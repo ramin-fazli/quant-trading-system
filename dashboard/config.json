@@ -1,0 +1,109 @@
+{
+    "dashboard": {
+        "host": "127.0.0.1",
+        "port": 8050,
+        "debug": false,
+        "theme": "dark",
+        "title": "Quantitative Trading Dashboard"
+    },
+    "websocket": {
+        "enabled": true,
+        "cors_allowed_origins": "*",
+        "ping_timeout": 60,
+        "ping_interval": 25
+    },
+    "data": {
+        "auto_refresh": true,
+        "update_interval": 1.0,
+        "max_data_points": 10000,
+        "cache_size": 1000,
+        "compression_enabled": true
+    },
+    "charts": {
+        "default_height": 400,
+        "color_scheme": "plotly_dark",
+        "show_toolbar": true,
+        "responsive": true,
+        "animation_duration": 500
+    },
+    "api": {
+        "cors_enabled": true,
+        "rate_limiting": false,
+        "max_requests_per_minute": 1000,
+        "api_key_required": false
+    },
+    "logging": {
+        "level": "INFO",
+        "file_enabled": true,
+        "console_enabled": true,
+        "max_file_size": "10MB",
+        "backup_count": 5
+    },
+    "performance": {
+        "lazy_loading": true,
+        "data_compression": true,
+        "cache_charts": true,
+        "minify_responses": false
+    },
+    "security": {
+        "validate_inputs": true,
+        "sanitize_html": true,
+        "csrf_protection": false,
+        "secure_cookies": false
+    },
+    "display": {
+        "currency_format": "$",
+        "percentage_decimals": 2,
+        "number_decimals": 4,
+        "date_format": "YYYY-MM-DD",
+        "timezone": "UTC"
+    },
+    "alerts": {
+        "enabled": true,
+        "sound_enabled": false,
+        "toast_duration": 5000,
+        "max_alerts": 100
+    },
+    "themes": {
+        "dark": {
+            "primary_color": "#007bff",
+            "background_color": "#1a1a1a",
+            "text_color": "#ffffff",
+            "card_background": "#2d2d2d",
+            "border_color": "#444444"
+        },
+        "light": {
+            "primary_color": "#007bff",
+            "background_color": "#ffffff",
+            "text_color": "#333333",
+            "card_background": "#f8f9fa",
+            "border_color": "#dee2e6"
+        }
+    },
+    "backtest": {
+        "show_trades": true,
+        "show_positions": true,
+        "show_signals": true,
+        "max_trades_display": 1000,
+        "default_charts": [
+            "equity_curve",
+            "drawdown",
+            "monthly_returns",
+            "performance_distribution"
+        ]
+    },
+    "live_trading": {
+        "update_frequency": 1.0,
+        "show_orderbook": false,
+        "show_recent_trades": true,
+        "max_recent_trades": 50,
+        "price_precision": 5
+    },
+    "pairs_analysis": {
+        "correlation_window": 252,
+        "zscore_window": 20,
+        "show_statistical_tests": true,
+        "cointegration_test": "adf",
+        "significance_level": 0.05
+    }
+}

@@ -1,0 +1,174 @@
+version: '3.8'
+
+services:
+  # InfluxDB - Time series database for high-frequency trading data
+  influxdb:
+    image: influxdb:latest
+    container_name: trading_influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=trading123
+      - DOCKER_INFLUXDB_INIT_ORG=trading
+      - DOCKER_INFLUXDB_INIT_BUCKET=market_data
+      - DOCKER_INFLUXDB_INIT_RETENTION=30d
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=trading-token-change-me
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+      - influxdb_config:/etc/influxdb2
+    restart: unless-stopped
+    networks:
+      - trading_network
+
+  # TimescaleDB - PostgreSQL with time series extensions
+  timescaledb:
+    image: timescale/timescaledb:latest-pg14
+    container_name: trading_timescaledb
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=trading_db
+      - POSTGRES_USER=trading_user
+      - POSTGRES_PASSWORD=trading_password
+      - POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./init-scripts/timescaledb:/docker-entrypoint-initdb.d
+    restart: unless-stopped
+    networks:
+      - trading_network
+
+  # Redis - In-memory caching and pub/sub
+  redis:
+    image: redis:latest
+    container_name: trading_redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass trading_redis_password
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - trading_network
+
+  # PostgreSQL - Traditional relational database (alternative to TimescaleDB)
+  postgres:
+    image: postgres:14
+    container_name: trading_postgres
+    ports:
+      - "5433:5432"  # Different port to avoid conflict with TimescaleDB
+    environment:
+      - POSTGRES_DB=trading_db
+      - POSTGRES_USER=trading_user
+      - POSTGRES_PASSWORD=trading_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts/postgres:/docker-entrypoint-initdb.d
+    restart: unless-stopped
+    networks:
+      - trading_network
+
+  # MongoDB - Document database (optional)
+  mongodb:
+    image: mongo:latest
+    container_name: trading_mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=trading_user
+      - MONGO_INITDB_ROOT_PASSWORD=trading_password
+      - MONGO_INITDB_DATABASE=trading_db
+    volumes:
+      - mongodb_data:/data/db
+      - ./init-scripts/mongodb:/docker-entrypoint-initdb.d
+    restart: unless-stopped
+    networks:
+      - trading_network
+
+  # Grafana - Data visualization and monitoring
+  grafana:
+    image: grafana/grafana:latest
+    container_name: trading_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=trading_admin
+      - GF_INSTALL_PLUGINS=grafana-influxdb-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana:/etc/grafana/provisioning
+    restart: unless-stopped
+    networks:
+      - trading_network
+    depends_on:
+      - influxdb
+      - timescaledb
+
+  # Adminer - Database administration tool
+  adminer:
+    image: adminer:latest
+    container_name: trading_adminer
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    networks:
+      - trading_network
+    depends_on:
+      - timescaledb
+      - postgres
+
+  # Redis Commander - Redis administration tool
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: trading_redis_commander
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_HOSTS=local:trading_redis:6379:0:trading_redis_password
+    restart: unless-stopped
+    networks:
+      - trading_network
+    depends_on:
+      - redis
+
+volumes:
+  influxdb_data:
+    driver: local
+  influxdb_config:
+    driver: local
+  timescaledb_data:
+    driver: local
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  mongodb_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  trading_network:
+    driver: bridge
+
+# Usage:
+# Start all services:          docker-compose up -d
+# Start specific service:      docker-compose up -d influxdb timescaledb redis
+# Stop all services:          docker-compose down
+# Stop and remove volumes:    docker-compose down -v
+# View logs:                  docker-compose logs -f influxdb
+# 
+# Service URLs:
+# - InfluxDB UI:      http://localhost:8086
+# - Grafana:          http://localhost:3000 (admin/trading_admin)
+# - Adminer:          http://localhost:8080
+# - Redis Commander:  http://localhost:8081
+#
+# Database Connections:
+# - InfluxDB:         http://localhost:8086 (token: trading-token-change-me)
+# - TimescaleDB:      postgresql://trading_user:trading_password@localhost:5432/trading_db
+# - PostgreSQL:       postgresql://trading_user:trading_password@localhost:5433/trading_db
+# - Redis:            redis://localhost:6379 (password: trading_redis_password)
+# - MongoDB:          mongodb://trading_user:trading_password@localhost:27017/trading_db

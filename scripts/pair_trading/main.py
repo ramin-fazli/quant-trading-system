@@ -4,28 +4,11 @@ import os
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-import numpy as np
-import pandas as pd
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 import warnings
 import os
-from dotenv import load_dotenv
-import datetime
-import time
 import logging
-import threading
-from collections import deque, defaultdict
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Union
-import json
-import MetaTrader5 as mt5
-import matplotlib.pyplot as plt
-import seaborn as sns
-import xlsxwriter
-import vectorbt as vbt
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import multiprocessing
 from reporting.report_generator import generate_enhanced_report  # Import the report generator
 from config import TradingConfig, get_config, force_config_update
 from data.mt5 import MT5DataManager

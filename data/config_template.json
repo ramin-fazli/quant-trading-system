@@ -1,0 +1,159 @@
+{
+  "data_sources": {
+    "mt5": {
+      "enabled": true,
+      "login": null,
+      "password": null,
+      "server": null,
+      "timeout": 10000,
+      "retries": 3
+    },
+    "parquet": {
+      "enabled": true,
+      "data_dir": "data/parquet",
+      "compression": "snappy",
+      "auto_create_dirs": true
+    },
+    "csv": {
+      "enabled": true,
+      "data_dir": "data/csv",
+      "date_column": "timestamp",
+      "date_format": "%Y-%m-%d %H:%M:%S",
+      "auto_detect_format": true
+    },
+    "database": {
+      "enabled": false,
+      "connection_string": "sqlite:///trading_data.db",
+      "table_name": "ohlcv_data",
+      "pool_size": 10,
+      "max_overflow": 20
+    },
+    "alpha_vantage": {
+      "enabled": false,
+      "api_key": null,
+      "rate_limit": 5,
+      "timeout": 30
+    },
+    "influxdb": {
+      "enabled": false,
+      "url": "http://localhost:8086",
+      "token": null,
+      "org": "trading",
+      "bucket": "market_data",
+      "timeout": 30000
+    },
+    "timescaledb": {
+      "enabled": false,
+      "connection_string": "postgresql://user:password@localhost:5432/trading_db",
+      "table_name": "ohlcv_data",
+      "time_column": "timestamp",
+      "pool_size": 10,
+      "max_overflow": 20
+    },
+    "ctrader": {
+      "enabled": false,
+      "host": "localhost",
+      "port": 8080,
+      "username": null,
+      "password": null
+    }
+  },
+  "cache": {
+    "memory_cache_size": 1000,
+    "ttl_seconds": 3600,
+    "compression": "snappy",
+    "use_redis": false,
+    "redis_config": {
+      "host": "localhost",
+      "port": 6379,
+      "db": 0,
+      "password": null,
+      "socket_timeout": 5
+    },
+    "disk_cache_size_mb": 1024,
+    "auto_cleanup": true,
+    "cleanup_interval_hours": 24
+  },
+  "database": {
+    "url": "sqlite:///trading_data.db",
+    "echo": false,
+    "pool_pre_ping": true,
+    "pool_recycle": 3600
+  },
+  "performance": {
+    "max_workers": 4,
+    "chunk_size": 10000,
+    "parallel_processing": true,
+    "use_numba": true,
+    "memory_limit_mb": 2048
+  },
+  "streaming": {
+    "buffer_size": 10000,
+    "update_interval": 0.1,
+    "auto_reconnect": true,
+    "max_reconnect_attempts": 5,
+    "reconnect_delay": 5.0,
+    "batch_size": 100,
+    "enable_compression": true,
+    "heartbeat_interval": 30
+  },
+  "data_validation": {
+    "enabled": true,
+    "outlier_detection": true,
+    "outlier_method": "iqr",
+    "outlier_factor": 1.5,
+    "fill_missing": true,
+    "fill_method": "interpolate",
+    "remove_duplicates": true,
+    "validate_ohlc": true
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    "file": "logs/data_manager.log",
+    "max_size_mb": 100,
+    "backup_count": 5
+  },
+  "symbols": {
+    "forex_majors": [
+      "EURUSD", "GBPUSD", "USDJPY", "USDCHF", 
+      "USDCAD", "AUDUSD", "NZDUSD"
+    ],
+    "forex_minors": [
+      "EURGBP", "EURJPY", "EURCHF", "EURCAD",
+      "EURAUD", "EURNZD", "GBPJPY", "GBPCHF"
+    ],
+    "stocks": [
+      "AAPL", "GOOGL", "MSFT", "TSLA", "AMZN",
+      "NVDA", "META", "NFLX", "SPY", "QQQ"
+    ],
+    "crypto": [
+      "BTCUSD", "ETHUSD", "ADAUSD", "DOTUSD",
+      "LINKUSD", "LTCUSD", "XRPUSD"
+    ]
+  },
+  "timeframes": {
+    "tick": "tick",
+    "1_minute": "1T",
+    "5_minutes": "5T",
+    "15_minutes": "15T",
+    "30_minutes": "30T",
+    "1_hour": "1H",
+    "4_hours": "4H",
+    "1_day": "1D",
+    "1_week": "1W",
+    "1_month": "1M"
+  },
+  "quality_thresholds": {
+    "min_quality_score": 0.8,
+    "max_missing_percent": 0.05,
+    "max_outlier_percent": 0.02,
+    "min_data_points": 100
+  },
+  "export_settings": {
+    "default_format": "parquet",
+    "compression": "snappy",
+    "include_metadata": true,
+    "batch_size": 50000
+  }
+}
