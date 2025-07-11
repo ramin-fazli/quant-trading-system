@@ -1,0 +1,192 @@
+# .gitignore for Advanced Trading Framework
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# celery beat schedule file
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# Trading System Specific
+# ========================
+
+# Configuration files with secrets
+config/trading_config.json
+config/*.json
+!config/trading_config.json.example
+
+# API keys and secrets
+.env
+*.env
+secrets/
+credentials/
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# Data files
+data/*.csv
+data/*.xlsx
+data/*.parquet
+data/*.h5
+data/*.hdf5
+
+# Cache
+cache/
+.cache/
+*.cache
+
+# Reports (generated)
+reports/
+backtest_reports/
+*.html
+*.xlsx
+!examples/sample_reports/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# Broker specific files
+mt5_data/
+*.ex4
+*.ex5
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Windows
+*.lnk
+
+# Linux
+*~
+
+# macOS
+.AppleDouble
+.LSOverride
+
+# Backup files
+*.bak
+*.backup
+*.orig
+
+# Performance monitoring
+*.prof
+*.cprof
+
+# Excel temporary files
+~$*.xlsx
+~$*.xls

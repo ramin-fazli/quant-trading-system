@@ -1,0 +1,372 @@
+import os
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.vector_ar.vecm import coint_johansen
+import warnings
+import logging
+from typing import Dict, Tuple
+from config import TradingConfig
+import MetaTrader5 as mt5
+import datetime
+
+def get_mt5_config():
+    """Get TradingConfig from config module, ensuring .env is loaded first."""
+    from config import get_config, force_config_update
+    force_config_update()
+    return get_config()
+
+# Only load config if run as script, not on import
+if __name__ == "__main__":
+    CONFIG = get_mt5_config()
+
+# Setup optimized logging with proper log file path
+CONFIG = get_mt5_config()
+log_file_path = os.path.join(CONFIG.logs_dir, "pairs_trading.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file_path, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+warnings.filterwarnings("ignore")
+
+
+# === OPTIMIZED STRATEGY ENGINE ===
+class OptimizedPairsStrategy:
+    """Vectorized and optimized pairs trading strategy"""
+    
+    def __init__(self, config: TradingConfig, data_manager = None):
+        self.config = config
+        self.data_manager = data_manager
+
+    def calculate_indicators_vectorized(self, price1: pd.Series, price2: pd.Series) -> Dict:
+        """Calculate all indicators using vectorized operations for maximum speed"""
+        
+        # Align series and handle missing data
+        df = pd.concat([price1, price2], axis=1).fillna(method='ffill').dropna()
+        if len(df) < max(self.config.z_period, self.config.corr_period, self.config.adf_period):
+            return {}
+        
+        df.columns = ['price1', 'price2']
+        
+        # Vectorized ratio calculation
+        ratio = df['price1'] / df['price2']
+        
+        # Rolling statistics using pandas optimized functions
+        ratio_ma = ratio.rolling(self.config.z_period, min_periods=self.config.z_period//2).mean()
+        ratio_std = ratio.rolling(self.config.z_period, min_periods=self.config.z_period//2).std()
+        
+        # Z-score calculation
+        zscore = (ratio - ratio_ma) / ratio_std
+        zscore_perc = zscore[-1]  # Latest value only
+        # logger.info(f"[{price1.name}-{price2.name}] z-score: {zscore_perc:.2f}")      
+        
+        # Calculate percentage distance from mean
+        distance_from_mean = abs((ratio - ratio_ma) / ratio_ma) * 100  # Convert to percentage
+        distance_from_mean_perc = distance_from_mean[-1]  # Latest value only
+        # logger.info(f"[{price1.name}-{price2.name}] Distance from mean: {distance_from_mean_perc:.2f}%")
+        
+        # Correlation using rolling window
+        correlation = df['price1'].rolling(self.config.corr_period).corr(df['price2'])
+        
+        # Volatility measures
+        vol1 = df['price1'].rolling(self.config.z_period).std() / df['price1'].rolling(self.config.z_period).mean()
+        vol2 = df['price2'].rolling(self.config.z_period).std() / df['price2'].rolling(self.config.z_period).mean()
+        vol_ratio = np.maximum(vol1, vol2) / np.minimum(vol1, vol2)
+        
+        # ADF test - skip if disabled
+        if self.config.enable_adf:
+            adf_pvals = self._rolling_adf_vectorized(ratio, self.config.adf_period)
+        else:
+            # Set to pass all tests when disabled
+            adf_pvals = np.zeros(len(ratio))  # Always pass (p-value = 0)
+        
+        # Johansen test - skip if disabled
+        if self.config.enable_johansen:
+            johansen_stats, johansen_crits = self._rolling_johansen_vectorized(
+                df['price1'], df['price2'], self.config.adf_period
+            )
+        else:
+            # Set to pass all tests when disabled
+            johansen_stats = np.ones(len(ratio))  # Always pass
+            johansen_crits = np.zeros(len(ratio))  # Always pass
+        
+        # Dynamic thresholds if enabled
+        if self.config.dynamic_z:
+            # Prevent division by zero if min_volatility is zero or very small
+            min_vol = self.config.min_volatility if self.config.min_volatility > 0 else 1e-8
+            dynamic_entry = np.maximum(self.config.z_entry, self.config.z_entry * ratio_std / min_vol)
+            dynamic_exit = np.maximum(self.config.z_exit, self.config.z_exit * ratio_std / min_vol)
+        else:
+            dynamic_entry = np.full(len(zscore), self.config.z_entry)
+            dynamic_exit = np.full(len(zscore), self.config.z_exit)
+        
+        # Calculate cost-based filter for pair trading
+        mode = os.getenv('TRADING_MODE', 'backtest').lower()
+        if mode == 'backtest':
+            cost_filter = pd.Series(True, index=df.index)  # Always pass cost filter in backtest mode
+        else:
+            cost_filter = self._calculate_cost_filter(price1.name, price2.name, df['price1'], df['price2'])
+        
+        # Suitability filter - build conditionally based on enabled tests and parameters
+        suitable_conditions = []
+
+        # Core conditions that are always checked regardless of enable flags
+        if self.config.min_volatility > 0:
+            suitable_conditions.append(ratio_std > self.config.min_volatility)
+            
+        if self.config.min_distance > 0:
+            suitable_conditions.append(distance_from_mean > self.config.min_distance)
+            
+        # Always check cost filter as it's critical for profitability
+        suitable_conditions.append(cost_filter)
+
+        # --- Market session filter ---
+        if mode == 'realtime':
+            # logger.info(f"Checking market session for {price1.name} and {price2.name}")
+            session_filter = self._market_session_filter(price1.name, price2.name)
+            suitable_conditions.append(session_filter)
+
+        # Optional conditions based on enable flags and their respective parameters
+        if self.config.enable_correlation and self.config.min_corr > 0:
+            suitable_conditions.append(correlation > self.config.min_corr)
+            
+        if self.config.enable_adf and self.config.max_adf_pval < 1:
+            suitable_conditions.append(adf_pvals < self.config.max_adf_pval)
+            
+        if self.config.enable_johansen and self.config.johansen_crit_level > 0:
+            suitable_conditions.append(johansen_stats > johansen_crits)
+            
+        if self.config.enable_vol_ratio and self.config.vol_ratio_max < float('inf'):
+            suitable_conditions.append(vol_ratio <= self.config.vol_ratio_max)
+        
+        # Initialize suitable as True if no conditions, otherwise combine all conditions
+        if not suitable_conditions:
+            suitable = pd.Series(True, index=ratio.index)
+        else:
+            suitable = suitable_conditions[0]
+            for condition in suitable_conditions[1:]:
+                suitable = suitable & condition
+        
+        return {
+            'df': df,
+            'ratio': ratio,
+            'ratio_ma': ratio_ma,
+            'ratio_std': ratio_std,
+            'zscore': zscore,
+            'correlation': correlation,
+            'vol_ratio': vol_ratio,
+            'adf_pvals': adf_pvals,
+            'johansen_stats': johansen_stats,
+            'johansen_crits': johansen_crits,
+            'dynamic_entry': dynamic_entry,
+            'dynamic_exit': dynamic_exit,
+            'suitable': suitable,
+            'cost_filter': cost_filter
+        }
+    
+    def _calculate_cost_filter(self, symbol1: str, symbol2: str, price1: pd.Series, price2: pd.Series) -> pd.Series:
+        """Calculate cost-based filter for pair trading suitability"""
+        
+        # If no data manager available (backtesting), assume costs are acceptable
+        if not self.data_manager or not hasattr(self.data_manager, 'symbol_info_cache'):
+            logger.warning("No data manager available for cost calculation - assuming costs are acceptable")
+            return pd.Series(True, index=price1.index)
+        
+        # Get symbol information from cache
+        if symbol1 not in self.data_manager.symbol_info_cache or symbol2 not in self.data_manager.symbol_info_cache:
+            logger.warning(f"Symbol info not available for {symbol1} or {symbol2} - assuming costs are acceptable")
+            return pd.Series(True, index=price1.index)
+        
+        info1 = self.data_manager.symbol_info_cache[symbol1]
+        info2 = self.data_manager.symbol_info_cache[symbol2]
+        
+        # Calculate spreads as percentage of price
+        spread1_perc = (info1['spread'] * info1['point']) / price1 * 100
+        spread2_perc = (info2['spread'] * info2['point']) / price2 * 100
+        
+        # Determine if symbols are stocks/ETFs based on naming convention
+        def is_stock_or_etf(symbol: str) -> bool:
+            """Check if symbol is a stock or ETF based on naming patterns"""
+            # Common patterns for stocks and ETFs
+            stock_patterns = [
+                '.US',      # US stocks (AAPL.US, MSFT.US)
+            ]
+            
+            # Check for stock exchange suffixes
+            for pattern in stock_patterns:
+                if pattern in symbol:
+                    return True
+            
+            return False
+        
+        # Calculate commission based on instrument type
+        if is_stock_or_etf(symbol1):
+            commission1_perc = (self.config.commission_fixed / price1) * 100
+        else:
+            commission1_perc = pd.Series(0.0, index=price1.index)  # No fixed commission for non-stocks
+        
+        if is_stock_or_etf(symbol2):
+            commission2_perc = (self.config.commission_fixed / price2) * 100
+        else:
+            commission2_perc = pd.Series(0.0, index=price2.index)  # No fixed commission for non-stocks
+        
+        # Total cost per trade (open + close) for both legs
+        # Each leg: commission (open) + commission (close) + spread (paid once per round-trip)
+        # Calculate cost per leg, then take weighted average based on position sizes
+        leg1_total_cost_perc = (2 * commission1_perc + spread1_perc)
+        leg2_total_cost_perc = (2 * commission2_perc + spread2_perc)
+        
+        # Weight the costs by the monetary value of each leg (equal weighting for balanced pairs)
+        total_cost_perc = (leg1_total_cost_perc + leg2_total_cost_perc) / 2
+        
+        # Create boolean filter where cost is acceptable
+        cost_acceptable = total_cost_perc <= self.config.max_commission_perc
+        
+        # Log cost information for monitoring with instrument type details
+        if len(cost_acceptable) > 0:
+            avg_cost = total_cost_perc.mean()
+            symbol1_type = "Stock/ETF" if is_stock_or_etf(symbol1) else "Other"
+            symbol2_type = "Stock/ETF" if is_stock_or_etf(symbol2) else "Other"
+            
+            # logger.info(f"Cost filter for {symbol1}-{symbol2}: avg_cost={avg_cost:.4f}%, threshold={self.config.max_commission_perc:.4f}%, "
+            #            f"acceptable={cost_acceptable.mean()*100:.1f}% of time")
+            # logger.info(f"  {symbol1} ({symbol1_type}): commission={commission1_perc.mean():.4f}%, spread={spread1_perc.mean():.4f}%")
+            # logger.info(f"  {symbol2} ({symbol2_type}): commission={commission2_perc.mean():.4f}%, spread={spread2_perc.mean():.4f}%")
+        
+        return cost_acceptable
+
+    def _rolling_adf_vectorized(self, series: pd.Series, window: int) -> np.ndarray:
+        """Optimized rolling ADF test"""
+        pvals = np.full(len(series), np.nan)
+        
+        # Use numpy arrays for faster computation
+        values = series.values
+        
+        for i in range(window, len(values)):
+            try:
+                window_data = values[i-window+1:i+1]
+                if len(np.unique(window_data)) > 1:  # Avoid constant series
+                    pvals[i] = adfuller(window_data, autolag='AIC')[1]
+            except:
+                pvals[i] = 1.0  # Conservative assumption
+                
+        return pvals
+    
+    def _rolling_johansen_vectorized(self, series1: pd.Series, series2: pd.Series, 
+                                   window: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Optimized rolling Johansen test"""
+        stats = np.full(len(series1), np.nan)
+        crits = np.full(len(series1), np.nan)
+        
+        crit_idx = {90: 0, 95: 1, 99: 2}[self.config.johansen_crit_level]
+        
+        # Convert to numpy for speed
+        vals1 = series1.values
+        vals2 = series2.values
+        
+        for i in range(window, len(vals1)):
+            try:
+                data = np.column_stack([vals1[i-window+1:i+1], vals2[i-window+1:i+1]])
+                if np.std(data[:, 0]) > 0 and np.std(data[:, 1]) > 0:
+                    result = coint_johansen(data, det_order=0, k_ar_diff=1)
+                    stats[i] = result.lr1[0]
+                    crits[i] = result.cvt[0, crit_idx]
+            except:
+                stats[i] = 0.0
+                crits[i] = 999.0  # High threshold for failed tests
+                
+        return stats, crits
+    
+    def generate_signals_vectorized(self, indicators: Dict) -> pd.DataFrame:
+        """Generate trading signals using vectorized operations"""
+        
+        if not indicators:
+            return pd.DataFrame()
+        
+        zscore = indicators['zscore']
+        suitable = indicators['suitable']
+        dynamic_entry = indicators['dynamic_entry']
+        dynamic_exit = indicators['dynamic_exit']
+        
+        signals = pd.DataFrame(index=indicators['df'].index)
+        signals['zscore'] = zscore
+        signals['suitable'] = suitable
+        
+        # SIMPLIFIED signal generation - trigger when Z-score exceeds threshold
+        # Remove the transition requirement for more aggressive entries
+        signals['long_entry'] = (
+            (zscore < -dynamic_entry) & 
+            suitable
+        )
+        
+        signals['short_entry'] = (
+            (zscore > dynamic_entry) & 
+            suitable
+        )
+        
+        signals['long_exit'] = (
+            (zscore > -dynamic_exit)
+        )
+        
+        signals['short_exit'] = (
+            (zscore < dynamic_exit)
+        )
+        
+        return signals
+
+    def _market_session_filter(self, symbol1: str, symbol2: str) -> bool:
+        """
+        Returns True if both symbols are currently in an open and tradable market session,
+        and both have recent tick data (Moscow time check).
+        If no data_manager or symbol_info_cache, assume True (for backtesting).
+        """
+        # If no data manager or no symbol info, assume tradable (for backtest)
+        if not self.data_manager or not hasattr(self.data_manager, 'symbol_info_cache'):
+            return True
+
+        cache = self.data_manager.symbol_info_cache
+        info1 = cache.get(symbol1)
+        info2 = cache.get(symbol2)
+        if not info1 or not info2:
+            return True
+
+        def is_tradable(info):
+            # MT5: trade_mode==0 means disabled, >0 means enabled
+            if 'trade_mode' in info and info['trade_mode'] != 4:
+                return False
+            # if 'session_deals' in info and info['session_deals'] == 0:
+            #     return False
+            # if 'session_trade' in info and info['session_trade'] == 0:
+            #     return False
+            return True
+
+        def has_recent_tick(symbol):
+            try:
+                last_tick = mt5.symbol_info_tick(symbol)
+                if last_tick is None:
+                    logger.info(f"{symbol}: No tick data available. Market might be inactive or closed.")
+                    return False
+                # Moscow time (UTC+3)
+                moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
+                current_utc_time = datetime.datetime.now(moscow_tz)
+                # Adjust for Moscow offset (+10800 seconds)
+                tick_time_diff = current_utc_time.timestamp() - last_tick.time + 10800
+                # Only accept if tick is within 60 seconds
+                if tick_time_diff > 600:
+                    last_tick_time = datetime.datetime.fromtimestamp(last_tick.time, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+                    # logger.info(f"{symbol}: Last tick is too old at {last_tick_time}). Market might be inactive.")
+                    return False
+                return True
+            except Exception:
+                return False
+
+        return (
+            is_tradable(info1) and is_tradable(info2)
+            and has_recent_tick(symbol1) and has_recent_tick(symbol2)
+        )
+
