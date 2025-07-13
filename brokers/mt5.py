@@ -563,14 +563,17 @@ class MT5RealTimeTrader:
             logger.debug(f"Not enough data for {pair_str}: {len(state['price1'])} vs {self.config.z_period} required")
             return
         
+        # Extract symbol names from pair string
+        symbol1, symbol2 = pair_str.split('-')
+        
         # Calculate indicators
         indicators = self.strategy.calculate_indicators_vectorized(state['price1'], state['price2'])
         if not indicators:
             logger.debug(f"No indicators calculated for {pair_str}")
             return
         
-        # Generate signals
-        signals = self.strategy.generate_signals_vectorized(indicators)
+        # Generate signals with symbol names for session filtering
+        signals = self.strategy.generate_signals_vectorized(indicators, symbol1, symbol2)
         if signals.empty:
             logger.debug(f"No signals generated for {pair_str}")
             return

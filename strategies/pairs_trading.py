@@ -282,7 +282,7 @@ class OptimizedPairsStrategy:
                 
         return stats, crits
     
-    def generate_signals_vectorized(self, indicators: Dict) -> pd.DataFrame:
+    def generate_signals_vectorized(self, indicators: Dict, symbol1: str = None, symbol2: str = None) -> pd.DataFrame:
         """Generate trading signals using vectorized operations"""
         
         if not indicators:
@@ -297,6 +297,13 @@ class OptimizedPairsStrategy:
         signals['zscore'] = zscore
         signals['suitable'] = suitable
         
+        # Check session filter for exit signals in real-time mode
+        mode = os.getenv('TRADING_MODE', 'backtest').lower()
+        if mode == 'realtime' and symbol1 and symbol2:
+            session_active = self._market_session_filter(symbol1, symbol2)
+        else:
+            session_active = True  # Always allow exits in backtest mode
+        
         # SIMPLIFIED signal generation - trigger when Z-score exceeds threshold
         # Remove the transition requirement for more aggressive entries
         signals['long_entry'] = (
@@ -309,12 +316,15 @@ class OptimizedPairsStrategy:
             suitable
         )
         
+        # Exit signals now include session filter check
         signals['long_exit'] = (
-            (zscore > -dynamic_exit)
+            (zscore > -dynamic_exit) & 
+            session_active
         )
         
         signals['short_exit'] = (
-            (zscore < dynamic_exit)
+            (zscore < dynamic_exit) & 
+            session_active
         )
         
         return signals

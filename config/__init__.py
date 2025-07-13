@@ -23,6 +23,7 @@ class TradingConfig:
     interval: str = "M15"
     start_date: str = "2025-06-01"
     data_provider: str = 'ctrader'  # Options:  'ctrader','mt5'    
+    broker: str = 'ctrader'  # For live trade executions. Options:  'ctrader','mt5'  
     end_date: Optional[str] = None
     
     # Strategy parameters
