@@ -9,10 +9,15 @@ import logging
 import json
 import threading
 import time
+import pandas as pd
+import numpy as np
 from datetime import datetime
 from typing import Dict, List, Set, Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+
 
 # WebSocket libraries (will be imported when available)
 try:
@@ -168,7 +173,7 @@ class WebSocketHandler:
             
             update_data = {
                 'type': 'backtest_update',
-                'data': backtest_data,
+                'data': self.serialize_for_json(backtest_data),
                 'timestamp': datetime.now().isoformat()
             }
             
@@ -192,7 +197,7 @@ class WebSocketHandler:
             
             update_data = {
                 'type': 'live_update',
-                'data': live_data,
+                'data': self.serialize_for_json(live_data),
                 'timestamp': datetime.now().isoformat()
             }
             
@@ -216,7 +221,7 @@ class WebSocketHandler:
             
             update_data = {
                 'type': 'portfolio_update',
-                'data': portfolio_data,
+                'data': self.serialize_for_json(portfolio_data),
                 'timestamp': datetime.now().isoformat()
             }
             
@@ -238,7 +243,7 @@ class WebSocketHandler:
             update_data = {
                 'type': 'custom_update',
                 'key': data_key,
-                'data': custom_data,
+                'data': self.serialize_for_json(custom_data),
                 'timestamp': datetime.now().isoformat()
             }
             
@@ -262,7 +267,7 @@ class WebSocketHandler:
                 'level': alert_data.get('level', 'info'),  # info, warning, error
                 'title': alert_data.get('title', 'Alert'),
                 'message': alert_data.get('message', ''),
-                'data': alert_data.get('data', {}),
+                'data': self.serialize_for_json(alert_data.get('data', {})),
                 'timestamp': datetime.now().isoformat()
             }
             
@@ -333,27 +338,30 @@ class WebSocketHandler:
         try:
             # Send latest backtest data if available
             if self.latest_backtest_data:
+                serialized_data = self.serialize_for_json(self.latest_backtest_data)
                 emit('backtest_update', {
                     'type': 'backtest_update',
-                    'data': self.latest_backtest_data,
+                    'data': serialized_data,
                     'timestamp': datetime.now().isoformat(),
                     'initial': True
                 })
             
             # Send latest live data if available
             if self.latest_live_data:
+                serialized_data = self.serialize_for_json(self.latest_live_data)
                 emit('live_update', {
                     'type': 'live_update',
-                    'data': self.latest_live_data,
+                    'data': serialized_data,
                     'timestamp': datetime.now().isoformat(),
                     'initial': True
                 })
             
             # Send latest portfolio data if available
             if self.latest_portfolio_data:
+                serialized_data = self.serialize_for_json(self.latest_portfolio_data)
                 emit('portfolio_update', {
                     'type': 'portfolio_update',
-                    'data': self.latest_portfolio_data,
+                    'data': serialized_data,
                     'timestamp': datetime.now().isoformat(),
                     'initial': True
                 })
@@ -419,3 +427,24 @@ class WebSocketHandler:
             
         except Exception as e:
             logger.error(f"Error cleaning up WebSocketHandler: {e}")
+    
+    def serialize_for_json(self, obj):
+        """Convert pandas/numpy objects to JSON-serializable format"""
+        if isinstance(obj, (pd.Timestamp, pd.DatetimeIndex)):
+            return obj.isoformat() if hasattr(obj, 'isoformat') else str(obj)
+        elif isinstance(obj, (np.int64, np.int32, np.int8, np.int16)):
+            return int(obj)
+        elif isinstance(obj, (np.float64, np.float32, np.float16)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, pd.Series):
+            return obj.to_dict()
+        elif isinstance(obj, pd.DataFrame):
+            return obj.to_dict('records')
+        elif isinstance(obj, dict):
+            return {k: self.serialize_for_json(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [self.serialize_for_json(item) for item in obj]
+        else:
+            return obj

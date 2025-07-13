@@ -6,11 +6,12 @@ Provides RESTful API endpoints and serves the dashboard web interface.
 
 import logging
 import json
+import numpy as np
 from datetime import datetime
 from typing import Dict, Any, Optional
 from pathlib import Path
 
-from flask import Flask, render_template, jsonify, request, send_from_directory
+from flask import Flask, render_template, jsonify, request, send_from_directory, send_file
 from flask_cors import CORS
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,11 @@ class DashboardServer:
         def settings_page():
             """Settings page"""
             return render_template('settings.html', config=self.config)
+        
+        @self.app.route('/reports')
+        def reports_page():
+            """Reports download page"""
+            return render_template('reports.html', config=self.config)
     
     def _register_api_routes(self):
         """Register API routes"""
@@ -113,7 +119,22 @@ class DashboardServer:
             try:
                 # Get data from data adapter
                 if not hasattr(self.data_adapter, 'backtest_data'):
-                    return jsonify({'error': 'No backtest data available'}), 404
+                    # Return empty/default data instead of 404
+                    return jsonify({
+                        'portfolio_metrics': {
+                            'portfolio_return': 0.0,
+                            'portfolio_sharpe': 0.0,
+                            'portfolio_max_drawdown': 0.0,
+                            'total_trades': 0,
+                            'portfolio_win_rate': 0.0,
+                            'total_pairs': 0
+                        },
+                        'summary': {
+                            'status': 'No backtest data available',
+                            'mode': 'realtime'
+                        },
+                        'timestamp': datetime.now().isoformat()
+                    })
                 
                 backtest_data = getattr(self.data_adapter, 'backtest_data', {})
                 
@@ -280,7 +301,173 @@ class DashboardServer:
             except Exception as e:
                 logger.error(f"Error updating config: {e}")
                 return jsonify({'error': str(e)}), 500
-    
+        
+        @self.app.route('/api/pairs/analysis')
+        def api_pairs_analysis():
+            """Get pairs analysis data"""
+            try:
+                # Get pairs from backtest data if available
+                if hasattr(self.data_adapter, 'backtest_data'):
+                    backtest_data = getattr(self.data_adapter, 'backtest_data', {})
+                    pairs = backtest_data.get('pairs', [])
+                    
+                    # Create analysis summary
+                    analysis = {
+                        'total_pairs': len(pairs),
+                        'profitable_pairs': len([p for p in pairs if p.get('metrics', {}).get('total_return', 0) > 0]),
+                        'avg_return': np.mean([p.get('metrics', {}).get('total_return', 0) for p in pairs]) if pairs else 0,
+                        'avg_sharpe': np.mean([p.get('metrics', {}).get('sharpe_ratio', 0) for p in pairs]) if pairs else 0,
+                        'pairs_data': pairs[:20]  # Limit to top 20 for performance
+                    }
+                    
+                    return jsonify(analysis)
+                else:
+                    # Return empty analysis if no data
+                    return jsonify({
+                        'total_pairs': 0,
+                        'profitable_pairs': 0,
+                        'avg_return': 0,
+                        'avg_sharpe': 0,
+                        'pairs_data': []
+                    })
+                    
+            except Exception as e:
+                logger.error(f"Error getting pairs analysis: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/reports')
+        def api_reports_list():
+            """Get list of available Excel reports"""
+            try:
+                reports_dir = Path(__file__).parent.parent / 'backtest_reports'
+                if not reports_dir.exists():
+                    return jsonify({'reports': []})
+                
+                reports = []
+                for file_path in reports_dir.glob('*.xlsx'):
+                    stat = file_path.stat()
+                    reports.append({
+                        'filename': file_path.name,
+                        'size': stat.st_size,
+                        'created': datetime.fromtimestamp(stat.st_ctime).isoformat(),
+                        'modified': datetime.fromtimestamp(stat.st_mtime).isoformat()
+                    })
+                
+                # Sort by creation time (newest first)
+                reports.sort(key=lambda x: x['created'], reverse=True)
+                
+                return jsonify({'reports': reports})
+            except Exception as e:
+                logger.error(f"Error listing reports: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/download/report/<filename>')
+        def api_download_report(filename):
+            """Download Excel report"""
+            try:
+                # Validate filename to prevent directory traversal
+                if '..' in filename or '/' in filename or '\\' in filename:
+                    return jsonify({'error': 'Invalid filename'}), 400
+                
+                reports_dir = Path(__file__).parent.parent / 'backtest_reports'
+                file_path = reports_dir / filename
+                
+                if not file_path.exists() or not file_path.is_file():
+                    return jsonify({'error': 'Report not found'}), 404
+                
+                if not filename.endswith('.xlsx'):
+                    return jsonify({'error': 'Invalid file type'}), 400
+                
+                return send_file(
+                    file_path,
+                    as_attachment=True,
+                    download_name=filename,
+                    mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                )
+            except Exception as e:
+                logger.error(f"Error downloading report {filename}: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/reports/<filename>', methods=['DELETE'])
+        def api_delete_report(filename):
+            """Delete Excel report"""
+            try:
+                # Validate filename to prevent directory traversal
+                if '..' in filename or '/' in filename or '\\' in filename:
+                    return jsonify({'error': 'Invalid filename'}), 400
+                
+                reports_dir = Path(__file__).parent.parent / 'backtest_reports'
+                file_path = reports_dir / filename
+                
+                if not file_path.exists() or not file_path.is_file():
+                    return jsonify({'error': 'Report not found'}), 404
+                
+                file_path.unlink()  # Delete file
+                
+                return jsonify({'status': 'success', 'message': f'Report {filename} deleted'})
+            except Exception as e:
+                logger.error(f"Error deleting report {filename}: {e}")
+                return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/api/pairs/run-analysis', methods=['POST'])
+        def api_pairs_run_analysis():
+            """Run pairs analysis with specified parameters"""
+            try:
+                # Get parameters from request
+                params = request.get_json() or {}
+                lookback_period = params.get('lookback_period', 252)
+                zscore_window = params.get('zscore_window', 20)
+                correlation_threshold = params.get('correlation_threshold', 0.7)
+                cointegration_test = params.get('cointegration_test', 'adf')
+                
+                logger.info(f"Running pairs analysis with params: {params}")
+                
+                # For now, return the existing analysis data
+                # TODO: Implement real-time analysis with these parameters
+                if hasattr(self.data_adapter, 'backtest_data'):
+                    backtest_data = getattr(self.data_adapter, 'backtest_data', {})
+                    pairs = backtest_data.get('pairs', [])
+                    
+                    # Filter pairs based on correlation threshold
+                    filtered_pairs = [p for p in pairs if p.get('metrics', {}).get('correlation', 0) >= correlation_threshold]
+                    
+                    analysis_result = {
+                        'status': 'success',
+                        'parameters': params,
+                        'total_pairs_analyzed': len(pairs),
+                        'pairs_results': filtered_pairs[:50],  # Limit results
+                        'summary': {
+                            'total_pairs': len(filtered_pairs),
+                            'profitable_pairs': len([p for p in filtered_pairs if p.get('metrics', {}).get('total_return', 0) > 0]),
+                            'avg_return': np.mean([p.get('metrics', {}).get('total_return', 0) for p in filtered_pairs]) if filtered_pairs else 0,
+                            'avg_sharpe': np.mean([p.get('metrics', {}).get('sharpe_ratio', 0) for p in filtered_pairs]) if filtered_pairs else 0,
+                        }
+                    }
+                    
+                    return jsonify(analysis_result)
+                else:
+                    return jsonify({
+                        'status': 'success',
+                        'parameters': params,
+                        'total_pairs_analyzed': 0,
+                        'pairs_results': [],
+                        'summary': {
+                            'total_pairs': 0,
+                            'profitable_pairs': 0,
+                            'avg_return': 0,
+                            'avg_sharpe': 0,
+                        }
+                    })
+                    
+            except Exception as e:
+                logger.error(f"Error running pairs analysis: {e}")
+                return jsonify({
+                    'status': 'error',
+                    'message': str(e),
+                    'pairs_results': [],
+                    'summary': {}
+                }), 500
+
     def _register_static_routes(self):
         """Register static file routes"""
         

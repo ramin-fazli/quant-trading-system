@@ -6,7 +6,7 @@ import time
 import logging
 import threading
 from collections import deque, defaultdict
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional, Union, Any
 import json
 import MetaTrader5 as mt5
 from config import TradingConfig
@@ -1522,6 +1522,129 @@ class MT5RealTimeTrader:
         
         pnl_pct = (pnl_dollar / total_position_value) * 100
         return pnl_pct
+
+    def get_portfolio_status(self) -> Dict[str, Any]:
+        """Get current portfolio status for dashboard display"""
+        try:
+            # Get MT5 account information
+            account_info = mt5.account_info()
+            
+            portfolio_status = {
+                'timestamp': datetime.datetime.now().isoformat(),
+                'total_value': 0,
+                'balance': 0,
+                'equity': 0,
+                'unrealized_pnl': 0,
+                'realized_pnl': 0,
+                'position_count': 0,
+                'positions': [],
+                'total_exposure': 0,
+                'free_margin': 0,
+                'margin_level': 0
+            }
+            
+            if account_info:
+                portfolio_status.update({
+                    'balance': float(account_info.balance),
+                    'equity': float(account_info.equity),
+                    'free_margin': float(account_info.margin_free),
+                    'margin_level': float(account_info.margin_level) if account_info.margin_level else 0,
+                    'total_value': float(account_info.equity)
+                })
+                
+                # Calculate unrealized P&L
+                portfolio_status['unrealized_pnl'] = portfolio_status['equity'] - portfolio_status['balance']
+            
+            # Get active positions information
+            portfolio_status['position_count'] = len(self.active_positions)
+            
+            # Calculate total exposure
+            portfolio_status['total_exposure'] = self._calculate_total_exposure()
+            
+            # Get detailed position information
+            for pair_str, position in self.active_positions.items():
+                try:
+                    # Calculate current P&L for this position
+                    current_pnl = self._calculate_position_pnl(pair_str)
+                    current_pnl_pct = self._calculate_position_pnl_pct(pair_str)
+                    
+                    position_info = {
+                        'pair': pair_str,
+                        'direction': position.get('direction', 'UNKNOWN'),
+                        'entry_price': position.get('entry_exec_price1', 0),  # First leg entry price
+                        'current_price': 0,  # Will be updated with current market price
+                        'pnl': current_pnl,
+                        'pnl_pct': current_pnl_pct,
+                        'volume1': position.get('volume1', 0),
+                        'volume2': position.get('volume2', 0),
+                        'entry_time': position.get('entry_time', ''),
+                        'duration': self._calculate_position_duration(position),
+                        'z_score': position.get('z_score', 0)
+                    }
+                    
+                    # Get current market price for first symbol
+                    symbols = pair_str.split('-')
+                    if len(symbols) >= 1:
+                        try:
+                            current_tick = mt5.symbol_info_tick(symbols[0])
+                            if current_tick:
+                                position_info['current_price'] = float(current_tick.bid)
+                        except Exception:
+                            pass  # Keep default 0 if can't get current price
+                    
+                    portfolio_status['positions'].append(position_info)
+                    
+                except Exception as e:
+                    logger.warning(f"Error processing position {pair_str}: {e}")
+            
+            return portfolio_status
+            
+        except Exception as e:
+            logger.error(f"Error getting portfolio status: {e}")
+            # Return minimal portfolio status on error
+            return {
+                'timestamp': datetime.datetime.now().isoformat(),
+                'total_value': 0,
+                'balance': 0,
+                'equity': 0,
+                'unrealized_pnl': 0,
+                'realized_pnl': 0,
+                'position_count': len(self.active_positions) if hasattr(self, 'active_positions') else 0,
+                'positions': [],
+                'total_exposure': 0,
+                'free_margin': 0,
+                'margin_level': 0,
+                'error': str(e)
+            }
+    
+    def _calculate_position_duration(self, position: Dict) -> str:
+        """Calculate how long a position has been open"""
+        try:
+            entry_time_str = position.get('entry_time', '')
+            if not entry_time_str:
+                return 'Unknown'
+            
+            # Parse entry time (assuming ISO format)
+            entry_time = datetime.datetime.fromisoformat(entry_time_str.replace('Z', '+00:00'))
+            current_time = datetime.datetime.now(entry_time.tzinfo)
+            
+            duration = current_time - entry_time
+            
+            # Format duration
+            days = duration.days
+            hours, remainder = divmod(duration.seconds, 3600)
+            minutes, _ = divmod(remainder, 60)
+            
+            if days > 0:
+                return f"{days}d {hours}h {minutes}m"
+            elif hours > 0:
+                return f"{hours}h {minutes}m"
+            else:
+                return f"{minutes}m"
+                
+        except Exception as e:
+            logger.debug(f"Error calculating position duration: {e}")
+            return 'Unknown'
 
     def _calculate_total_exposure(self) -> float:
         """Calculate total monetary exposure across all active positions"""

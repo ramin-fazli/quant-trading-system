@@ -7,6 +7,7 @@ import os
 import datetime
 import time
 import logging
+import threading
 from collections import deque, defaultdict
 from config import TradingConfig, get_config, force_config_update
 
@@ -112,6 +113,11 @@ current_account_id = None
 
 # === CTRADER AUTHENTICATION AND DATA RETRIEVAL ===
 class CTraderDataManager:
+    # Class-level circuit breaker to prevent runaway connections
+    _global_connection_attempts = 0
+    _max_global_attempts = 50  # Increase limit for backtesting
+    _last_reset_time = time.time()
+    
     def __init__(self, config: TradingConfig):
         self.config = config
         self.client = None
@@ -127,11 +133,45 @@ class CTraderDataManager:
         self.timeout_count = 0
         self.max_retries = 3
         self.request_delay = 1.0  # Delay between requests
+        self.connection_established = False  # Track if this instance has established a connection
+        
+        # Instance-level connection state to avoid multiple connections per instance
+        self.connection_established = False
+        self.symbols_loaded = False
+        
+        # Check global circuit breaker
+        self._check_circuit_breaker()
+    
+    @classmethod
+    def _check_circuit_breaker(cls):
+        """Check if we should reset the global connection counter"""
+        current_time = time.time()
+        # Reset counter every 10 minutes
+        if current_time - cls._last_reset_time > 600:
+            cls._global_connection_attempts = 0
+            cls._last_reset_time = current_time
+            print("Circuit breaker reset - connection attempts counter reset")
+    
+    @classmethod
+    def _increment_connection_attempts(cls):
+        """Increment global connection attempts and check if we should stop"""
+        cls._global_connection_attempts += 1
+        if cls._global_connection_attempts > cls._max_global_attempts:
+            print(f"Circuit breaker triggered: {cls._global_connection_attempts} total connection attempts exceeded limit of {cls._max_global_attempts}")
+            return False
+        return True
         
     def setup_client(self):
         """Setup cTrader client connection"""
         if not CTRADER_API_AVAILABLE:
             return None
+        
+        # Only count actual client setups, not reuse of existing connections
+        if not self.connection_established:
+            # Check circuit breaker only for new connections
+            if not self._increment_connection_attempts():
+                print("Circuit breaker: Too many connection attempts. Aborting.")
+                return None
             
         # Use demo environment for testing
         self.client = Client(EndPoints.PROTOBUF_DEMO_HOST, EndPoints.PROTOBUF_PORT, TcpProtocol)
@@ -158,6 +198,8 @@ class CTraderDataManager:
     
     def _on_connected(self, client):
         print("Connected to cTrader API")
+        self.connection_established = True  # Mark connection as established
+        
         # Authenticate application
         request = ProtoOAApplicationAuthReq()
         request.clientId = CTRADER_CLIENT_ID
@@ -172,36 +214,66 @@ class CTraderDataManager:
 
     def _on_error(self, failure):
         print(f"API Error: {failure}")
-        self.timeout_count += 1
         
         # Check if it's a timeout error
         if 'TimeoutError' in str(failure) or 'timeout' in str(failure).lower():
+            self.timeout_count += 1
             print(f"Request timeout occurred (attempt {self.timeout_count}/{self.max_retries})")
             
             if self.timeout_count < self.max_retries:
                 print("Retrying in 5 seconds...")
+                # Use callLater to prevent immediate recursion
                 reactor.callLater(5, self._retry_connection)
                 return
             else:
                 print("Max retries reached. Giving up.")
         
-        # Complete with empty data on error
+        # Complete with empty data on error - always call this to stop infinite loops
+        self._complete_with_empty_data()
+    
+    def _complete_with_empty_data(self):
+        """Complete the request with empty data and stop any further retries"""
+        print("Completing with empty data...")
+        
+        # Mark as completed to prevent further retries
+        self.timeout_count = self.max_retries
+        
+        # Complete deferred if not already done
         if self.deferred_result and not self.deferred_result.called:
             self.deferred_result.callback({})
-        reactor.stop()
+        
+        # Try to stop reactor safely
+        try:
+            import signal
+            if (reactor.running and 
+                threading.current_thread() is threading.main_thread() and
+                hasattr(signal, 'SIGINT')):
+                reactor.stop()
+        except Exception:
+            pass
     
     def _retry_connection(self):
         """Retry the connection after a timeout"""
         print("Retrying connection...")
         try:
-            # Reset state
+            # Prevent further retries if we've exceeded max attempts
+            if self.timeout_count >= self.max_retries:
+                print("Max retries exceeded in retry attempt. Stopping.")
+                self._complete_with_empty_data()
+                return
+            
+            # Reset state for retry
             self.pending_requests = 0
             self.symbols_map = {}
             self.retrieved_data = {}
             
-            # Try to reconnect
+            # Disconnect current client if exists
             if self.client:
-                self.client.disconnect()
+                try:
+                    self.client.disconnect()
+                except Exception:
+                    pass
+                self.client = None
             
             # Setup new client
             client = self.setup_client()
@@ -209,15 +281,11 @@ class CTraderDataManager:
                 client.startService()
             else:
                 print("Failed to setup client for retry")
-                if self.deferred_result and not self.deferred_result.called:
-                    self.deferred_result.callback({})
-                reactor.stop()
+                self._complete_with_empty_data()
                 
         except Exception as e:
             print(f"Error during retry: {e}")
-            if self.deferred_result and not self.deferred_result.called:
-                self.deferred_result.callback({})
-            reactor.stop()
+            self._complete_with_empty_data()
     
     def _authenticate_account(self):
         """Authenticate trading account"""
@@ -255,9 +323,7 @@ class CTraderDataManager:
             self._authenticate_account()
         else:
             print("No accounts available")
-            if self.deferred_result and not self.deferred_result.called:
-                self.deferred_result.callback({})
-            reactor.stop()
+            self._complete_with_empty_data()
     
     def _get_symbols_list(self):
         """Get list of available symbols"""
@@ -280,9 +346,13 @@ class CTraderDataManager:
         
         # Check if our target symbols are available
         missing_symbols = []
+        available_symbols = []
+        
         for symbol in self.target_symbols:
             if symbol not in self.symbols_map:
                 missing_symbols.append(symbol)
+            else:
+                available_symbols.append(symbol)
         
         if missing_symbols:
             print(f"Warning: These symbols were not found: {missing_symbols}")
@@ -293,6 +363,9 @@ class CTraderDataManager:
                 if similar:
                     print(f"  Similar to '{missing}': {similar[:5]}")
         
+        if available_symbols:
+            print(f"Found {len(available_symbols)} available symbols: {available_symbols[:5]}{'...' if len(available_symbols) > 5 else ''}")
+        
         # Start requesting data for each symbol
         self._request_historical_data()
     
@@ -302,17 +375,18 @@ class CTraderDataManager:
             return
             
         # Calculate time range
-        start_dt = pd.to_datetime(self.config.START)
-        end_dt = pd.to_datetime(self.config.END) if self.config.END else pd.Timestamp.now()
+        start_dt = pd.to_datetime(self.config.start_date)
+        end_dt = pd.to_datetime(self.config.end_date) if self.config.end_date else pd.Timestamp.now()
         
         from_timestamp = int(calendar.timegm(start_dt.utctimetuple())) * 1000
         to_timestamp = int(calendar.timegm(end_dt.utctimetuple())) * 1000
         
         # Map interval to cTrader period
         period_map = {
-            "1m": "M1", "5m": "M5", "15m": "M15", "1h": "H1", "4h": "H4", "1d": "D1"
+            "M1": "M1", "M5": "M5", "M15": "M15", "M30": "M30", 
+            "H1": "H1", "H4": "H4", "D1": "D1", "W1": "W1", "MN1": "MN1"
         }
-        period = period_map.get(self.config.INTERVAL, "M15")
+        period = period_map.get(self.config.interval, "M15")
         
         # Filter symbols to only those available
         available_symbols = [s for s in self.target_symbols if s in self.symbols_map]
@@ -356,6 +430,15 @@ class CTraderDataManager:
     def _on_data_error(self, failure):
         """Handle errors for individual data requests"""
         print(f"Data request error: {failure}")
+        
+        # Increment timeout counter for data errors too
+        if 'TimeoutError' in str(failure) or 'timeout' in str(failure).lower():
+            self.timeout_count += 1
+            if self.timeout_count >= self.max_retries:
+                print("Max data request timeouts reached. Stopping.")
+                self._complete_with_empty_data()
+                return
+        
         self.pending_requests -= 1
         
         # Continue with remaining requests even if one fails
@@ -448,33 +531,75 @@ class CTraderDataManager:
         print("Data retrieval completed")
         if self.deferred_result and not self.deferred_result.called:
             self.deferred_result.callback(self.retrieved_data)
-        reactor.stop()
+        
+        # Only stop reactor safely
+        try:
+            import signal
+            if (reactor.running and 
+                threading.current_thread() is threading.main_thread() and
+                hasattr(signal, 'SIGINT')):
+                reactor.stop()
+        except Exception:
+            pass
     
     def get_historical_data(self, symbols, interval, start, end=None):
-        """Get historical data for symbols"""
-        self.target_symbols = symbols
+        """Get historical data for symbols
+        
+        Args:
+            symbols: str or list of str - symbol(s) to retrieve data for
+            interval: str - time interval
+            start: str - start date
+            end: str - end date (optional)
+            
+        Returns:
+            pandas.Series if single symbol, dict of Series if multiple symbols
+        """
+        # Handle both single symbol and list of symbols
+        if isinstance(symbols, str):
+            symbol_list = [symbols]
+            return_single = True
+        else:
+            symbol_list = symbols
+            return_single = False
+        
+        print(f"CTrader: Requesting data for {symbol_list}")
+        
+        # Check circuit breaker first
+        if not self._increment_connection_attempts():
+            print("Circuit breaker: Too many global connection attempts. Returning empty data.")
+            if return_single:
+                return pd.Series(dtype=float)
+            else:
+                return {symbol: pd.Series(dtype=float) for symbol in symbol_list}
+        
+        # Reset state for new request
+        self.target_symbols = symbol_list
+        self.timeout_count = 0  # Reset timeout counter for new request
+        self.retrieved_data = {}
         self.deferred_result = defer.Deferred()
         
         if not CTRADER_API_AVAILABLE:
             print("cTrader API not available, returning empty data")
-            return {symbol: pd.Series(dtype=float) for symbol in symbols}
+            if return_single:
+                return pd.Series(dtype=float)
+            else:
+                return {symbol: pd.Series(dtype=float) for symbol in symbol_list}
         
         # Setup client first to initialize account_id
         client = self.setup_client()
         if not client:
             print("Failed to setup client")
-            return {symbol: pd.Series(dtype=float) for symbol in symbols}
-        
-        # Check if we have account ID after setup
-        if not self.account_id:
-            print("No account ID available after setup - will try to get from API")
+            if return_single:
+                return pd.Series(dtype=float)
+            else:
+                return {symbol: pd.Series(dtype=float) for symbol in symbol_list}
         
         try:
             # Start the reactor to handle API communication
             client.startService()
             
-            # Add a global timeout for the entire operation
-            timeout_deferred = reactor.callLater(300, self._global_timeout)  # 5 minute timeout
+            # Add a shorter global timeout
+            timeout_deferred = reactor.callLater(60, self._global_timeout)  # 1 minute timeout
             
             def cleanup_timeout(result):
                 if timeout_deferred.active():
@@ -482,20 +607,61 @@ class CTraderDataManager:
                 return result
             
             self.deferred_result.addBoth(cleanup_timeout)
-            reactor.run()
+            
+            # Simple approach: just run reactor if not running, otherwise wait
+            if not reactor.running:
+                reactor.run(installSignalHandlers=False)
+            else:
+                # Wait for result with shorter timeout
+                timeout = 60  # 1 minute
+                start_time = time.time()
+                while not self.deferred_result.called and (time.time() - start_time) < timeout:
+                    time.sleep(0.1)
+                
+                if not self.deferred_result.called:
+                    print("Timeout waiting for data retrieval")
+                    self.deferred_result.callback({})
             
         except Exception as e:
             print(f"Exception during data retrieval: {e}")
-            return {symbol: pd.Series(dtype=float) for symbol in symbols}
+            if return_single:
+                return pd.Series(dtype=float)
+            else:
+                return {symbol: pd.Series(dtype=float) for symbol in symbol_list}
         
-        return self.retrieved_data
+        # Return the result - handle both single symbol and multiple symbols  
+        if self.deferred_result.called:
+            try:
+                # Access the result directly from the deferred
+                if hasattr(self.deferred_result, 'result'):
+                    result = self.deferred_result.result
+                else:
+                    result = {}
+            except Exception as e:
+                print(f"Error accessing deferred result: {e}")
+                result = {}
+        else:
+            result = {}
+        
+        if return_single:
+            # Return Series for single symbol
+            symbol = symbol_list[0]
+            return result.get(symbol, pd.Series(dtype=float))
+        else:
+            # Return dict for multiple symbols
+            return result
     
     def _global_timeout(self):
         """Handle global timeout for the entire operation"""
         print("Global timeout reached. Stopping data retrieval.")
-        if self.deferred_result and not self.deferred_result.called:
-            self.deferred_result.callback(self.retrieved_data)
-        reactor.stop()
+        
+        # Store empty data for all requested symbols
+        for symbol in getattr(self, 'target_symbols', []):
+            if symbol not in self.retrieved_data:
+                self.retrieved_data[symbol] = pd.Series(dtype=float)
+        
+        # Use the helper to complete cleanly
+        self._complete_with_empty_data()
 
     @staticmethod
     def get_data(symbols, interval, start, end=None):
@@ -587,3 +753,59 @@ class CTraderDataManager:
                     if symbol not in self.trading_engine.subscribed_symbols:
                         self.trading_engine.subscribed_symbols.add(symbol)
                         logger.debug(f"Confirmed subscription for {symbol}")
+
+    def test_connection(self) -> bool:
+        """Test if CTrader connection is working properly"""
+        if not CTRADER_API_AVAILABLE:
+            print("CTrader API not available")
+            return False
+        
+        if not self.access_token or not self.account_id:
+            print("Missing CTrader credentials")
+            return False
+        
+        try:
+            # Try a simple test with minimal timeout
+            test_symbols = ['EURUSD']  # Single symbol test
+            self.target_symbols = test_symbols
+            self.deferred_result = defer.Deferred()
+            
+            client = self.setup_client()
+            if not client:
+                return False
+            
+            # Start with short timeout for connection test
+            client.startService()
+            timeout_deferred = reactor.callLater(30, self._test_timeout)  # 30 second timeout
+            
+            def cleanup_timeout(result):
+                if timeout_deferred.active():
+                    timeout_deferred.cancel()
+                return result
+            
+            self.deferred_result.addBoth(cleanup_timeout)
+            
+            # Run test connection
+            if not reactor.running:
+                reactor.run()
+            
+            # Check if we got any data
+            return len(self.retrieved_data) > 0 and any(
+                isinstance(data, pd.Series) and len(data) > 0 
+                for data in self.retrieved_data.values()
+            )
+            
+        except Exception as e:
+            print(f"CTrader connection test failed: {e}")
+            return False
+    
+    def _test_timeout(self):
+        """Handle timeout for connection test"""
+        print("CTrader connection test timeout")
+        if self.deferred_result and not self.deferred_result.called:
+            self.deferred_result.callback({})
+        try:
+            if reactor.running:
+                reactor.stop()
+        except:
+            pass

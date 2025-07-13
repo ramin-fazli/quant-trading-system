@@ -22,7 +22,7 @@ class TradingConfig:
     # Data parameters
     interval: str = "M15"
     start_date: str = "2025-06-01"
-    data_provider: str = 'mt5'  # Options: 'mt5', 'ctrader'
+    data_provider: str = 'ctrader'  # Options:  'ctrader','mt5'    
     end_date: Optional[str] = None
     
     # Strategy parameters
