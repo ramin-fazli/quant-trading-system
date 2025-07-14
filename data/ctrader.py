@@ -778,7 +778,7 @@ class CTraderDataManager:
         
         try:
             # Set a global timeout - exactly like working version  
-            timeout_deferred = reactor.callLater(90, self._global_timeout)  # Increased timeout
+            timeout_deferred = reactor.callLater(10000, self._global_timeout)  # Increased timeout
             
             # Start the reactor to handle API communication - exactly like working version
             self.client.startService()

@@ -219,14 +219,41 @@ class IntelligentDataManager:
         
         logger.info(f"Found {len(gaps)} data gaps for {symbol}")
         
-        # Step 3: Handle gaps based on provider
+        # Step 3: Handle gaps based on provider and gap count
         if data_provider.lower() == 'ctrader':
             # For cTrader, we need to fetch all missing data in one go to avoid reactor issues
             logger.info(f"cTrader provider detected - will handle gaps in bulk fetch")
             # Return existing data for now, bulk fetch will handle the gaps
             return existing_data
+        elif len(gaps) > 20:  # MT5 optimization: if too many gaps, use bulk fetch
+            logger.info(f"MT5 provider with {len(gaps)} gaps detected - using bulk fetch strategy")
+            logger.info(f"This is more efficient than {len(gaps)} individual API calls")
+            
+            # Fetch all data in bulk and let MT5 return whatever it has
+            bulk_data = self._fetch_and_store_data(symbol, interval, start_date, end_date, data_provider)
+            
+            if not bulk_data.empty:
+                # Normalize timezones before merging
+                existing_data = self._normalize_timezone(existing_data)
+                bulk_data = self._normalize_timezone(bulk_data)
+                
+                # Merge with existing data, preferring new data for overlaps
+                combined_data = pd.concat([existing_data, bulk_data]).sort_index()
+                combined_data = combined_data[~combined_data.index.duplicated(keep='last')]
+                
+                # Store the new data points in InfluxDB
+                new_points = bulk_data[~bulk_data.index.isin(existing_data.index)]
+                if not new_points.empty:
+                    logger.info(f"Storing {len(new_points)} new data points from bulk fetch")
+                
+                final_data = combined_data[(combined_data.index >= start_date) & (combined_data.index <= end_date)]
+                logger.info(f"Final dataset for {symbol}: {len(final_data)} points (bulk strategy)")
+                return final_data
+            else:
+                logger.warning(f"Bulk fetch returned no data for {symbol}")
+                return existing_data
         else:
-            # For MT5, fetch gaps individually
+            # For MT5 with few gaps, fetch gaps individually
             logger.info(f"Fetching missing data gaps individually for {symbol}")
             for gap in gaps:
                 logger.info(f"Fetching gap: {gap}")
@@ -308,55 +335,54 @@ class IntelligentDataManager:
             logger.warning(f"Unknown interval {interval}, cannot detect gaps")
             return gaps
         
-        # Create expected index
-        expected_index = pd.date_range(start=start_date, end=end_date, freq=freq)
-        existing_index = existing_data.index
+        # For market data, we need to be smarter about gap detection
+        # Don't expect data during weekends, holidays, or outside market hours
         
-        # Find missing periods
-        missing_periods = expected_index.difference(existing_index)
+        # Check data coverage more intelligently
+        data_start = existing_data.index.min()
+        data_end = existing_data.index.max()
         
-        if len(missing_periods) == 0:
-            return gaps  # No gaps
+        # Calculate the expected data points more conservatively
+        # For M15 data, we expect roughly 26 points per trading day (6.5 hours * 4 points/hour)
+        # For daily data, we expect roughly 252 trading days per year
         
-        # Group consecutive missing periods into gaps
-        if len(missing_periods) > 0:
-            # Group consecutive timestamps
-            groups = []
-            current_group = [missing_periods[0]]
+        if interval == 'M15':
+            # For 15-minute data, check if we have reasonable coverage
+            expected_days = (end_date - start_date).days
+            trading_days = expected_days * 5/7  # Rough estimate of trading days
+            expected_points = trading_days * 26  # ~26 points per trading day
             
-            for i in range(1, len(missing_periods)):
-                current_ts = missing_periods[i]
-                prev_ts = missing_periods[i-1]
-                
-                # Check if this timestamp is consecutive to the previous one
-                expected_next = prev_ts + pd.Timedelta(freq)
-                if current_ts <= expected_next + pd.Timedelta(freq):  # Allow some tolerance
-                    current_group.append(current_ts)
-                else:
-                    # Start a new group
-                    groups.append(current_group)
-                    current_group = [current_ts]
+            actual_points = len(existing_data)
+            coverage_ratio = actual_points / max(expected_points, 1)
             
-            # Add the last group
-            groups.append(current_group)
+            logger.debug(f"{symbol}: Expected ~{expected_points:.0f} points, got {actual_points}, coverage: {coverage_ratio:.2%}")
             
-            # Convert groups to gaps
-            for group in groups:
-                gap_start = min(group)
-                gap_end = max(group)
+            # If we have reasonable coverage (>70%), consider it complete
+            if coverage_ratio > 0.7:
+                logger.debug(f"{symbol} has good coverage ({coverage_ratio:.2%}), no gaps detected")
+                return gaps
                 
-                # Extend gap slightly to ensure we get all needed data
-                gap_start = gap_start - pd.Timedelta(freq)
-                gap_end = gap_end + pd.Timedelta(freq)
+            # If coverage is poor, check for major gaps in the timeline
+            if data_start > start_date + pd.Timedelta(days=7):
+                # Missing data at the beginning
+                gap_end = min(data_start - pd.Timedelta(hours=1), end_date)
+                gaps.append(DataGap(symbol, start_date, gap_end, interval))
                 
-                # Ensure gap is within requested range
-                gap_start = max(gap_start, start_date)
-                gap_end = min(gap_end, end_date)
+            if data_end < end_date - pd.Timedelta(days=7):
+                # Missing data at the end
+                gap_start = max(data_end + pd.Timedelta(hours=1), start_date)
+                gaps.append(DataGap(symbol, gap_start, end_date, interval))
                 
-                if gap_start < gap_end:
-                    gaps.append(DataGap(symbol, gap_start, gap_end, interval))
+        else:
+            # For other intervals, use a simpler approach
+            # Check if we're missing significant chunks of data
+            if data_start > start_date + pd.Timedelta(days=1):
+                gaps.append(DataGap(symbol, start_date, data_start, interval))
+                
+            if data_end < end_date - pd.Timedelta(days=1):
+                gaps.append(DataGap(symbol, data_end, end_date, interval))
         
-        logger.debug(f"Detected {len(gaps)} gaps for {symbol}")
+        logger.debug(f"Detected {len(gaps)} significant gaps for {symbol}")
         return gaps
     
     def _normalize_timezone(self, data: pd.Series) -> pd.Series:
@@ -728,7 +754,7 @@ class BacktestDataManager:
             logger.info("All data will be fetched in one reactor session to avoid connection issues")
         
         # Use intelligent data manager to fetch data with provider-specific optimization
-        return self.intelligent_data_manager.get_historical_data_intelligent(
+        raw_data = self.intelligent_data_manager.get_historical_data_intelligent(
             symbols=all_symbols,
             interval=self.config.interval,
             start_date=self.config.start_date,
@@ -736,6 +762,25 @@ class BacktestDataManager:
             data_provider=data_provider,
             force_refresh=force_refresh
         )
+        
+        # Clean and validate all data series to prevent duplicate timestamp issues
+        cleaned_data = {}
+        for symbol, data in raw_data.items():
+            if not data.empty:
+                # Remove any duplicate timestamps that might cause alignment issues
+                cleaned_series = data.sort_index()
+                if cleaned_series.index.duplicated().any():
+                    logger.warning(f"Found duplicate timestamps in {symbol}, removing duplicates")
+                    cleaned_series = cleaned_series[~cleaned_series.index.duplicated(keep='last')]
+                
+                # Ensure proper timezone normalization
+                cleaned_series = self.intelligent_data_manager._normalize_timezone(cleaned_series)
+                cleaned_data[symbol] = cleaned_series
+                logger.debug(f"Cleaned {symbol}: {len(cleaned_series)} points")
+            else:
+                cleaned_data[symbol] = data
+        
+        return cleaned_data
     
     def get_pair_data(self, pair: str, data_cache: Dict[str, pd.Series]) -> Tuple[pd.Series, pd.Series]:
         """Extract pair data from the data cache"""
@@ -752,8 +797,27 @@ class BacktestDataManager:
         data1 = self.intelligent_data_manager._normalize_timezone(data1)
         data2 = self.intelligent_data_manager._normalize_timezone(data2)
         
+        # Additional duplicate check to be safe
+        if data1.index.duplicated().any():
+            logger.warning(f"Removing duplicates from {symbol1} during pair alignment")
+            data1 = data1[~data1.index.duplicated(keep='last')]
+            
+        if data2.index.duplicated().any():
+            logger.warning(f"Removing duplicates from {symbol2} during pair alignment")
+            data2 = data2[~data2.index.duplicated(keep='last')]
+        
         # Align the series by index
-        aligned_data = pd.concat([data1, data2], axis=1, keys=[symbol1, symbol2]).dropna()
+        try:
+            aligned_data = pd.concat([data1, data2], axis=1, keys=[symbol1, symbol2]).dropna()
+        except ValueError as e:
+            if "duplicate labels" in str(e).lower():
+                logger.error(f"Duplicate timestamp issue in pair {pair}: {e}")
+                # Try to fix by ensuring unique index
+                data1 = data1.groupby(data1.index).last()
+                data2 = data2.groupby(data2.index).last()
+                aligned_data = pd.concat([data1, data2], axis=1, keys=[symbol1, symbol2]).dropna()
+            else:
+                raise e
         
         if aligned_data.empty:
             logger.warning(f"No aligned data available for pair {pair}")

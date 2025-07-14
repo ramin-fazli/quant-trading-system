@@ -27,7 +27,7 @@ class TradingConfig:
     end_date: Optional[str] = None
     
     # Strategy parameters
-    z_entry: float = 0
+    z_entry: float = 2
     z_exit: float = 0.5
     z_period: int = 100
     min_distance: float = 0  # Minimum distance from mean to enter trade (in percentage)

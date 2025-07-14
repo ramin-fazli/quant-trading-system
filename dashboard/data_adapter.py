@@ -137,9 +137,13 @@ class DataAdapter:
         try:
             metrics = pair_result.get('metrics', {})
             
+            # Get pair name from either the metrics or the top-level pair_result
+            pair_name = metrics.get('pair') or pair_result.get('pair', 'Unknown')
+            
             pair_data = {
-                'pair': metrics.get('pair', 'Unknown'),
+                'pair': pair_name,
                 'metrics': {
+                    'pair': pair_name,  # Add pair name to metrics for template compatibility
                     'total_return': self._safe_float(metrics.get('total_return', 0)),
                     'sharpe_ratio': self._safe_float(metrics.get('sharpe_ratio', 0)),
                     'sortino_ratio': self._safe_float(metrics.get('sortino_ratio', 0)),
@@ -147,10 +151,10 @@ class DataAdapter:
                     'total_trades': int(metrics.get('total_trades', 0)),
                     'win_rate': self._safe_float(metrics.get('win_rate', 0)),
                     'profit_factor': self._safe_float(metrics.get('profit_factor', 0)),
-                    'avg_trade_return': self._safe_float(metrics.get('avg_trade_return', 0)),
-                    'best_trade': self._safe_float(metrics.get('best_trade', 0)),
-                    'worst_trade': self._safe_float(metrics.get('worst_trade', 0)),
-                    'avg_trade_duration': self._safe_float(metrics.get('avg_trade_duration', 0)),
+                    'avg_trade_return': self._safe_float(metrics.get('avg_trade_pnl', metrics.get('avg_trade_return', 0))),
+                    'best_trade': self._safe_float(metrics.get('max_trade_pnl', metrics.get('best_trade', 0))),
+                    'worst_trade': self._safe_float(metrics.get('min_trade_pnl', metrics.get('worst_trade', 0))),
+                    'avg_trade_duration': self._safe_float(metrics.get('avg_bars_held', metrics.get('avg_trade_duration', 0))),
                     'composite_score': self._safe_float(metrics.get('composite_score', 0))
                 },
                 'trades': [],

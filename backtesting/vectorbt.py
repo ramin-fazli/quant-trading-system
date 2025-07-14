@@ -93,13 +93,13 @@ class VectorBTBacktester:
         
         # Force sequential processing for CTrader to avoid API overload
         if is_ctrader:
-            logger.info("Using sequential processing for CTrader data manager")
+            logger.info(f"Using sequential processing for {data_manager_type} data manager")
             return self._run_pairs_sequential()
         elif self.use_multiprocessing:
-            logger.info("Using parallel processing for MT5 data manager")
+            logger.info(f"Using parallel processing for {data_manager_type} data manager")
             return self._run_pairs_parallel()
         else:
-            logger.info("Using sequential processing")
+            logger.info(f"Using sequential processing for {data_manager_type} data manager")
             return self._run_pairs_sequential()
     
     def _run_pairs_parallel(self) -> List[Dict]:
@@ -137,7 +137,7 @@ class VectorBTBacktester:
         
         logger.info(f"Running sequential processing (detected {data_manager_type})")
         if is_ctrader:
-            logger.info("Using sequential processing for CTrader to avoid API rate limits")
+            logger.info(f"Using sequential processing for {data_manager_type} to avoid API rate limits")
         
         for i, pair_str in enumerate(self.config.pairs):
             try:
@@ -149,7 +149,7 @@ class VectorBTBacktester:
                 # Add delay for CTrader to avoid rate limiting and connection issues
                 if is_ctrader and i < len(self.config.pairs) - 1:
                     delay_time = 3  # Increased delay to 3 seconds
-                    logger.debug(f"CTrader delay: waiting {delay_time} seconds before next pair...")
+                    logger.debug(f"{data_manager_type} delay: waiting {delay_time} seconds before next pair...")
                     time.sleep(delay_time)
                     
             except Exception as e:
@@ -186,14 +186,14 @@ class VectorBTBacktester:
                         data1 = data2 = pd.Series(dtype=float)
                         
                 except Exception as e:
-                    logger.warning(f"CTrader batch request failed for {pair_str}: {e}, falling back to individual requests")
+                    logger.warning(f"{data_manager_type} batch request failed for {pair_str}: {e}, falling back to individual requests")
                     # Fall back to individual requests
                     data1 = self.data_manager.get_historical_data(s1, self.config.interval, 
                                                                  self.config.start_date, self.config.end_date)
                     data2 = self.data_manager.get_historical_data(s2, self.config.interval,
                                                                  self.config.start_date, self.config.end_date)
             else:
-                # For MT5 and other data managers, use individual requests
+                # For other data managers, use individual requests
                 data1 = self.data_manager.get_historical_data(s1, self.config.interval, 
                                                              self.config.start_date, self.config.end_date)
                 data2 = self.data_manager.get_historical_data(s2, self.config.interval,
