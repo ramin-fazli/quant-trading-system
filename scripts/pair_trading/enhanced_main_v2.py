@@ -52,7 +52,7 @@ def filtered_log_msg(*args, **kwargs):
 
 # Only replace if we're using CTrader (to avoid interfering with other Twisted usage)
 try:
-    from data.ctrader_working import CTraderDataManager
+    from data.ctrader import CTraderDataManager
     log.msg = filtered_log_msg
 except ImportError:
     pass
@@ -94,7 +94,7 @@ import logging
 temp_logger = logging.getLogger(__name__)
 
 try:
-    from data.ctrader_working import CTraderDataManager
+    from data.ctrader import CTraderDataManager
     CTRADER_WORKING_AVAILABLE = True
     temp_logger.info("Using working CTrader data manager")
 except ImportError:
@@ -689,9 +689,9 @@ class EnhancedTradingSystemV2:
                     logger.warning(f"Too many symbols ({len(all_symbols)}), limiting to first {max_symbols_per_session} to avoid rate limits")
                     all_symbols = all_symbols[:max_symbols_per_session]
                 
-                # Fetch all data in ONE connection using the working pattern from pairs_trading_ctrader_v4.py
+                # Fetch all data in ONE connection
                 try:
-                    logger.info("Fetching all symbols in single connection (like pairs_trading_ctrader_v4.py)...")
+                    logger.info("Fetching all symbols in single connection ...")
                     
                     # Get all data in one reactor session - exactly like the working script
                     bulk_data = self.primary_data_manager.get_historical_data(
@@ -939,13 +939,13 @@ class EnhancedTradingSystemV2:
                             except Exception as e:
                                 logger.debug(f"Error getting MT5 tick data for {pair}: {e}")
                                 # Fallback to mock data
-                                current_data = {
-                                    'bid': 1.1000 + (hash(pair) % 100) * 0.0001,
-                                    'ask': 1.1005 + (hash(pair) % 100) * 0.0001,
-                                    'last': 1.1002 + (hash(pair) % 100) * 0.0001,
-                                    'volume': 1000 + (hash(pair) % 1000),
-                                    'timestamp': datetime.now().isoformat()
-                                }
+                                # current_data = {
+                                #     'bid': 1.1000 + (hash(pair) % 100) * 0.0001,
+                                #     'ask': 1.1005 + (hash(pair) % 100) * 0.0001,
+                                #     'last': 1.1002 + (hash(pair) % 100) * 0.0001,
+                                #     'volume': 1000 + (hash(pair) % 1000),
+                                #     'timestamp': datetime.now().isoformat()
+                                # }
                         
                         if current_data:
                             # Store in InfluxDB with provider tag
