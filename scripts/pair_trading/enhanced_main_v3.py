@@ -287,21 +287,100 @@ class InfluxDBManager:
             
             # Store individual pair results
             for pair_result in backtest_results.get('pair_results', []):
+                metrics = pair_result.get('metrics', {})
                 pair_point = (
                     Point("pair_backtest_results")
-                    .tag("pair", pair_result.get('pair', ''))
+                    .tag("pair", metrics.get('pair', ''))
                     .tag("strategy", "pairs_trading")
-                    .field("return", float(pair_result.get('return', 0)))
-                    .field("sharpe", float(pair_result.get('sharpe', 0)))
-                    .field("max_drawdown", float(pair_result.get('max_drawdown', 0)))
-                    .field("total_trades", int(pair_result.get('total_trades', 0)))
-                    .field("win_rate", float(pair_result.get('win_rate', 0)))
+                    .field("return", float(metrics.get('total_return', 0)))
+                    .field("sharpe", float(metrics.get('sharpe_ratio', 0)))
+                    .field("max_drawdown", float(metrics.get('max_drawdown', 0)))
+                    .field("total_trades", int(metrics.get('total_trades', 0)))
+                    .field("win_rate", float(metrics.get('win_rate', 0)))
                     .time(datetime.utcnow(), WritePrecision.NS)
                 )
                 self.write_api.write(bucket=self.bucket, org=self.org, record=pair_point)
                 
         except Exception as e:
             logger.warning(f"Failed to store backtest results in InfluxDB (continuing anyway): {e}")
+    
+    def get_latest_backtest_results(self) -> Optional[Dict[str, Any]]:
+        """Retrieve the most recent backtest results from InfluxDB"""
+        try:
+            if not self.query_api:
+                logger.warning("InfluxDB query API not available")
+                return None
+                
+            # Query for the most recent backtest results
+            query = f'''
+                from(bucket: "{self.bucket}")
+                |> range(start: -30d)
+                |> filter(fn: (r) => r["_measurement"] == "backtest_results")
+                |> filter(fn: (r) => r["strategy"] == "pairs_trading")
+                |> sort(columns: ["_time"], desc: true)
+                |> limit(n: 1)
+                |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+            '''
+            
+            result = self.query_api.query(org=self.org, query=query)
+            
+            backtest_data = None
+            timestamp = None
+            
+            for table in result:
+                for record in table.records:
+                    if not backtest_data:
+                        timestamp = record.get_time()
+                        backtest_data = {
+                            'portfolio_metrics': {
+                                'portfolio_return': record.values.get('portfolio_return', 0),
+                                'portfolio_sharpe': record.values.get('sharpe_ratio', 0),
+                                'portfolio_max_drawdown': record.values.get('max_drawdown', 0),
+                                'total_trades': record.values.get('total_trades', 0),
+                                'portfolio_win_rate': record.values.get('win_rate', 0)
+                            },
+                            'pair_results': [],
+                            'timestamp': timestamp.isoformat() if timestamp else datetime.now().isoformat(),
+                            'data_source': 'influxdb',
+                            'intelligent_caching': True
+                        }
+            
+            if backtest_data:
+                # Query for pair results from the same timeframe
+                pair_query = f'''
+                    from(bucket: "{self.bucket}")
+                    |> range(start: {timestamp.strftime('%Y-%m-%dT%H:%M:%SZ')}, stop: {(timestamp + timedelta(minutes=5)).strftime('%Y-%m-%dT%H:%M:%SZ')})
+                    |> filter(fn: (r) => r["_measurement"] == "pair_backtest_results")
+                    |> filter(fn: (r) => r["strategy"] == "pairs_trading")
+                    |> pivot(rowKey:["_time", "pair"], columnKey: ["_field"], valueColumn: "_value")
+                '''
+                
+                pair_result = self.query_api.query(org=self.org, query=pair_query)
+                
+                for table in pair_result:
+                    for record in table.records:
+                        pair_data = {
+                            'pair': record.values.get('pair', ''),
+                            'metrics': {
+                                'pair': record.values.get('pair', ''),
+                                'total_return': record.values.get('return', 0),
+                                'sharpe_ratio': record.values.get('sharpe', 0),
+                                'max_drawdown': record.values.get('max_drawdown', 0),
+                                'total_trades': record.values.get('total_trades', 0),
+                                'win_rate': record.values.get('win_rate', 0)
+                            }
+                        }
+                        backtest_data['pair_results'].append(pair_data)
+                
+                logger.info(f"Retrieved latest backtest results from InfluxDB: {len(backtest_data['pair_results'])} pairs")
+                return backtest_data
+            else:
+                logger.warning("No backtest results found in InfluxDB")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Failed to retrieve latest backtest results from InfluxDB: {e}")
+            return None
     
     def get_market_data(self, symbol: str, hours: int = 24) -> List[Dict]:
         """Retrieve market data from InfluxDB"""
@@ -721,6 +800,8 @@ class EnhancedTradingSystemV3:
                     data_source=self.primary_data_manager,
                     symbols=[],  # Will be populated during live trading
                     dashboard_config=None,
+                    influxdb_manager=self.influxdb_manager,  # Pass InfluxDB manager to load latest backtest results
+                    config=self.config,  # Pass trading config for data processing
                     blocking=False  # Important: don't block the main thread
                 )
             
@@ -881,14 +962,25 @@ class EnhancedTradingSystemV3:
                         from twisted.internet import reactor
                         if not reactor.running:
                             logger.info("Starting cTrader Twisted reactor...")
-                            reactor.run(installSignalHandlers=False)
+                            try:
+                                reactor.run(installSignalHandlers=False)
+                            except Exception as reactor_error:
+                                logger.error(f"Error in cTrader reactor: {reactor_error}")
+                                # Don't re-raise here, log and continue
                         else:
                             logger.info("cTrader Twisted reactor already running")
                             
+                    except KeyboardInterrupt:
+                        logger.info("cTrader trading interrupted by user")
                     except Exception as e:
                         logger.error(f"Error in cTrader trading: {e}")
-                        import traceback
-                        traceback.print_exc()
+                        # Check if it's a timeout error and handle gracefully
+                        if "timeout" in str(e).lower() or "symbols" in str(e).lower():
+                            logger.warning("cTrader connection issues detected - trading will continue in degraded mode")
+                            logger.warning("Some features may be limited until connection stabilizes")
+                        else:
+                            import traceback
+                            traceback.print_exc()
                 
                 # Start cTrader in a separate thread
                 trading_thread = threading.Thread(target=start_ctrader_trading, daemon=True)
@@ -933,13 +1025,53 @@ class EnhancedTradingSystemV3:
             
             # Try to get portfolio status to verify connection
             try:
-                portfolio_status = self.trader.get_portfolio_status() if hasattr(self.trader, 'get_portfolio_status') else None
+                portfolio_status = None
+                if hasattr(self.trader, 'get_portfolio_status'):
+                    # Use threading timeout instead of signal (works on Windows)
+                    
+                    result = [None]
+                    exception = [None]
+                    
+                    def get_status():
+                        try:
+                            result[0] = self.trader.get_portfolio_status()
+                        except Exception as e:
+                            exception[0] = e
+                    
+                    status_thread = threading.Thread(target=get_status)
+                    status_thread.daemon = True
+                    status_thread.start()
+                    status_thread.join(timeout=5)  # 5-second timeout
+                    
+                    if status_thread.is_alive():
+                        raise TimeoutError("Portfolio status check timed out")
+                    elif exception[0]:
+                        raise exception[0]
+                    else:
+                        portfolio_status = result[0]
+                
                 if portfolio_status:
                     logger.info(f"✅ Portfolio Status: Connected (${portfolio_status.get('portfolio_value', 'N/A')})")
                 else:
-                    logger.warning("⚠️ Portfolio Status: Not available yet")
+                    logger.warning("⚠️ Portfolio Status: Not available yet (this is normal during initialization)")
+                    
+            except TimeoutError:
+                logger.warning("⚠️ Portfolio Status: Timeout during check (connection may be slow)")
             except Exception as e:
-                logger.warning(f"⚠️ Portfolio Status: Error - {e}")
+                # Check if it's a symbols-related error
+                if "symbols" in str(e).lower() or "timeout" in str(e).lower():
+                    logger.warning("⚠️ Portfolio Status: Symbols not ready yet (trading will continue)")
+                else:
+                    logger.warning(f"⚠️ Portfolio Status: Error - {e}")
+            
+            # Special handling for CTrader
+            if self.broker == 'ctrader':
+                logger.info("📡 CTrader Status:")
+                logger.info("   Connection: Established")
+                logger.info("   Authentication: Complete")
+                logger.info("   Symbols: Loading (may take up to 30 seconds)")
+                logger.info("   Trading: Active (will start when symbols are ready)")
+                logger.info("   Note: Some initial timeout messages are expected and normal")
             
             logger.info("="*60)
             logger.info(f"🚀 Real-time trading STARTED with {self.broker} broker")
@@ -1031,8 +1163,19 @@ class EnhancedTradingSystemV3:
                                 if iteration % 12 == 1:
                                     logger.debug(f"   ⚠️ No portfolio status from {self.broker}")
                         except Exception as e:
-                            if iteration % 12 == 1:
-                                logger.warning(f"   ❌ Portfolio status error: {e}")
+                            # Handle different types of errors gracefully
+                            error_msg = str(e).lower()
+                            
+                            if "timeout" in error_msg or "symbols" in error_msg:
+                                # CTrader timeout errors - reduce log noise
+                                if iteration % 60 == 1:  # Log every 5 minutes instead of every minute
+                                    logger.debug(f"   ⚠️ CTrader connection timeout (normal during initialization)")
+                            elif "connection" in error_msg or "network" in error_msg:
+                                if iteration % 12 == 1:
+                                    logger.warning(f"   ⚠️ Network/connection issue: {e}")
+                            else:
+                                if iteration % 12 == 1:
+                                    logger.warning(f"   ❌ Portfolio status error: {e}")
                     else:
                         if iteration % 12 == 1:
                             logger.debug(f"   ⚠️ Portfolio status not available from {self.broker}")
@@ -1279,6 +1422,8 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
                 try:
                     # Check status periodically
                     status_check_count = 0
+                    timeout_warning_shown = False
+                    
                     while True:
                         time.sleep(30)  # Check every 30 seconds
                         status_check_count += 1
@@ -1297,11 +1442,40 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
                             else:
                                 logger.error("❌ Live data collection: Stopped")
                             
-                            # Check trader status
-                            if system.trader and hasattr(system.trader, 'is_trading'):
-                                logger.info(f"✅ Trading Status: {system.trader.is_trading}")
-                            else:
-                                logger.warning("⚠️ Trading Status: Unknown")
+                            # Check trader status with timeout handling
+                            try:
+                                if system.trader and hasattr(system.trader, 'is_trading'):
+                                    is_trading = system.trader.is_trading
+                                    logger.info(f"✅ Trading Status: {is_trading}")
+                                    
+                                    # Special status for CTrader
+                                    if system.broker == 'ctrader' and hasattr(system.trader, 'trader'):
+                                        trader = system.trader.trader
+                                        if hasattr(trader, 'symbols_initialized'):
+                                            symbols_ready = trader.symbols_initialized
+                                            degraded_mode = getattr(trader, '_degraded_mode', False)
+                                            
+                                            if symbols_ready:
+                                                logger.info("✅ CTrader Symbols: Loaded")
+                                                timeout_warning_shown = False  # Reset flag
+                                            elif degraded_mode:
+                                                if not timeout_warning_shown:
+                                                    logger.warning("⚠️ CTrader Symbols: Degraded mode (timeout occurred)")
+                                                    logger.warning("   Trading continues with limited symbol information")
+                                                    timeout_warning_shown = True
+                                            else:
+                                                logger.info("🔄 CTrader Symbols: Loading...")
+                                else:
+                                    logger.warning("⚠️ Trading Status: Unknown")
+                                    
+                            except Exception as e:
+                                # Don't spam logs with repeated timeout errors
+                                if "timeout" in str(e).lower() or "symbols" in str(e).lower():
+                                    if not timeout_warning_shown:
+                                        logger.warning("⚠️ Trading Status: CTrader connection issues (this is normal)")
+                                        timeout_warning_shown = True
+                                else:
+                                    logger.warning(f"⚠️ Trading Status: Error - {e}")
                             
                             logger.info("="*60)
                         

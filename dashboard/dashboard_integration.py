@@ -97,6 +97,8 @@ def start_dashboard_with_backtest(backtest_results: Dict,
 def start_dashboard_with_live_trading(data_source: Any,
                                     symbols: Optional[list] = None,
                                     dashboard_config: Optional[Dict] = None,
+                                    influxdb_manager: Any = None,
+                                    config: Optional[Any] = None,
                                     blocking: bool = True) -> DashboardManager:
     """
     Start dashboard with live trading data
@@ -105,6 +107,8 @@ def start_dashboard_with_live_trading(data_source: Any,
         data_source: Live data source (MT5DataManager, etc.)
         symbols: List of symbols to monitor
         dashboard_config: Dashboard-specific configuration
+        influxdb_manager: InfluxDB manager instance for loading backtest results
+        config: Trading configuration object
         blocking: Whether to run in blocking mode
         
     Returns:
@@ -117,6 +121,17 @@ def start_dashboard_with_live_trading(data_source: Any,
         
         # Connect live data source
         dashboard.connect_live_data_source(data_source, symbols)
+        
+        # Load latest backtest results from InfluxDB if manager provided
+        if influxdb_manager:
+            latest_backtest_results = load_latest_backtest_from_influxdb(influxdb_manager)
+            if latest_backtest_results:
+                dashboard.load_backtest_data(latest_backtest_results, config)
+                logger.info("Loaded latest backtest results from InfluxDB into dashboard")
+            else:
+                logger.warning("No recent backtest results found in InfluxDB - dashboard will show live data only")
+        else:
+            logger.warning("No InfluxDB manager provided - dashboard will show live data only")
         
         # Start server
         dashboard.start(blocking=blocking)
@@ -340,6 +355,45 @@ def integration_example():
         print(f"   ✗ Failed: {e}")
     
     print("\nIntegration example completed!")
+
+
+def load_latest_backtest_from_influxdb(influxdb_manager) -> Optional[Dict]:
+    """
+    Load the most recent backtest results from InfluxDB
+    
+    Args:
+        influxdb_manager: InfluxDBManager instance
+        
+    Returns:
+        Latest backtest results or None if not found
+    """
+    try:
+        logger.info("Attempting to load latest backtest results from InfluxDB...")
+        
+        if not influxdb_manager:
+            logger.warning("InfluxDB manager is None")
+            return None
+            
+        if not hasattr(influxdb_manager, 'get_latest_backtest_results'):
+            logger.warning("InfluxDB manager missing get_latest_backtest_results method")
+            return None
+        
+        logger.info("Calling InfluxDB manager to get latest backtest results...")
+        latest_results = influxdb_manager.get_latest_backtest_results()
+        
+        if latest_results:
+            logger.info(f"Successfully loaded latest backtest results from InfluxDB: {len(latest_results.get('pair_results', []))} pairs")
+            logger.info(f"Backtest timestamp: {latest_results.get('timestamp', 'Unknown')}")
+            return latest_results
+        else:
+            logger.warning("No backtest results found in InfluxDB - this is normal if no backtests have been run recently")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Failed to load latest backtest results from InfluxDB: {e}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        return None
 
 
 if __name__ == "__main__":

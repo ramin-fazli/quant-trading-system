@@ -620,6 +620,10 @@ class CTraderDataManager:
                     self.client.stopService()
                 elif hasattr(self.client, 'disconnect'):
                     self.client.disconnect()
+                elif hasattr(self.client, 'transport') and hasattr(self.client.transport, 'loseConnection'):
+                    self.client.transport.loseConnection()
+                else:
+                    logger.debug("No known disconnect method found for cTrader client")
             logger.info("Disconnected from CTrader API")
         except Exception as e:
             logger.debug(f"Error during disconnect: {e}")
@@ -765,7 +769,16 @@ class CTraderDataManager:
         
         # Create a fresh client for data retrieval - exactly like working version
         try:
-            self.client = Client(EndPoints.PROTOBUF_DEMO_HOST, EndPoints.PROTOBUF_PORT, TcpProtocol)
+            # Get host based on environment variable
+            host_type = os.getenv('CTRADER_HOST_TYPE', 'Demo').lower()
+            if host_type == 'demo':
+                host = EndPoints.PROTOBUF_DEMO_HOST
+                logger.info(f"🔧 Data retrieval using DEMO server: {host}:{EndPoints.PROTOBUF_PORT}")
+            else:
+                host = EndPoints.PROTOBUF_LIVE_HOST
+                logger.info(f"🔧 Data retrieval using LIVE server: {host}:{EndPoints.PROTOBUF_PORT}")
+            
+            self.client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
             self.access_token = CTRADER_ACCESS_TOKEN
             
             # Set up callbacks - exactly like working version

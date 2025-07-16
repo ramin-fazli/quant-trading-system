@@ -118,36 +118,74 @@ class DashboardServer:
             """Get backtest summary data"""
             try:
                 # Get data from data adapter
-                if not hasattr(self.data_adapter, 'backtest_data'):
-                    # Return empty/default data instead of 404
+                if not hasattr(self.data_adapter, 'backtest_data') or not self.data_adapter.backtest_data:
+                    # Return default/empty data with a helpful message instead of 404
+                    logger.warning("No backtest data available in data adapter - returning default values")
                     return jsonify({
                         'portfolio_metrics': {
+                            'total_return': 0.0,
                             'portfolio_return': 0.0,
                             'portfolio_sharpe': 0.0,
                             'portfolio_max_drawdown': 0.0,
                             'total_trades': 0,
                             'portfolio_win_rate': 0.0,
+                            'profit_factor': 0.0,
                             'total_pairs': 0
                         },
                         'summary': {
-                            'status': 'No backtest data available',
-                            'mode': 'realtime'
+                            'status': 'No recent backtest data available',
+                            'mode': 'live_trading',
+                            'message': 'Run a backtest to see results here, or check if InfluxDB contains recent backtest data'
                         },
                         'timestamp': datetime.now().isoformat()
                     })
                 
                 backtest_data = getattr(self.data_adapter, 'backtest_data', {})
                 
+                # Ensure we have valid portfolio metrics
+                portfolio_metrics = backtest_data.get('portfolio_metrics', {})
+                if not portfolio_metrics:
+                    portfolio_metrics = {
+                        'total_return': 0.0,
+                        'portfolio_return': 0.0,
+                        'portfolio_sharpe': 0.0,
+                        'portfolio_max_drawdown': 0.0,
+                        'total_trades': 0,
+                        'portfolio_win_rate': 0.0,
+                        'profit_factor': 0.0,
+                        'total_pairs': len(backtest_data.get('pairs', []))
+                    }
+                
                 summary = {
-                    'portfolio_metrics': backtest_data.get('portfolio_metrics', {}),
-                    'summary': backtest_data.get('summary', {}),
-                    'timestamp': backtest_data.get('timestamp')
+                    'portfolio_metrics': portfolio_metrics,
+                    'summary': backtest_data.get('summary', {
+                        'status': 'Backtest data loaded from InfluxDB',
+                        'mode': 'live_trading'
+                    }),
+                    'timestamp': backtest_data.get('timestamp', datetime.now().isoformat())
                 }
                 
                 return jsonify(summary)
             except Exception as e:
                 logger.error(f"Error getting backtest summary: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({
+                    'portfolio_metrics': {
+                        'total_return': 0.0,
+                        'portfolio_return': 0.0,
+                        'portfolio_sharpe': 0.0,
+                        'portfolio_max_drawdown': 0.0,
+                        'total_trades': 0,
+                        'portfolio_win_rate': 0.0,
+                        'profit_factor': 0.0,
+                        'total_pairs': 0
+                    },
+                    'summary': {
+                        'status': 'Error loading backtest data',
+                        'mode': 'live_trading',
+                        'error': str(e)
+                    },
+                    'timestamp': datetime.now().isoformat()
+                }), 200  # Return 200 instead of 500 to prevent frontend errors
         
         @self.app.route('/api/backtest/pairs')
         def api_backtest_pairs():
@@ -159,17 +197,44 @@ class DashboardServer:
                 sort_by = request.args.get('sort_by', 'total_return')
                 sort_order = request.args.get('sort_order', 'desc')
                 
-                if not hasattr(self.data_adapter, 'backtest_data'):
-                    return jsonify({'error': 'No backtest data available'}), 404
+                if not hasattr(self.data_adapter, 'backtest_data') or not self.data_adapter.backtest_data:
+                    logger.warning("No backtest pairs data available - returning empty list")
+                    return jsonify({
+                        'pairs': [],
+                        'pagination': {
+                            'page': page,
+                            'per_page': per_page,
+                            'total_pages': 0,
+                            'total_items': 0,
+                            'has_next': False,
+                            'has_prev': False
+                        },
+                        'message': 'No backtest pairs data available - run a backtest or check InfluxDB connection'
+                    })
                 
                 backtest_data = getattr(self.data_adapter, 'backtest_data', {})
                 pairs = backtest_data.get('pairs', [])
+                
+                if not pairs:
+                    logger.warning("Backtest data exists but contains no pairs")
+                    return jsonify({
+                        'pairs': [],
+                        'pagination': {
+                            'page': page,
+                            'per_page': per_page,
+                            'total_pages': 0,
+                            'total_items': 0,
+                            'has_next': False,
+                            'has_prev': False
+                        },
+                        'message': 'Backtest data loaded but contains no pairs'
+                    })
                 
                 # Sort pairs
                 reverse = sort_order.lower() == 'desc'
                 if sort_by in ['total_return', 'sharpe_ratio', 'total_trades', 'win_rate']:
                     pairs = sorted(pairs, 
-                                 key=lambda x: x['metrics'].get(sort_by, 0), 
+                                 key=lambda x: x.get('metrics', {}).get(sort_by, 0), 
                                  reverse=reverse)
                 
                 # Paginate
@@ -221,22 +286,35 @@ class DashboardServer:
         def api_backtest_charts():
             """Get backtest chart data"""
             try:
-                if not hasattr(self.data_adapter, 'backtest_data'):
-                    return jsonify({'error': 'No backtest data available'}), 404
+                if not hasattr(self.data_adapter, 'backtest_data') or not self.data_adapter.backtest_data:
+                    logger.warning("No backtest chart data available - returning empty charts")
+                    return jsonify({
+                        'equity_curve': [],
+                        'drawdown_curve': [],
+                        'performance_distribution': [],
+                        'monthly_returns': [],
+                        'message': 'No backtest chart data available - run a backtest to see charts'
+                    })
                 
                 backtest_data = getattr(self.data_adapter, 'backtest_data', {})
                 
                 charts = {
                     'equity_curve': backtest_data.get('equity_curve', []),
                     'drawdown_curve': backtest_data.get('drawdown_curve', []),
-                    'performance_distribution': [],  # TODO: Generate
-                    'monthly_returns': []  # TODO: Generate
+                    'performance_distribution': backtest_data.get('performance_distribution', []),
+                    'monthly_returns': backtest_data.get('monthly_returns', [])
                 }
                 
                 return jsonify(charts)
             except Exception as e:
                 logger.error(f"Error getting backtest charts: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({
+                    'equity_curve': [],
+                    'drawdown_curve': [],
+                    'performance_distribution': [],
+                    'monthly_returns': [],
+                    'error': str(e)
+                }), 200  # Return 200 instead of 500 to prevent frontend errors
         
         @self.app.route('/api/live/data')
         def api_live_data():

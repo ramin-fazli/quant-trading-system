@@ -12,6 +12,7 @@ import MetaTrader5 as mt5
 from config import TradingConfig
 from strategies.pairs_trading import OptimizedPairsStrategy
 from data.mt5 import MT5DataManager
+from utils.state_manager import TradingStateManager
 
 
 def get_mt5_config():
@@ -47,6 +48,9 @@ class MT5RealTimeTrader:
         # Performance optimization
         self._price_buffer = defaultdict(lambda: deque(maxlen=1000))
         self._update_lock = threading.Lock()
+        
+        # Initialize state manager
+        self.state_manager = TradingStateManager(config.state_file, self._update_lock)
         
         # Add drawdown tracking
         self.portfolio_peak_value = config.initial_portfolio_value
@@ -1070,92 +1074,47 @@ class MT5RealTimeTrader:
         
         logger.info("Attempting to save final state before exiting...")
         self._save_state()
-
-        # Close all open positions
-
-        for pair_str in list(self.active_positions.keys()):
-            self._close_pair_position(pair_str)
         
         logger.info("Real-time trading stopped")
 
     def _save_state(self):
-        """Save the current state of the trader to a file."""
-        with self._update_lock:
-            try:
-                # logger.info(f"Saving trading state to {self.config.state_file}...")
+        """Save the current state of the trader using the state manager."""
+        try:
+            # Prepare portfolio data
+            portfolio_data = {
+                'portfolio_peak_value': self.portfolio_peak_value,
+                'pair_peak_values': self.pair_peak_values,
+                'suspended_pairs': list(self.suspended_pairs),
+                'portfolio_trading_suspended': self.portfolio_trading_suspended,
+            }
+            
+            # Save using state manager
+            success = self.state_manager.save_trading_state(
+                active_positions=self.active_positions,
+                pair_states=self.pair_states,
+                portfolio_data=portfolio_data
+            )
+            
+            if success:
+                logger.debug("Trading state saved successfully")
+            else:
+                logger.error("Failed to save trading state")
                 
-                # Create a copy of active positions to avoid modifying the original
-                positions_to_save = {}
-                for pair, pos_data in self.active_positions.items():
-                    # Create a new dict with serializable values
-                    pos_copy = pos_data.copy()
-                    if 'entry_time' in pos_copy and isinstance(pos_copy['entry_time'], datetime.datetime):
-                        pos_copy['entry_time'] = pos_copy['entry_time'].isoformat()
-                    positions_to_save[pair] = pos_copy
-
-                # Prepare pair states
-                pair_states_to_save = {}
-                for pair, data in self.pair_states.items():
-                    # Convert price series to serializable format
-                    pair_states_to_save[pair] = {
-                        'symbol1': data['symbol1'],
-                        'symbol2': data['symbol2'],
-                        'price1': {
-                            'index': [t.isoformat() for t in data['price1'].index],
-                            'values': data['price1'].values.tolist()
-                        },
-                        'price2': {
-                            'index': [t.isoformat() for t in data['price2'].index],
-                            'values': data['price2'].values.tolist()
-                        },
-                        'position': data['position'],
-                        'cooldown': data['cooldown'],
-                        'last_update': data['last_update'].isoformat(),
-                        'last_candle_time': data['last_candle_time'].isoformat() if data['last_candle_time'] else None
-                    }
-
-                state = {
-                    'active_positions': positions_to_save,
-                    'pair_states': pair_states_to_save,
-                    'portfolio_peak_value': self.portfolio_peak_value,
-                    'pair_peak_values': self.pair_peak_values,
-                    'suspended_pairs': list(self.suspended_pairs),
-                    'portfolio_trading_suspended': self.portfolio_trading_suspended,
-                    'last_save_time': datetime.datetime.now().isoformat()
-                }
-
-                # Save with proper encoding and formatting
-                with open(self.config.state_file, 'w', encoding='utf-8') as f:
-                    json.dump(state, f, indent=4, ensure_ascii=False)
-                
-                # logger.info("Trading state saved successfully")
-                
-                # Verify the save was successful by trying to read it back
-                with open(self.config.state_file, 'r', encoding='utf-8') as f:
-                    _ = json.load(f)
-
-            except Exception as e:
-                logger.error(f"Failed to save state: {str(e)}")
-                # If saving fails, try to create a backup of the current state file
-                try:
-                    if os.path.exists(self.config.state_file):
-                        backup_file = f"{self.config.state_file}.backup"
-                        os.replace(self.config.state_file, backup_file)
-                        logger.info(f"Created backup of state file: {backup_file}")
-                except Exception as backup_error:
-                    logger.error(f"Failed to create backup: {str(backup_error)}")
+        except Exception as e:
+            logger.error(f"Error saving state: {str(e)}")
 
     def _load_state(self) -> bool:
-        """Load the trader's state from a file."""
-        if not os.path.exists(self.config.state_file):
+        """Load the trader's state using the state manager."""
+        # Load state using state manager
+        loaded_state = self.state_manager.load_trading_state()
+        
+        if loaded_state is None:
             logger.info("No state file found. Starting fresh.")
             return False
         
         try:
-            logger.info(f"Loading trading state from {self.config.state_file}...")
-            with open(self.config.state_file, 'r') as f:
-                state = json.load(f)
-
+            logger.info("Processing loaded state...")
+            
             # First, initialize pair_states with current config pairs
             self.pair_states = {}
             current_pairs = set(self.config.pairs)
@@ -1186,26 +1145,30 @@ class MT5RealTimeTrader:
                     logger.info(f"Initialized new pair {pair_str} with {len(data1)} bars")
 
             # Now overlay saved state for existing pairs
-            if 'pair_states' in state:
-                for pair, data in state['pair_states'].items():
+            if 'pair_states' in loaded_state:
+                for pair, data in loaded_state['pair_states'].items():
                     if pair in current_pairs:  # Only load state for pairs that are in current config
                         # Update existing pair state with saved position and cooldown
                         if pair in self.pair_states:
-                            self.pair_states[pair]['position'] = data['position']
-                            self.pair_states[pair]['cooldown'] = data['cooldown']
+                            self.pair_states[pair]['position'] = data.get('position')
+                            self.pair_states[pair]['cooldown'] = data.get('cooldown', 0)
                             logger.info(f"Restored state for existing pair {pair}")
 
             # Handle active positions
             self.active_positions = {}
-            if 'active_positions' in state:
-                for pair, pos_data in state['active_positions'].items():
+            if 'active_positions' in loaded_state:
+                for pair, pos_data in loaded_state['active_positions'].items():
                     if pair in current_pairs:  # Only load positions for current pairs
-                        if 'entry_time' in pos_data and isinstance(pos_data['entry_time'], str):
-                            pos_data['entry_time'] = datetime.datetime.fromisoformat(pos_data['entry_time'])
                         self.active_positions[pair] = pos_data
                         logger.info(f"Restored active position for {pair}")
                     else:
                         logger.warning(f"Skipping position for removed pair {pair}")
+
+            # Load portfolio data
+            self.portfolio_peak_value = loaded_state.get('portfolio_peak_value', self.config.initial_portfolio_value)
+            self.pair_peak_values = loaded_state.get('pair_peak_values', {})
+            self.suspended_pairs = set(loaded_state.get('suspended_pairs', []))
+            self.portfolio_trading_suspended = loaded_state.get('portfolio_trading_suspended', False)
 
             logger.info("State loaded. Reconciling with MT5 server...")
             self._reconcile_positions()
@@ -1215,7 +1178,7 @@ class MT5RealTimeTrader:
             return True
 
         except Exception as e:
-            logger.error(f"Failed to load state: {e}. Starting fresh.")
+            logger.error(f"Failed to process loaded state: {e}. Starting fresh.")
             # Clean up potentially corrupted state
             self.active_positions = {}
             self.pair_states = {}
@@ -1666,3 +1629,24 @@ class MT5RealTimeTrader:
             logger.error(f"Error calculating total exposure: {e}")
             
         return total_exposure
+
+    def get_state_info(self) -> Dict[str, Any]:
+        """Get trading state information using the state manager."""
+        try:
+            # Get basic state file info
+            state_info = self.state_manager.get_state_info()
+            
+            # Get portfolio summary if state exists
+            if state_info.get('exists', False):
+                portfolio_summary = self.state_manager.get_portfolio_summary()
+                state_info.update(portfolio_summary)
+            
+            return state_info
+            
+        except Exception as e:
+            logger.error(f"Error getting state info: {e}")
+            return {'error': str(e)}
+    
+    def delete_state(self) -> bool:
+        """Delete the current state file."""
+        return self.state_manager.delete_state()

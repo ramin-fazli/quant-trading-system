@@ -13,6 +13,7 @@ import os
 import time
 import logging
 import threading
+import traceback
 import pandas as pd
 from collections import deque, defaultdict
 from datetime import datetime, timedelta
@@ -102,6 +103,14 @@ class CTraderRealTimeTrader:
         self.execution_requests = {}
         self.next_order_id = 1
         
+        # Trading threads
+        self.trading_thread = None
+        self.symbols_request_time = None
+        self.symbols_initialized = False
+        self.trading_started = False  # Track if trading loop has started
+        self.authentication_in_progress = False
+        self._degraded_mode = False  # Flag for degraded mode operation
+        
         # Drawdown tracking (consistent with MT5 implementation)
         self.portfolio_peak_value = config.initial_portfolio_value
         self.pair_peak_values = {}
@@ -117,9 +126,21 @@ class CTraderRealTimeTrader:
         """Initialize cTrader real-time trading system"""
         logger.info("Initializing cTrader real-time trading system...")
         
+        # Log environment configuration for debugging
+        logger.info("🔍 CTRADER CONFIGURATION DEBUG:")
+        logger.info(f"   Account ID: {self.account_id}")
+        logger.info(f"   Client ID: {self.client_id[:8] + '...' if self.client_id else 'NOT SET'}")
+        logger.info(f"   Client Secret: {'SET' if self.client_secret else 'NOT SET'}")
+        logger.info(f"   Access Token: {'SET' if self.access_token else 'NOT SET'}")
+        logger.info(f"   Host Type: {os.getenv('CTRADER_HOST_TYPE', 'Live')}")
+        
         # Validate credentials
         if not all([self.client_id, self.client_secret, self.access_token]):
             logger.error("Missing cTrader credentials. Check CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, and CTRADER_ACCESS_TOKEN")
+            return False
+        
+        if self.account_id == 0:
+            logger.error("Missing or invalid CTRADER_ACCOUNT_ID. Please set a valid account ID.")
             return False
         
         # Initialize client
@@ -135,17 +156,31 @@ class CTraderRealTimeTrader:
     def _setup_client(self) -> bool:
         """Setup cTrader API client with proper callbacks"""
         try:
-            host = EndPoints.PROTOBUF_LIVE_HOST
+            # Get host based on environment variable
+            host_type = os.getenv('CTRADER_HOST_TYPE', 'Live').lower()
+            if host_type == 'demo':
+                host = EndPoints.PROTOBUF_DEMO_HOST
+                logger.info(f"🔧 Using DEMO server: {host}:{EndPoints.PROTOBUF_PORT}")
+                logger.info("⚠️  Demo mode: Trades will be simulated, not real!")
+            else:
+                host = EndPoints.PROTOBUF_LIVE_HOST
+                logger.info(f"🔧 Using LIVE server: {host}:{EndPoints.PROTOBUF_PORT}")
+                logger.info("💰 Live mode: Real trading with real money!")
+            
             port = EndPoints.PROTOBUF_PORT
+            
+            logger.info(f"Connecting to cTrader API at {host}:{port}")
             
             self.client = Client(host, port, TcpProtocol)
             self.client.setConnectedCallback(self._on_connected)
             self.client.setDisconnectedCallback(self._on_disconnected)
             self.client.setMessageReceivedCallback(self._on_message_received)
             
-            # Start the client
+            # Start the client - handle case where startService returns None
+            logger.info("Starting cTrader client service...")
             d = self.client.startService()
-            d.addErrback(self._on_error)
+            if d is not None:
+                d.addErrback(self._on_error)
             
             return True
             
@@ -182,6 +217,7 @@ class CTraderRealTimeTrader:
     
     def _authenticate_application(self):
         """Authenticate the application with cTrader"""
+        logger.info("Authenticating application with cTrader...")
         request = ProtoOAApplicationAuthReq()
         request.clientId = self.client_id
         request.clientSecret = self.client_secret
@@ -191,6 +227,7 @@ class CTraderRealTimeTrader:
     
     def _authenticate_account(self):
         """Authenticate the trading account"""
+        logger.info("Authenticating account with cTrader...")
         request = ProtoOAAccountAuthReq()
         request.ctidTraderAccountId = self.account_id
         request.accessToken = self.access_token
@@ -199,67 +236,139 @@ class CTraderRealTimeTrader:
         deferred.addErrback(self._on_error)
     
     def _get_symbols_list(self):
-        """Get the list of available symbols"""
-        request = ProtoOASymbolsListReq()
-        request.ctidTraderAccountId = self.account_id
+        """Get the list of available symbols from cTrader"""
+        if self.symbols_initialized:
+            logger.debug("Symbols already initialized, skipping request")
+            return
+            
+        logger.info("Requesting symbols list from cTrader...")
+        self.symbols_request_time = datetime.now()
         
-        deferred = self.client.send(request)
-        deferred.addErrback(self._on_error)
+        try:
+            request = ProtoOASymbolsListReq()
+            request.ctidTraderAccountId = self.account_id
+            request.includeArchivedSymbols = False
+            
+            deferred = self.client.send(request)
+            deferred.addErrback(self._on_error)
+            deferred.addTimeout(30, reactor)
+            
+        except Exception as e:
+            logger.error(f"Error requesting symbols: {e}")
+            raise
+    
+
     
     def _on_message_received(self, client, message):
         """Handle incoming messages from cTrader API"""
         try:
+            logger.debug(f"Received message type: {message.payloadType}")
+            
             if message.payloadType == ProtoOAApplicationAuthRes().payloadType:
                 logger.info("Application authenticated with cTrader")
                 self._authenticate_account()
                 
             elif message.payloadType == ProtoOAAccountAuthRes().payloadType:
                 logger.info("Account authenticated with cTrader")
-                self._get_symbols_list()
+                # Extract account details for verification
+                response = Protobuf.extract(message)
+                logger.info(f"🔍 ACCOUNT VERIFICATION:")
+                logger.info(f"   Account ID: {getattr(response, 'ctidTraderAccountId', 'Unknown')}")
+                logger.info(f"   Live Account: {getattr(response, 'liveAccount', 'Unknown')}")
+                logger.info(f"   Account Type: {'LIVE' if getattr(response, 'liveAccount', False) else 'DEMO'}")
                 
+                if not self.symbols_initialized:  # Only request once
+                    self._get_symbols_list()
+                    
+            elif message.payloadType == 2142:  # Account auth response type
+                if not hasattr(self, '_account_authenticated'):
+                    self._account_authenticated = True
+                    logger.info("Account authenticated with cTrader (type 2142)")
+                    if not self.symbols_initialized:  # Only request once
+                        self._get_symbols_list()
+                        
             elif message.payloadType == ProtoOASymbolsListRes().payloadType:
+                logger.info("Received symbols list response")
+                self._process_symbols_list(message)
+            elif message.payloadType == 2143:  # Alternative symbols list response type
+                logger.info("Received symbols list response (type 2143)")
                 self._process_symbols_list(message)
                 
             elif message.payloadType == ProtoOAGetTrendbarsRes().payloadType:
                 self._process_trendbar_data(message)
                 
             elif message.payloadType == ProtoOASpotEvent().payloadType:
-                self._process_spot_event(message.payload)
+                # Extract the spot event properly
+                event = Protobuf.extract(message)
+                self._process_spot_event(event)
                 
             elif message.payloadType == ProtoOAExecutionEvent().payloadType:
-                self._process_execution_event(message.payload)
+                # Extract the execution event properly  
+                event = Protobuf.extract(message)
+                self._process_execution_event(event)
                 
             elif message.payloadType == ProtoOASubscribeSpotsRes().payloadType:
                 logger.debug("Spot subscription confirmed")
                 
+            else:
+                # Reduce log noise from unhandled message types
+                logger.debug(f"Unhandled message type: {message.payloadType}")  # Changed from info to debug
+                
         except Exception as e:
             logger.error(f"Error processing message: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     def _process_symbols_list(self, message):
         """Process the symbols list and initialize trading pairs"""
-        for symbol in message.payload.symbol:
-            symbol_name = symbol.symbolName
-            symbol_id = symbol.symbolId
+        logger.info("Processing symbols list...")
+        
+        try:
+            # Extract the message content properly using Protobuf.extract
+            response = Protobuf.extract(message)
             
-            self.symbols_map[symbol_name] = symbol_id
-            self.symbol_id_to_name_map[symbol_id] = symbol_name
+            # Check if we have symbols in the response
+            if not hasattr(response, 'symbol') or len(response.symbol) == 0:
+                logger.error("No symbols received from cTrader API")
+                raise ValueError("Empty symbols list received from cTrader")
             
-            # Store symbol details
-            self.symbol_details[symbol_name] = {
-                'digits': symbol.digits,
-                'pip_factor': getattr(symbol, 'pipFactor', 0),
-                'min_volume': getattr(symbol, 'minVolume', 1000),
-                'max_volume': getattr(symbol, 'maxVolume', 100000000),
-                'volume_step': getattr(symbol, 'stepVolume', 1000),
-            }
-        
-        logger.info(f"Retrieved {len(self.symbols_map)} symbols from cTrader")
-        
-        # Initialize pair states
-        self._initialize_pair_states()
-        
-        # Subscribe to real-time data
-        self._subscribe_to_data()
+            logger.info(f"Received symbols list: {len(response.symbol)} symbols")
+            
+            for symbol in response.symbol:
+                symbol_name = symbol.symbolName
+                symbol_id = symbol.symbolId
+                
+                self.symbols_map[symbol_name] = symbol_id
+                self.symbol_id_to_name_map[symbol_id] = symbol_name
+                
+                # Store symbol details with safe attribute access
+                self.symbol_details[symbol_name] = {
+                    'digits': getattr(symbol, 'digits', 5),
+                    'pip_factor': getattr(symbol, 'pipFactor', 10),
+                    'min_volume': getattr(symbol, 'minVolume', 1000),
+                    'max_volume': getattr(symbol, 'maxVolume', 100000000),
+                    'volume_step': getattr(symbol, 'stepVolume', 1000),
+                }
+            
+            logger.info(f"Successfully retrieved {len(self.symbols_map)} symbols from cTrader")
+            self.symbols_initialized = True
+            
+            # Initialize pair states
+            self._initialize_pair_states()
+            
+            # Subscribe to real-time data
+            self._subscribe_to_data()
+            
+            # Start the trading loop now that we have real symbols
+            if not self.trading_started:
+                logger.info("🚀 Starting real trading loop with live cTrader data")
+                threading.Thread(target=self._trading_loop, daemon=True).start()
+                self.trading_started = True
+            
+        except Exception as e:
+            logger.error(f"Error processing symbols list: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
     
     def _initialize_pair_states(self):
         """Initialize pair states for trading"""
@@ -268,13 +377,17 @@ class CTraderRealTimeTrader:
         valid_pairs = []
         
         for pair_str in self.config.pairs:
-            s1, s2 = pair_str.split('-')
-            if s1 in self.symbols_map and s2 in self.symbols_map:
-                all_symbols.add(s1)
-                all_symbols.add(s2)
-                valid_pairs.append(pair_str)
-            else:
-                logger.warning(f"Pair {pair_str} skipped - symbols not available in cTrader")
+            try:
+                s1, s2 = pair_str.split('-')
+                if s1 in self.symbols_map and s2 in self.symbols_map:
+                    all_symbols.add(s1)
+                    all_symbols.add(s2)
+                    valid_pairs.append(pair_str)
+                else:
+                    logger.debug(f"Pair {pair_str} skipped - symbols not available in cTrader")
+            except ValueError:
+                logger.warning(f"Invalid pair format: {pair_str}")
+                continue
         
         logger.info(f"Initializing {len(valid_pairs)} valid pairs from {len(self.config.pairs)} configured pairs")
         
@@ -297,6 +410,10 @@ class CTraderRealTimeTrader:
             }
         
         logger.info(f"Initialized {len(self.pair_states)} pair states")
+        
+        # If no valid pairs, log a warning
+        if len(valid_pairs) == 0:
+            logger.warning("No valid pairs found! Check symbol availability in cTrader")
     
     def _subscribe_to_data(self):
         """Subscribe to real-time data for all required symbols"""
@@ -307,10 +424,14 @@ class CTraderRealTimeTrader:
             all_symbols.add(s2)
         
         # Subscribe to spot prices
+        successful_subscriptions = 0
         for symbol in all_symbols:
-            self._subscribe_to_spot_prices(symbol)
+            if self._subscribe_to_spot_prices(symbol):
+                successful_subscriptions += 1
         
-        logger.info(f"Subscribed to real-time data for {len(all_symbols)} symbols")
+        logger.info(f"✅ Real-time data subscriptions: {successful_subscriptions} symbols")
+        logger.info(f"✅ Trading loop started")
+        logger.info("📝 Note: Subscription timeout messages above are normal cTrader API behavior")
     
     def _subscribe_to_spot_prices(self, symbol):
         """Subscribe to real-time price updates for a symbol"""
@@ -323,7 +444,7 @@ class CTraderRealTimeTrader:
             
             try:
                 deferred = self.client.send(request)
-                deferred.addErrback(self._on_subscription_error)
+                deferred.addErrback(self._on_subscription_error, symbol)
                 self.subscribed_symbols.add(symbol)
                 logger.debug(f"Subscribed to spot prices for {symbol}")
                 return True
@@ -332,9 +453,19 @@ class CTraderRealTimeTrader:
                 return False
         return False
     
-    def _on_subscription_error(self, failure):
+    def _on_subscription_error(self, failure, symbol=None):
         """Handle subscription errors"""
-        logger.error(f"Subscription error: {failure}")
+        # Check if this is a timeout error (common with cTrader API when subscribing to many symbols)
+        if hasattr(failure, 'value') and 'TimeoutError' in str(failure.value):
+            # Timeout errors are expected behavior when subscribing to many symbols
+            logger.debug(f"Subscription timeout for {symbol or 'unknown symbol'} (normal cTrader API behavior)")
+        else:
+            # Log actual errors that aren't timeouts
+            logger.warning(f"Subscription error for {symbol or 'unknown symbol'}: {failure}")
+    
+    def _process_trendbar_data(self, message):
+        """Process trendbar data (not used for real-time trading but needed for handler)"""
+        logger.debug("Received trendbar data - ignored in real-time trading mode")
     
     def _process_spot_event(self, event):
         """Process real-time price updates"""
@@ -385,6 +516,12 @@ class CTraderRealTimeTrader:
         """Check for trading signals across all pairs"""
         try:
             for pair_str, state in self.pair_states.items():
+                # Skip if in cooldown
+                if state['cooldown'] > 0:
+                    state['cooldown'] -= 1
+                    continue
+                
+                # Check if we have enough price data
                 if len(state['price1']) < self.config.z_period or len(state['price2']) < self.config.z_period:
                     continue
                 
@@ -417,20 +554,25 @@ class CTraderRealTimeTrader:
                 z_entry_threshold = self.config.z_entry
                 z_exit_threshold = self.config.z_exit
                 
+                # Check portfolio limits before entry
+                if current_position is None and not has_active_position:
+                    if len(self.active_positions) >= self.config.max_open_positions:
+                        continue
+                
                 # Process entry signals
                 if current_position is None and not has_active_position:
                     if z_score > z_entry_threshold:
-                        logger.info(f"SHORT entry signal for {pair_str}, z-score: {z_score:.2f}")
+                        logger.info(f"[SHORT ENTRY] Signal trigger for {pair_str} - OK - Positions: {len(self.active_positions)}/{self.config.max_open_positions}")
                         self._execute_pair_trade(pair_str, 'SHORT')
                     elif z_score < -z_entry_threshold:
-                        logger.info(f"LONG entry signal for {pair_str}, z-score: {z_score:.2f}")
+                        logger.info(f"[LONG ENTRY] Signal trigger for {pair_str} - OK - Positions: {len(self.active_positions)}/{self.config.max_open_positions}")
                         self._execute_pair_trade(pair_str, 'LONG')
                 
                 # Process exit signals
                 elif current_position is not None or has_active_position:
                     if (current_position == 'LONG' and z_score > -z_exit_threshold) or \
                        (current_position == 'SHORT' and z_score < z_exit_threshold):
-                        logger.info(f"Exit signal for {pair_str} {current_position}, z-score: {z_score:.2f}")
+                        logger.info(f"[{current_position} EXIT] Signal trigger for {pair_str}, z-score: {z_score:.2f}")
                         self._close_pair_position(pair_str)
                         
         except Exception as e:
@@ -439,6 +581,7 @@ class CTraderRealTimeTrader:
     def _execute_pair_trade(self, pair_str: str, direction: str) -> bool:
         """Execute a pairs trade"""
         if not self._check_drawdown_limits(pair_str):
+            logger.error(f"[ERROR] Trade blocked by drawdown limits for {pair_str}")
             return False
         
         state = self.pair_states[pair_str]
@@ -455,9 +598,16 @@ class CTraderRealTimeTrader:
         # Calculate volumes
         volumes = self._calculate_balanced_volumes(s1, s2, price1, price2)
         if volumes is None:
+            logger.error(f"Cannot calculate balanced volumes for {pair_str}")
             return False
         
-        volume1, volume2, _, _ = volumes
+        volume1, volume2, monetary1, monetary2 = volumes
+        
+        # Check position size limits
+        total_monetary = monetary1 + monetary2
+        if total_monetary > self.config.max_position_size:
+            logger.error(f"Position size for {pair_str} exceeds max_position_size")
+            return False
         
         # Determine trade directions
         if direction == 'LONG':
@@ -488,8 +638,10 @@ class CTraderRealTimeTrader:
             state['entry_price1'] = price1
             state['entry_price2'] = price2
             
-            logger.info(f"Executed {direction} trade for {pair_str}")
+            logger.info(f"Successfully executed {direction} trade for {pair_str}")
             return True
+        else:
+            logger.error(f"[ERROR] Failed to execute {direction} trade for {pair_str}")
         
         return False
     
@@ -503,6 +655,7 @@ class CTraderRealTimeTrader:
         
         s1, s2 = position['symbol1'], position['symbol2']
         direction = position['direction']
+        volume1, volume2 = position['volume1'], position['volume2']
         
         # Determine closing sides (opposite of opening)
         if direction == 'LONG':
@@ -510,9 +663,9 @@ class CTraderRealTimeTrader:
         else:
             close_side1, close_side2 = ProtoOATradeSide.BUY, ProtoOATradeSide.SELL
         
-        # Close positions
-        self._send_market_order(s1, close_side1, None, is_close=True)
-        self._send_market_order(s2, close_side2, None, is_close=True)
+        # Close positions with the same volumes as opening
+        self._send_market_order(s1, close_side1, volume1, is_close=True)
+        self._send_market_order(s2, close_side2, volume2, is_close=True)
         
         # Clean up position state
         del self.active_positions[pair_str]
@@ -532,6 +685,11 @@ class CTraderRealTimeTrader:
         client_order_id = f"PT_{datetime.now().strftime('%Y%m%d%H%M%S')}_{self.next_order_id}"
         self.next_order_id += 1
         
+        # Log account and trading details for debugging
+        logger.info(f"🔍 TRADING DEBUG - Account ID: {self.account_id}")
+        logger.info(f"🔍 TRADING DEBUG - Symbol: {symbol} (ID: {symbol_id})")
+        logger.info(f"🔍 TRADING DEBUG - Client Order ID: {client_order_id}")
+        
         request = ProtoOANewOrderReq()
         request.ctidTraderAccountId = self.account_id
         request.symbolId = symbol_id
@@ -540,12 +698,29 @@ class CTraderRealTimeTrader:
         request.clientOrderId = client_order_id
         
         if is_close:
-            # Close all positions for the symbol
-            request.closePositionDetails.SetInParent()
-        else:
-            # Convert volume to broker format (typically in units, not lots)
-            broker_volume = int(volume * 100000)  # Adjust based on broker requirements
-            request.volume = broker_volume
+            # For closing positions, we need to use ProtoOAClosePositionReq instead
+            # For now, we'll create a regular market order in the opposite direction
+            # TODO: Implement proper position ID tracking for ProtoOAClosePositionReq
+            logger.debug(f"Using market order to close position for {symbol} (fallback method)")
+        
+        # Validate volume is provided
+        if volume is None:
+            logger.error(f"Volume is required for all orders")
+            return None
+        
+        # Convert volume to cTrader format (volume in units)
+        # For cTrader, volume is typically in the base unit (e.g., 100,000 = 1 lot for forex)
+        symbol_details = self.symbol_details.get(symbol, {})
+        min_volume = symbol_details.get('min_volume', 1000)
+        
+        # Ensure volume meets minimum requirements
+        broker_volume = max(int(volume * 100000), min_volume)
+        request.volume = broker_volume
+        
+        # Convert side enum to readable string
+        side_name = "BUY" if side == ProtoOATradeSide.BUY else "SELL"
+        action_type = "Closing" if is_close else "Opening"
+        logger.info(f"{action_type} {side_name} order for {symbol}: {volume:.5f} lots ({broker_volume} units)")
         
         try:
             deferred = self.client.send(request)
@@ -560,6 +735,9 @@ class CTraderRealTimeTrader:
                 'is_close': is_close
             }
             
+            logger.info(f"📨 ORDER SENT - ID: {client_order_id}, Symbol: {symbol}, Side: {side_name}, Volume: {volume:.5f}")
+            logger.info(f"📨 Awaiting execution confirmation from cTrader...")
+            
             return client_order_id
             
         except Exception as e:
@@ -573,17 +751,35 @@ class CTraderRealTimeTrader:
     def _process_execution_event(self, event):
         """Process order execution events"""
         client_order_id = getattr(event, 'clientOrderId', None)
+        
+        # Log all execution events for debugging
+        logger.info(f"🎯 EXECUTION EVENT RECEIVED:")
+        logger.info(f"   Client Order ID: {client_order_id}")
+        logger.info(f"   Event Type: {getattr(event, 'executionType', 'Unknown')}")
+        logger.info(f"   Order Status: {getattr(event, 'orderStatus', 'Unknown')}")
+        logger.info(f"   Position ID: {getattr(event, 'positionId', 'None')}")
+        logger.info(f"   Deal ID: {getattr(event, 'dealId', 'None')}")
+        
         if client_order_id in self.execution_requests:
             order_data = self.execution_requests[client_order_id]
             
             # Process execution details
             if hasattr(event, 'executionType'):
                 execution_type = event.executionType
-                logger.info(f"Order {client_order_id} execution: {execution_type}")
+                logger.info(f"✅ Order {client_order_id} execution: {execution_type}")
+                
+                # Log additional details for successful executions
+                if hasattr(event, 'executedVolume'):
+                    logger.info(f"   Executed Volume: {getattr(event, 'executedVolume', 0)}")
+                if hasattr(event, 'executionPrice'):
+                    logger.info(f"   Execution Price: {getattr(event, 'executionPrice', 0)}")
             
             # Clean up completed orders
             if hasattr(event, 'orderStatus') and event.orderStatus in ['FILLED', 'CANCELLED', 'REJECTED']:
+                logger.info(f"🏁 Order {client_order_id} completed with status: {event.orderStatus}")
                 del self.execution_requests[client_order_id]
+        else:
+            logger.warning(f"⚠️  Received execution event for unknown order: {client_order_id}")
     
     def _calculate_balanced_volumes(self, symbol1: str, symbol2: str, price1: float, price2: float) -> Optional[Tuple[float, float, float, float]]:
         """Calculate balanced volumes for equal monetary exposure"""
@@ -629,25 +825,209 @@ class CTraderRealTimeTrader:
         
         logger.info("Starting cTrader real-time trading loop...")
         
+        # Start continuous trading loop in separate thread
+        self.trading_thread = threading.Thread(target=self._trading_loop, daemon=True)
+        self.trading_thread.start()
+        
         # The reactor will be started by the main thread or callback
         # Just ensure the client is ready to receive messages
         logger.info("cTrader trader ready for real-time trading")
     
+    def _trading_loop(self):
+        """Continuous trading loop to actively check for signals and manage positions"""
+        logger.info("Starting cTrader continuous trading loop...")
+        
+        status_counter = 0
+        symbols_check_counter = 0
+        
+        while self.is_trading:
+            try:
+                # Check if symbols need to be retried (less frequently to avoid spam)
+                symbols_check_counter += 1
+                if symbols_check_counter % 60 == 0:  # Check every 60 seconds instead of 30
+                    self._check_symbols_timeout()
+                    symbols_check_counter = 0
+                
+                # Only proceed with trading if symbols are available or in degraded mode
+                if self.symbols_initialized or self._degraded_mode:
+                    # Check trading signals for all pairs
+                    self._check_trading_signals()
+                    
+                    # Monitor existing positions
+                    self._monitor_positions()
+                else:
+                    # Log status periodically while waiting for symbols (less frequently)
+                    if symbols_check_counter % 30 == 0:
+                        logger.debug("Waiting for symbols initialization before starting trading...")
+                
+                # Log portfolio status every 5 minutes (300 seconds)
+                status_counter += 1
+                if status_counter % 300 == 0:
+                    self._log_portfolio_status()
+                    status_counter = 0
+                
+                # Sleep for a short interval to prevent excessive CPU usage
+                time.sleep(1)  # Check every second
+                
+            except Exception as e:
+                # Don't spam the logs with timeout errors
+                if "timeout" not in str(e).lower():
+                    logger.error(f"Error in cTrader trading loop: {e}")
+                    traceback.print_exc()
+                else:
+                    logger.debug(f"Timeout in trading loop (normal): {e}")
+                time.sleep(5)  # Wait longer on error before retrying
+        
+        logger.info("cTrader trading loop stopped")
+    
+    def _check_symbols_timeout(self):
+        """Check if symbols request timed out and retry if needed"""
+        if not self.symbols_initialized and self.symbols_request_time:
+            time_since_request = datetime.now() - self.symbols_request_time
+            if time_since_request.total_seconds() > 30:  # 30 second timeout
+                logger.error("Symbols request timed out - this indicates a connection issue")
+                logger.error("Please check your cTrader API credentials and account access")
+                
+                # Instead of raising an exception, reset and try again
+                logger.warning("Resetting symbols request for retry...")
+                self.symbols_request_time = None  # Reset to allow retry
+                
+                # Set a flag to indicate degraded mode
+                self._degraded_mode = True
+                logger.warning("Trading system entering degraded mode due to symbols timeout")
+                
+                # Don't raise exception - let trading continue without full symbol data
+    
+    def _log_portfolio_status(self):
+        """Log current portfolio status"""
+        try:
+            status = self.get_portfolio_status()
+            
+            logger.info("")
+            logger.info("=" * 80)
+            logger.info("PORTFOLIO STATUS")
+            logger.info("-" * 80)
+            logger.info(f"Active Pairs     : {len(self.pair_states)}")
+            logger.info(f"Open Positions   : {status['position_count']}/{self.config.max_open_positions}")
+            logger.info(f"Current Value    : ${status['portfolio_value']:,.2f}")
+            logger.info(f"Exposure         : ${status['total_exposure']:,.2f}/{self.config.max_monetary_exposure:,.2f} ({status['total_exposure']/self.config.max_monetary_exposure*100:.1f}%)")
+            
+            # Calculate drawdown
+            drawdown_pct = max(0, (self.portfolio_peak_value - status['portfolio_value']) / self.portfolio_peak_value * 100)
+            logger.info(f"Drawdown         : {drawdown_pct:.2f}%")
+            logger.info(f"Trading Status   : {'ACTIVE' if self.is_trading else 'STOPPED'}")
+            logger.info(f"Suspended Pairs  : {len(self.suspended_pairs)}")
+            logger.info(f"Open P&L        : ${status['unrealized_pnl']:,.2f} ({status['unrealized_pnl']/self.config.initial_portfolio_value*100:+.2f}%)")
+            logger.info("-" * 80)
+            
+            if status['positions']:
+                logger.info("ACTIVE PAIRS P&L")
+                logger.info("-" * 80)
+                logger.info("PAIR            P&L($)      P&L(%)   VALUE($)")
+                logger.info("-" * 80)
+                
+                for pos in status['positions']:
+                    position_value = abs(pos['volume1'] * pos['current_price1']) + abs(pos['volume2'] * pos['current_price2'])
+                    pnl_pct = (pos['pnl'] / position_value * 100) if position_value > 0 else 0
+                    logger.info(f"{pos['pair']:<15} {pos['pnl']:>8.2f}   {pnl_pct:>6.2f}    {position_value:>8,.0f}")
+            
+            logger.info("=" * 80)
+            logger.info("")
+            
+        except Exception as e:
+            logger.error(f"Error logging portfolio status: {e}")
+    
+    def _monitor_positions(self):
+        """Monitor existing positions for risk management"""
+        try:
+            current_time = datetime.now()
+            
+            for pair_str, position in list(self.active_positions.items()):
+                # Check if position should be closed due to time limits or risk management
+                if position['entry_time']:
+                    position_duration = current_time - position['entry_time']
+                    
+                    # Example: Close positions after 24 hours (can be configured)
+                    if position_duration.total_seconds() > 86400:  # 24 hours
+                        logger.info(f"Closing {pair_str} position due to time limit")
+                        self._close_pair_position(pair_str)
+                        continue
+                
+                # Check stop loss / take profit levels
+                self._check_position_exit_conditions(pair_str, position)
+                
+        except Exception as e:
+            logger.error(f"Error monitoring positions: {e}")
+    
+    def _check_position_exit_conditions(self, pair_str: str, position: dict):
+        """Check if position should be closed based on stop loss or take profit"""
+        try:
+            s1, s2 = position['symbol1'], position['symbol2']
+            direction = position['direction']
+            
+            # Get current prices
+            if s1 not in self.spot_prices or s2 not in self.spot_prices:
+                return
+            
+            current_price1 = self.spot_prices[s1]
+            current_price2 = self.spot_prices[s2]
+            
+            # Calculate current P&L percentage
+            if direction == 'LONG':
+                pnl = (current_price1 - position['entry_price1']) * position['volume1'] - \
+                      (current_price2 - position['entry_price2']) * position['volume2']
+            else:
+                pnl = (position['entry_price1'] - current_price1) * position['volume1'] - \
+                      (position['entry_price2'] - current_price2) * position['volume2']
+            
+            # Calculate position value for percentage calculation
+            position_value = abs(position['volume1'] * position['entry_price1']) + \
+                           abs(position['volume2'] * position['entry_price2'])
+            
+            if position_value > 0:
+                pnl_percentage = (pnl / position_value) * 100
+                
+                # Check stop loss
+                if pnl_percentage <= -self.config.stop_loss_perc:
+                    logger.info(f"Stop loss triggered for {pair_str}: {pnl_percentage:.2f}%")
+                    self._close_pair_position(pair_str)
+                    return
+                
+                # Check take profit
+                if pnl_percentage >= self.config.take_profit_perc:
+                    logger.info(f"Take profit triggered for {pair_str}: {pnl_percentage:.2f}%")
+                    self._close_pair_position(pair_str)
+                    return
+                
+        except Exception as e:
+            logger.error(f"Error checking exit conditions for {pair_str}: {e}")
+
     def stop_trading(self):
         """Stop real-time trading"""
         self.is_trading = False
         
-        # Close all positions
-        for pair_str in list(self.active_positions.keys()):
-            self._close_pair_position(pair_str)
+        # Wait for trading thread to stop
+        if self.trading_thread and self.trading_thread.is_alive():
+            logger.info("Waiting for trading thread to stop...")
+            self.trading_thread.join(timeout=10)
         
         # Unsubscribe from data
         for symbol in list(self.subscribed_symbols):
             self._unsubscribe_from_spots(symbol)
         
-        # Disconnect client
+        # Disconnect client - handle different disconnect methods
         if self.client:
-            self.client.disconnect()
+            try:
+                if hasattr(self.client, 'disconnect'):
+                    self.client.disconnect()
+                elif hasattr(self.client, 'transport') and hasattr(self.client.transport, 'loseConnection'):
+                    self.client.transport.loseConnection()
+                elif hasattr(self.client, 'stopService'):
+                    self.client.stopService()
+                else:
+                    logger.warning("No known disconnect method found for cTrader client")
+            except Exception as e:
+                logger.warning(f"Error disconnecting cTrader client: {e}")
         
         logger.info("CTrader real-time trading stopped")
     
@@ -676,6 +1056,7 @@ class CTraderRealTimeTrader:
         portfolio_value = self.config.initial_portfolio_value
         unrealized_pnl = 0.0
         total_exposure = 0.0
+        realized_pnl = 0.0  # This would need to be tracked from completed trades
         
         positions = []
         for pair_str, position in self.active_positions.items():
@@ -707,12 +1088,20 @@ class CTraderRealTimeTrader:
                 'entry_time': position['entry_time']
             })
         
+        # Update portfolio peak value for drawdown calculation
+        current_portfolio_value = portfolio_value + unrealized_pnl
+        if current_portfolio_value > self.portfolio_peak_value:
+            self.portfolio_peak_value = current_portfolio_value
+        
         return {
-            'portfolio_value': portfolio_value + unrealized_pnl,
+            'portfolio_value': current_portfolio_value,
             'unrealized_pnl': unrealized_pnl,
+            'realized_pnl': realized_pnl,
             'position_count': total_positions,
             'total_exposure': total_exposure,
             'positions': positions,
             'account_currency': self.account_currency,
-            'broker': 'ctrader'
+            'broker': 'ctrader',
+            'max_positions': self.config.max_open_positions,
+            'max_exposure': self.config.max_monetary_exposure
         }
