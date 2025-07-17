@@ -5,12 +5,13 @@ from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 import warnings
 import logging
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Any
 from config import TradingConfig
+from strategies.base_strategy import PairsStrategyInterface
 import MetaTrader5 as mt5
 import datetime
 
-def get_mt5_config():
+def get_config():
     """Get TradingConfig from config module, ensuring .env is loaded first."""
     from config import get_config, force_config_update
     force_config_update()
@@ -18,10 +19,10 @@ def get_mt5_config():
 
 # Only load config if run as script, not on import
 if __name__ == "__main__":
-    CONFIG = get_mt5_config()
+    CONFIG = get_config()
 
 # Setup optimized logging with proper log file path
-CONFIG = get_mt5_config()
+CONFIG = get_config()
 log_file_path = os.path.join(CONFIG.logs_dir, "pairs_trading.log")
 logging.basicConfig(
     level=logging.INFO,
@@ -36,155 +37,288 @@ warnings.filterwarnings("ignore")
 
 
 # === OPTIMIZED STRATEGY ENGINE ===
-class OptimizedPairsStrategy:
+class OptimizedPairsStrategy(PairsStrategyInterface):
     """Vectorized and optimized pairs trading strategy"""
     
     def __init__(self, config: TradingConfig, data_manager = None):
-        self.config = config
-        self.data_manager = data_manager
+        super().__init__(config, data_manager)
+
+    def get_minimum_data_points(self) -> int:
+        """Get the minimum number of data points required for strategy calculation."""
+        return max(
+            getattr(self.config, 'z_period', 50),
+            getattr(self.config, 'corr_period', 50),
+            getattr(self.config, 'adf_period', 50)
+        )
+
+    def validate_market_data(self, market_data: Dict[str, Any]) -> bool:
+        """Validate that market data is sufficient for pairs strategy calculations."""
+        if 'price1' not in market_data or 'price2' not in market_data:
+            return False
+        
+        price1 = market_data['price1']
+        price2 = market_data['price2']
+        
+        if not isinstance(price1, pd.Series) or not isinstance(price2, pd.Series):
+            return False
+        
+        min_points = self.get_minimum_data_points()
+        if len(price1) < min_points or len(price2) < min_points:
+            return False
+        
+        # Check for sufficient non-null values
+        if price1.isnull().sum() > len(price1) * 0.2 or price2.isnull().sum() > len(price2) * 0.2:
+            return False
+        
+        return True
 
     def calculate_indicators_vectorized(self, price1: pd.Series, price2: pd.Series) -> Dict:
         """Calculate all indicators using vectorized operations for maximum speed"""
         
-        # Align series and handle missing data
-        df = pd.concat([price1, price2], axis=1).fillna(method='ffill').dropna()
-        if len(df) < max(self.config.z_period, self.config.corr_period, self.config.adf_period):
-            return {}
-        
-        df.columns = ['price1', 'price2']
-        
-        # Vectorized ratio calculation
-        ratio = df['price1'] / df['price2']
-        
-        # Rolling statistics using pandas optimized functions
-        ratio_ma = ratio.rolling(self.config.z_period, min_periods=self.config.z_period//2).mean()
-        ratio_std = ratio.rolling(self.config.z_period, min_periods=self.config.z_period//2).std()
-        
-        # Z-score calculation
-        zscore = (ratio - ratio_ma) / ratio_std
-        zscore_perc = zscore[-1]  # Latest value only
-        # logger.info(f"[{price1.name}-{price2.name}] z-score: {zscore_perc:.2f}")      
-        
-        # Calculate percentage distance from mean
-        distance_from_mean = abs((ratio - ratio_ma) / ratio_ma) * 100  # Convert to percentage
-        distance_from_mean_perc = distance_from_mean[-1]  # Latest value only
-        # logger.info(f"[{price1.name}-{price2.name}] Distance from mean: {distance_from_mean_perc:.2f}%")
-        
-        # Correlation using rolling window
-        correlation = df['price1'].rolling(self.config.corr_period).corr(df['price2'])
-        
-        # Volatility measures
-        vol1 = df['price1'].rolling(self.config.z_period).std() / df['price1'].rolling(self.config.z_period).mean()
-        vol2 = df['price2'].rolling(self.config.z_period).std() / df['price2'].rolling(self.config.z_period).mean()
-        vol_ratio = np.maximum(vol1, vol2) / np.minimum(vol1, vol2)
-        
-        # ADF test - skip if disabled
-        if self.config.enable_adf:
-            adf_pvals = self._rolling_adf_vectorized(ratio, self.config.adf_period)
-        else:
-            # Set to pass all tests when disabled
-            adf_pvals = np.zeros(len(ratio))  # Always pass (p-value = 0)
-        
-        # Johansen test - skip if disabled
-        if self.config.enable_johansen:
-            johansen_stats, johansen_crits = self._rolling_johansen_vectorized(
-                df['price1'], df['price2'], self.config.adf_period
+        try:
+            # Enhanced input validation with duplicate handling
+            if price1 is None or price2 is None:
+                logger.error("None price series provided to calculate_indicators_vectorized")
+                return {}
+            
+            if len(price1) == 0 or len(price2) == 0:
+                logger.error("Empty price series provided to calculate_indicators_vectorized")
+                return {}
+            
+            # Optimized duplicate handling with rate-limited logging
+            original_len1, original_len2 = len(price1), len(price2)
+            
+            # Fast duplicate removal - check and remove in one step if needed
+            if price1.index.has_duplicates:
+                price1 = price1[~price1.index.duplicated(keep='last')]
+                # Rate-limited logging - only log every 100 duplicates to reduce noise
+                if not hasattr(self, '_duplicate_count1'):
+                    self._duplicate_count1 = 0
+                self._duplicate_count1 += 1
+                if self._duplicate_count1 % 100 == 1:  # Log first, then every 100th
+                    duplicates_removed = original_len1 - len(price1)
+                    logger.warning(f"Price1: Removed {duplicates_removed} duplicate timestamps (total processed: {self._duplicate_count1})")
+            
+            if price2.index.has_duplicates:
+                price2 = price2[~price2.index.duplicated(keep='last')]
+                # Rate-limited logging - only log every 100 duplicates to reduce noise
+                if not hasattr(self, '_duplicate_count2'):
+                    self._duplicate_count2 = 0
+                self._duplicate_count2 += 1
+                if self._duplicate_count2 % 100 == 1:  # Log first, then every 100th
+                    duplicates_removed = original_len2 - len(price2)
+                    logger.warning(f"Price2: Removed {duplicates_removed} duplicate timestamps (total processed: {self._duplicate_count2})")
+            
+            # Quick validation after duplicate removal
+            if len(price1) == 0 or len(price2) == 0:
+                logger.error("All data removed during duplicate cleanup")
+                return {}
+            
+            # Align series and handle missing data with explicit DataFrame creation
+            try:
+                # Create DataFrame with explicit handling of duplicates
+                df = pd.DataFrame({'price1': price1, 'price2': price2})
+                
+                # Remove any remaining duplicate indices
+                if df.index.has_duplicates:
+                    logger.warning("DataFrame has duplicate indices after creation, keeping last values")
+                    df = df[~df.index.duplicated(keep='last')]
+                
+                # Forward fill and drop NaN values
+                df = df.fillna(method='ffill').dropna()
+                
+            except Exception as e:
+                logger.error(f"Error creating DataFrame: {e}")
+                # Fallback: try using pd.concat with duplicate handling
+                try:
+                    # Ensure indices are unique before concatenation
+                    price1_clean = price1[~price1.index.duplicated(keep='last')]
+                    price2_clean = price2[~price2.index.duplicated(keep='last')]
+                    df = pd.concat([price1_clean, price2_clean], axis=1).fillna(method='ffill').dropna()
+                except Exception as e2:
+                    logger.error(f"Fallback DataFrame creation also failed: {e2}")
+                    return {}
+            
+            # Check minimum data requirements
+            min_required = max(
+                getattr(self.config, 'z_period', 50),
+                getattr(self.config, 'corr_period', 50), 
+                getattr(self.config, 'adf_period', 50)
             )
-        else:
-            # Set to pass all tests when disabled
-            johansen_stats = np.ones(len(ratio))  # Always pass
-            johansen_crits = np.zeros(len(ratio))  # Always pass
+            
+            if len(df) < min_required:
+                return {}
+            
+            df.columns = ['price1', 'price2']
+            
+            # Check for zero or negative prices (would cause issues with ratio calculation)
+            if (df['price1'] <= 0).any() or (df['price2'] <= 0).any():
+                return {}
+            
+            # Vectorized ratio calculation
+            ratio = df['price1'] / df['price2']
+            
+            # Check for invalid ratios
+            if ratio.isnull().all() or not ratio.std() > 0:
+                return {}
+            
+            # Rolling statistics using pandas optimized functions
+            z_period = getattr(self.config, 'z_period', 50)
+            ratio_ma = ratio.rolling(z_period, min_periods=z_period//2).mean()
+            ratio_std = ratio.rolling(z_period, min_periods=z_period//2).std()
+            
+            # Z-score calculation
+            zscore = (ratio - ratio_ma) / ratio_std
+            
+            # Check for valid z-score
+            if zscore.isnull().all():
+                return {}
+            
+            zscore_perc = zscore.iloc[-1]  # Use iloc for safer access
+            
+            # Calculate percentage distance from mean
+            distance_from_mean = abs((ratio - ratio_ma) / ratio_ma) * 100
+            distance_from_mean_perc = distance_from_mean.iloc[-1] if not distance_from_mean.empty else 0
+            
+            # Correlation using rolling window
+            correlation = df['price1'].rolling(self.config.corr_period).corr(df['price2'])
+            
+            # Volatility measures
+            vol1 = df['price1'].rolling(self.config.z_period).std() / df['price1'].rolling(self.config.z_period).mean()
+            vol2 = df['price2'].rolling(self.config.z_period).std() / df['price2'].rolling(self.config.z_period).mean()
+            vol_ratio = np.maximum(vol1, vol2) / np.minimum(vol1, vol2)
+            
+            # ADF test - skip if disabled
+            if self.config.enable_adf:
+                adf_pvals = self._rolling_adf_vectorized(ratio, self.config.adf_period)
+            else:
+                # Set to pass all tests when disabled
+                adf_pvals = np.zeros(len(ratio))  # Always pass (p-value = 0)
+            
+            # Johansen test - skip if disabled
+            if self.config.enable_johansen:
+                johansen_stats, johansen_crits = self._rolling_johansen_vectorized(
+                    df['price1'], df['price2'], self.config.adf_period
+                )
+            else:
+                # Set to pass all tests when disabled
+                johansen_stats = np.ones(len(ratio))  # Always pass
+                johansen_crits = np.zeros(len(ratio))  # Always pass
         
-        # Dynamic thresholds if enabled
-        if self.config.dynamic_z:
-            # Prevent division by zero if min_volatility is zero or very small
-            min_vol = self.config.min_volatility if self.config.min_volatility > 0 else 1e-8
-            dynamic_entry = np.maximum(self.config.z_entry, self.config.z_entry * ratio_std / min_vol)
-            dynamic_exit = np.maximum(self.config.z_exit, self.config.z_exit * ratio_std / min_vol)
-        else:
-            dynamic_entry = np.full(len(zscore), self.config.z_entry)
-            dynamic_exit = np.full(len(zscore), self.config.z_exit)
+            # Dynamic thresholds if enabled
+            if self.config.dynamic_z:
+                # Prevent division by zero if min_volatility is zero or very small
+                min_vol = self.config.min_volatility if self.config.min_volatility > 0 else 1e-8
+                dynamic_entry = np.maximum(self.config.z_entry, self.config.z_entry * ratio_std / min_vol)
+                dynamic_exit = np.maximum(self.config.z_exit, self.config.z_exit * ratio_std / min_vol)
+            else:
+                dynamic_entry = np.full(len(zscore), self.config.z_entry)
+                dynamic_exit = np.full(len(zscore), self.config.z_exit)
         
-        # Calculate cost-based filter for pair trading
-        mode = os.getenv('TRADING_MODE', 'backtest').lower()
-        if mode == 'backtest':
-            cost_filter = pd.Series(True, index=df.index)  # Always pass cost filter in backtest mode
-        else:
-            cost_filter = self._calculate_cost_filter(price1.name, price2.name, df['price1'], df['price2'])
+            # Calculate cost-based filter for pair trading
+            mode = os.getenv('TRADING_MODE', 'backtest').lower()
+            if mode == 'backtest':
+                cost_filter = pd.Series(True, index=df.index)  # Always pass cost filter in backtest mode
+            else:
+                cost_filter = self._calculate_cost_filter(price1.name, price2.name, df['price1'], df['price2'])
         
-        # Suitability filter - build conditionally based on enabled tests and parameters
-        suitable_conditions = []
+            # Suitability filter - build conditionally based on enabled tests and parameters
+            suitable_conditions = []
 
-        # Core conditions that are always checked regardless of enable flags
-        if self.config.min_volatility > 0:
-            suitable_conditions.append(ratio_std > self.config.min_volatility)
-            
-        if self.config.min_distance > 0:
-            suitable_conditions.append(distance_from_mean > self.config.min_distance)
-            
-        # Always check cost filter as it's critical for profitability
-        suitable_conditions.append(cost_filter)
+            # Core conditions that are always checked regardless of enable flags
+            if self.config.min_volatility > 0:
+                suitable_conditions.append(ratio_std > self.config.min_volatility)
+                
+            if self.config.min_distance > 0:
+                suitable_conditions.append(distance_from_mean > self.config.min_distance)
+                
+            # Always check cost filter as it's critical for profitability
+            suitable_conditions.append(cost_filter)
 
-        # --- Market session filter ---
-        if mode == 'realtime':
-            # logger.info(f"Checking market session for {price1.name} and {price2.name}")
-            session_filter = self._market_session_filter(price1.name, price2.name)
-            suitable_conditions.append(session_filter)
+            # --- Market session filter ---
+            if mode == 'realtime':
+                # logger.info(f"Checking market session for {price1.name} and {price2.name}")
+                session_filter = self._market_session_filter(price1.name, price2.name)
+                suitable_conditions.append(session_filter)
 
-        # Optional conditions based on enable flags and their respective parameters
-        if self.config.enable_correlation and self.config.min_corr > 0:
-            suitable_conditions.append(correlation > self.config.min_corr)
+            # Optional conditions based on enable flags and their respective parameters
+            if self.config.enable_correlation and self.config.min_corr > 0:
+                suitable_conditions.append(correlation > self.config.min_corr)
+                
+            if self.config.enable_adf and self.config.max_adf_pval < 1:
+                suitable_conditions.append(adf_pvals < self.config.max_adf_pval)
+                
+            if self.config.enable_johansen and self.config.johansen_crit_level > 0:
+                suitable_conditions.append(johansen_stats > johansen_crits)
+                
+            if self.config.enable_vol_ratio and self.config.vol_ratio_max < float('inf'):
+                suitable_conditions.append(vol_ratio <= self.config.vol_ratio_max)
             
-        if self.config.enable_adf and self.config.max_adf_pval < 1:
-            suitable_conditions.append(adf_pvals < self.config.max_adf_pval)
+            # Initialize suitable as True if no conditions, otherwise combine all conditions
+            if not suitable_conditions:
+                suitable = pd.Series(True, index=ratio.index)
+            else:
+                suitable = suitable_conditions[0]
+                for condition in suitable_conditions[1:]:
+                    suitable = suitable & condition
             
-        if self.config.enable_johansen and self.config.johansen_crit_level > 0:
-            suitable_conditions.append(johansen_stats > johansen_crits)
-            
-        if self.config.enable_vol_ratio and self.config.vol_ratio_max < float('inf'):
-            suitable_conditions.append(vol_ratio <= self.config.vol_ratio_max)
+            return {
+                'df': df,
+                'ratio': ratio,
+                'ratio_ma': ratio_ma,
+                'ratio_std': ratio_std,
+                'zscore': zscore,
+                'correlation': correlation,
+                'vol_ratio': vol_ratio,
+                'adf_pvals': adf_pvals,
+                'johansen_stats': johansen_stats,
+                'johansen_crits': johansen_crits,
+                'dynamic_entry': dynamic_entry,
+                'dynamic_exit': dynamic_exit,
+                'suitable': suitable,
+                'cost_filter': cost_filter
+            }
         
-        # Initialize suitable as True if no conditions, otherwise combine all conditions
-        if not suitable_conditions:
-            suitable = pd.Series(True, index=ratio.index)
-        else:
-            suitable = suitable_conditions[0]
-            for condition in suitable_conditions[1:]:
-                suitable = suitable & condition
-        
-        return {
-            'df': df,
-            'ratio': ratio,
-            'ratio_ma': ratio_ma,
-            'ratio_std': ratio_std,
-            'zscore': zscore,
-            'correlation': correlation,
-            'vol_ratio': vol_ratio,
-            'adf_pvals': adf_pvals,
-            'johansen_stats': johansen_stats,
-            'johansen_crits': johansen_crits,
-            'dynamic_entry': dynamic_entry,
-            'dynamic_exit': dynamic_exit,
-            'suitable': suitable,
-            'cost_filter': cost_filter
-        }
+        except Exception as e:
+            logger.error(f"Comprehensive error in calculate_indicators_vectorized: {e}")
+            logger.error(f"Price1 info: type={type(price1)}, length={len(price1) if hasattr(price1, '__len__') else 'N/A'}")
+            logger.error(f"Price2 info: type={type(price2)}, length={len(price2) if hasattr(price2, '__len__') else 'N/A'}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return {}
     
     def _calculate_cost_filter(self, symbol1: str, symbol2: str, price1: pd.Series, price2: pd.Series) -> pd.Series:
         """Calculate cost-based filter for pair trading suitability"""
         
         # If no data manager available (backtesting), assume costs are acceptable
-        if not self.data_manager or not hasattr(self.data_manager, 'symbol_info_cache'):
+        if not self.data_manager:
             logger.warning("No data manager available for cost calculation - assuming costs are acceptable")
             return pd.Series(True, index=price1.index)
         
-        # Get symbol information from cache
-        if symbol1 not in self.data_manager.symbol_info_cache or symbol2 not in self.data_manager.symbol_info_cache:
-            logger.warning(f"Symbol info not available for {symbol1} or {symbol2} - assuming costs are acceptable")
+        # Check for different data manager types
+        symbol_info_available = False
+        
+        # MT5 data manager uses symbol_info_cache
+        if hasattr(self.data_manager, 'symbol_info_cache'):
+            if symbol1 in self.data_manager.symbol_info_cache and symbol2 in self.data_manager.symbol_info_cache:
+                info1 = self.data_manager.symbol_info_cache[symbol1]
+                info2 = self.data_manager.symbol_info_cache[symbol2]
+                symbol_info_available = True
+                logger.debug(f"Using MT5 symbol info cache for {symbol1}-{symbol2}")
+        
+        # cTrader data manager uses symbol_details  
+        elif hasattr(self.data_manager, 'symbol_details'):
+            if symbol1 in self.data_manager.symbol_details and symbol2 in self.data_manager.symbol_details:
+                # cTrader doesn't provide spread info in the same way, so assume costs are acceptable
+                logger.debug(f"cTrader data manager detected for {symbol1}-{symbol2} - assuming costs are acceptable")
+                return pd.Series(True, index=price1.index)
+        
+        # If no symbol info available, assume costs are acceptable
+        if not symbol_info_available:
+            logger.debug(f"Symbol info not available for {symbol1} or {symbol2} - assuming costs are acceptable")
             return pd.Series(True, index=price1.index)
         
-        info1 = self.data_manager.symbol_info_cache[symbol1]
-        info2 = self.data_manager.symbol_info_cache[symbol2]
-        
+        # Process MT5 symbol info for cost calculation
         # Calculate spreads as percentage of price
         spread1_perc = (info1['spread'] * info1['point']) / price1 * 100
         spread2_perc = (info2['spread'] * info2['point']) / price2 * 100

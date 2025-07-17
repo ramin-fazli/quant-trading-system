@@ -24,6 +24,7 @@ import time
 import logging
 import threading
 import calendar
+import traceback
 from collections import deque, defaultdict
 from config import TradingConfig, get_config, force_config_update
 
@@ -114,6 +115,79 @@ class CTraderDataManager:
         else:
             logger.warning("No account ID provided")
             self.account_id = None
+    
+    def _get_price_from_relative(self, symbol_details, relative_price):
+        """
+        Convert relative price to actual price according to cTrader documentation
+        
+        Args:
+            symbol_details: Dictionary containing symbol information including 'digits'
+            relative_price: Raw price value from cTrader API
+            
+        Returns:
+            Properly formatted price rounded to symbol digits
+        """
+        # Divide by 100000 and round to symbol digits as per cTrader documentation
+        digits = symbol_details.get('digits', 5)  # Default to 5 digits if not available
+        actual_price = relative_price / 100000.0
+        return round(actual_price, digits)
+    
+    def _process_trendbar_prices(self, bar, symbol_details):
+        """
+        Process trendbar data according to cTrader documentation relative format
+        
+        According to cTrader documentation:
+        - low is the base price in relative format
+        - high = low + deltaHigh  
+        - open = low + deltaOpen
+        - close = low + deltaClose
+        - All prices must be divided by 100000 and rounded to symbol digits
+        
+        Args:
+            bar: Trendbar object from cTrader API
+            symbol_details: Dictionary containing symbol information
+            
+        Returns:
+            Dictionary with OHLC prices properly converted, or None if processing fails
+        """
+        try:
+            # According to cTrader documentation:
+            # - low is the base price
+            # - high = low + deltaHigh  
+            # - open = low + deltaOpen
+            # - close = low + deltaClose
+            # All prices must be divided by 100000 and rounded to symbol digits
+            
+            if not hasattr(bar, 'low'):
+                return None
+                
+            low_raw = bar.low
+            low_price = self._get_price_from_relative(symbol_details, low_raw)
+            
+            prices = {'low': low_price}
+            
+            if hasattr(bar, 'deltaHigh'):
+                high_raw = low_raw + bar.deltaHigh
+                prices['high'] = self._get_price_from_relative(symbol_details, high_raw)
+            
+            if hasattr(bar, 'deltaOpen'):
+                open_raw = low_raw + bar.deltaOpen  
+                prices['open'] = self._get_price_from_relative(symbol_details, open_raw)
+                
+            if hasattr(bar, 'deltaClose'):
+                close_raw = low_raw + bar.deltaClose
+                prices['close'] = self._get_price_from_relative(symbol_details, close_raw)
+            
+            # Ensure we have at least a close price
+            if 'close' not in prices:
+                # Fallback: use low price as close if no deltaClose
+                prices['close'] = low_price
+                
+            return prices
+            
+        except Exception as e:
+            logger.error(f"Error processing trendbar prices: {e}")
+            return None
     
     @staticmethod
     def test_basic_connectivity():
@@ -247,8 +321,10 @@ class CTraderDataManager:
             response = Protobuf.extract(message)
             logger.info(f"Received symbols list: {len(response.symbol)} symbols")
             
-            # Map symbol names to IDs - exactly like working version
+            # Map symbol names to IDs and collect basic symbol details
             self.symbol_name_to_id = {}
+            symbol_ids_for_details = []
+            
             for symbol in response.symbol:
                 # Store both exact name and cleaned name mappings
                 self.symbol_name_to_id[symbol.symbolName] = symbol.symbolId
@@ -256,10 +332,22 @@ class CTraderDataManager:
                 clean_name = symbol.symbolName.split('.')[0]
                 if clean_name not in self.symbol_name_to_id:
                     self.symbol_name_to_id[clean_name] = symbol.symbolId
+                
+                # Store basic symbol details for price conversion
+                self.symbol_details[symbol.symbolName] = {
+                    'digits': getattr(symbol, 'digits', 5),  # Default to 5 digits
+                    'pip_position': getattr(symbol, 'pipPosition', -5),  # Default pip position
+                    'symbol_id': symbol.symbolId
+                }
+                
+                # Also store for clean name
+                if clean_name not in self.symbol_details:
+                    self.symbol_details[clean_name] = self.symbol_details[symbol.symbolName].copy()
                     
             logger.info(f"Mapped {len(self.symbol_name_to_id)} symbol names to IDs")
+            logger.info(f"Collected symbol details for {len(self.symbol_details)} symbols")
             
-            # Start requesting historical data for each symbol - exactly like working version
+            # Start requesting historical data for each symbol
             self._request_all_symbol_data()
             
         elif message.payloadType == ProtoOAGetTrendbarsRes().payloadType:
@@ -409,35 +497,46 @@ class CTraderDataManager:
                 self._check_completion()
                 return
             
-            # Process trendbars data - exactly like working version
+            # Process trendbars data according to cTrader documentation
             if hasattr(response, 'trendbar') and response.trendbar:
                 dates = []
                 prices = []
+                
+                # Get symbol details for proper price conversion
+                symbol_details = self.symbol_details.get(target_symbol, {'digits': 5})
                 
                 for bar in response.trendbar:
                     # Convert timestamp to datetime
                     dt = datetime.datetime.fromtimestamp(bar.utcTimestampInMinutes * 60)
                     dates.append(dt)
                     
-                    # Try different possible attribute names for close price - exactly like working version
-                    close_price = None
-                    if hasattr(bar, 'close'):
-                        close_price = bar.close
-                    elif hasattr(bar, 'closePrice'):
-                        close_price = bar.closePrice
-                    elif hasattr(bar, 'c'):
-                        close_price = bar.c
-                    elif hasattr(bar, 'low'):  # If close doesn't exist, try using low as fallback
-                        close_price = bar.low
+                    # Process trendbar using cTrader documentation format
+                    bar_prices = self._process_trendbar_prices(bar, symbol_details)
                     
-                    if close_price is not None:
-                        # Adjust price for pip factor - use standard 5 decimal places for cTrader
-                        adjusted_price = close_price / 100000.0  # cTrader uses 5 decimal places
-                        prices.append(adjusted_price)
+                    if bar_prices and 'close' in bar_prices:
+                        prices.append(bar_prices['close'])
                     else:
-                        logger.error(f"No close price found for bar. Available attributes: {[attr for attr in dir(bar) if not attr.startswith('_')]}")
-                        # Skip this bar if no price data available
-                        dates.pop()  # Remove the date we just added
+                        # Fallback: try direct price attributes with proper conversion
+                        try:
+                            if hasattr(bar, 'close'):
+                                close_price = self._get_price_from_relative(symbol_details, bar.close)
+                            elif hasattr(bar, 'closePrice'):
+                                close_price = self._get_price_from_relative(symbol_details, bar.closePrice)
+                            elif hasattr(bar, 'c'):
+                                close_price = self._get_price_from_relative(symbol_details, bar.c)
+                            elif hasattr(bar, 'low'):
+                                close_price = self._get_price_from_relative(symbol_details, bar.low)
+                            else:
+                                logger.error(f"No valid price data found for bar. Available attributes: {[attr for attr in dir(bar) if not attr.startswith('_')]}")
+                                dates.pop()  # Remove the date we just added
+                                continue
+                            
+                            prices.append(close_price)
+                            
+                        except Exception as bar_error:
+                            logger.warning(f"Error processing bar data with fallback: {bar_error}")
+                            dates.pop()  # Remove the date we just added
+                            continue
                 
                 # Create pandas Series
                 if dates and prices:
@@ -741,30 +840,8 @@ class CTraderDataManager:
         
         # Check if reactor is already running from a previous call
         if reactor.running:
-            logger.warning("Reactor is already running, attempting to stop it first")
-            try:
-                # Force stop the reactor and wait for it to stop
-                reactor.stop()
-                # Wait for reactor to stop completely
-                max_wait = 5  # 5 seconds max wait
-                wait_time = 0
-                while reactor.running and wait_time < max_wait:
-                    time.sleep(0.1)
-                    wait_time += 0.1
-                    
-                if reactor.running:
-                    logger.error("Failed to stop reactor after 5 seconds, cannot proceed")
-                    return {symbol: pd.Series(dtype=float) for symbol in symbols}
-                    
-                logger.debug("Reactor stopped successfully")
-                
-            except Exception as e:
-                logger.error(f"Failed to stop running reactor: {e}")
-                return {symbol: pd.Series(dtype=float) for symbol in symbols}
-        
-        # Add additional safety check - ensure reactor is not running
-        if hasattr(reactor, '_started') and reactor._started:
-            logger.error("Reactor is in started state, cannot run again")
+            logger.warning("Reactor is already running, cannot fetch historical data")
+            logger.info("Returning empty data - live trading will accumulate real-time data instead")
             return {symbol: pd.Series(dtype=float) for symbol in symbols}
         
         # Create a fresh client for data retrieval - exactly like working version

@@ -122,11 +122,15 @@ from brokers.mt5 import MT5RealTimeTrader
 try:
     from brokers.ctrader import CTraderRealTimeTrader
     CTRADER_BROKER_AVAILABLE = True
-    temp_logger.info("CTrader broker available")
+    temp_logger.info("Strategy-Agnostic CTrader broker available")
 except ImportError:
     CTraderRealTimeTrader = None
     CTRADER_BROKER_AVAILABLE = False
     temp_logger.warning("CTrader broker not available")
+
+# Strategy imports
+from strategies.base_strategy import BaseStrategy, PairsStrategyInterface
+from strategies.pairs_trading import OptimizedPairsStrategy
 
 # Backtesting
 from backtesting.vectorbt import VectorBTBacktester
@@ -568,22 +572,37 @@ class EnhancedRealTimeTrader:
     Supports both MT5 and cTrader brokers independently from data provider
     """
     
-    def __init__(self, config: TradingConfig, data_manager, broker: str, influxdb_manager: InfluxDBManager):
+    def __init__(self, config: TradingConfig, data_manager, broker: str, influxdb_manager: InfluxDBManager, strategy: BaseStrategy = None):
         self.config = config
         self.data_manager = data_manager
         self.broker = broker.lower()
         self.influxdb_manager = influxdb_manager
         self.dashboard = None
         
-        # Initialize the appropriate broker trader
+        # Create strategy instance if not provided
+        if strategy is None:
+            # Use default pairs strategy for backwards compatibility
+            strategy = OptimizedPairsStrategy(config, data_manager)
+            logger.info("Using default OptimizedPairsStrategy")
+        else:
+            logger.info(f"Using provided strategy: {strategy.__class__.__name__}")
+            # Ensure the provided strategy has access to the data manager
+            if hasattr(strategy, 'data_manager') and strategy.data_manager is None:
+                strategy.data_manager = data_manager
+                logger.info("Updated provided strategy with data manager for cost calculations")
+        
+        self.strategy = strategy
+        
+        # Initialize the appropriate broker trader with strategy
         if self.broker == 'ctrader':
             if not CTRADER_BROKER_AVAILABLE:
                 raise ValueError("CTrader broker not available. Install ctrader-open-api: pip install ctrader-open-api")
-            self.trader = CTraderRealTimeTrader(config, data_manager)
-            logger.info("Initialized with CTrader broker for trade execution")
+            self.trader = CTraderRealTimeTrader(config, data_manager, strategy)
+            logger.info(f"Initialized CTrader broker with {strategy.__class__.__name__}")
         elif self.broker == 'mt5':
+            # For MT5, we still use the old interface for now (could be updated similarly)
             self.trader = MT5RealTimeTrader(config, data_manager)
-            logger.info("Initialized with MT5 broker for trade execution")
+            logger.info(f"Initialized MT5 broker (strategy integration pending)")
         else:
             raise ValueError(f"Unsupported broker: {broker}. Supported: 'ctrader', 'mt5'")
         
@@ -656,12 +675,22 @@ class EnhancedRealTimeTrader:
         return self.trader.stop_trading()
     
     def get_portfolio_status(self) -> Dict[str, Any]:
-        """Get portfolio status from the trader"""
+        """Get portfolio status from the trader including strategy information"""
         if hasattr(self.trader, 'get_portfolio_status'):
             status = self.trader.get_portfolio_status()
             status['broker'] = self.broker
+            status['data_provider'] = 'enhanced'  # Could be made configurable
             return status
-        return {'broker': self.broker, 'portfolio_value': 0, 'position_count': 0}
+        
+        # Fallback for brokers without strategy integration
+        strategy_info = self.strategy.get_strategy_info()
+        return {
+            'broker': self.broker, 
+            'strategy': strategy_info['name'],
+            'strategy_type': strategy_info['type'],
+            'portfolio_value': 0, 
+            'position_count': 0
+        }
     
     @property
     def is_trading(self):
@@ -671,18 +700,29 @@ class EnhancedRealTimeTrader:
 
 class EnhancedTradingSystemV3:
     """
-    Enhanced trading system v3 with configurable data provider and broker
+    Enhanced trading system v3 with configurable data provider, broker, and strategy
     """
     
-    def __init__(self, data_provider: str = 'ctrader', broker: str = 'ctrader'):
+    def __init__(self, data_provider: str = 'ctrader', broker: str = 'ctrader', strategy: BaseStrategy = None):
         """
-        Initialize the trading system with specified data provider and broker
+        Initialize the trading system with specified data provider, broker, and strategy
         
         Args:
             data_provider: 'ctrader' or 'mt5' - provider for all data operations
             broker: 'ctrader' or 'mt5' - broker for trade execution
+            strategy: Strategy instance implementing BaseStrategy interface
         """
         self.config = CONFIG
+        self.data_provider = data_provider.lower()
+        self.broker = broker.lower()
+        
+        # Create default strategy if none provided
+        if strategy is None:
+            strategy = OptimizedPairsStrategy(CONFIG, None)  # data_manager will be set later
+            logger.info("Using default OptimizedPairsStrategy")
+        
+        self.strategy = strategy
+        logger.info(f"Trading system initialized with {strategy.__class__.__name__}")
         self.data_provider = data_provider.lower()
         self.broker = broker.lower()
         
@@ -769,15 +809,18 @@ class EnhancedTradingSystemV3:
             logger.info(f"{self.broker} execution manager initialized")
             available_providers[self.broker] = self.execution_data_manager
         
-        # Register all available providers with intelligent data manager
+        # Register all available providers with intelligent data manager and backtest data manager
+        for provider_name, provider_instance in available_providers.items():
+            self.intelligent_data_manager.register_data_provider(provider_name, provider_instance)
         self.backtest_data_manager.register_data_providers(available_providers)
         
-        # Initialize enhanced trader with selected broker
+        # Initialize enhanced trader with selected broker and strategy
         self.trader = EnhancedRealTimeTrader(
             self.config, 
             self.execution_data_manager,
             self.broker,
-            self.influxdb_manager
+            self.influxdb_manager,
+            self.strategy
         )
         
         # Initialize backtester with primary data manager
@@ -926,6 +969,97 @@ class EnhancedTradingSystemV3:
                 'intelligent_caching': False
             }
     
+    def _prepare_trading_data(self) -> bool:
+        """Prepare trading data cache using intelligent data management (reactor-safe)"""
+        logger.info("="*60)
+        logger.info("PRE-FETCHING TRADING DATA")
+        logger.info("="*60)
+        
+        try:
+            if self.broker == 'ctrader':
+                logger.info("CTrader broker detected - using intelligent data pre-fetching...")
+                
+                # Get required symbols from strategy
+                required_symbols = set()
+                if hasattr(self.strategy, 'get_required_symbols'):
+                    required_symbols.update(self.strategy.get_required_symbols())
+                else:
+                    # Fallback: extract from pairs
+                    for pair in self.config.pairs:
+                        if '-' in pair:
+                            sym1, sym2 = pair.split('-')
+                            required_symbols.add(sym1)
+                            required_symbols.add(sym2)
+                
+                logger.info(f"Required symbols for trading: {sorted(required_symbols)}")
+                
+                # Use backtest data manager to pre-fetch data (same approach as backtesting)
+                logger.info("Using intelligent data management to pre-fetch historical data...")
+                logger.info("This uses the same proven system as backtesting to avoid reactor conflicts")
+                
+                # Prepare trading data cache using the same method as backtesting
+                # Note: This fetches all symbols from config.pairs, then we'll filter to required symbols
+                full_data_cache = self.backtest_data_manager.prepare_backtest_data(
+                    data_provider=self.data_provider,
+                    force_refresh=False  # Use cached data if available
+                )
+                
+                # Filter to only required symbols for trading
+                trading_data_cache = {symbol: full_data_cache.get(symbol, pd.Series(dtype=float)) 
+                                    for symbol in required_symbols}
+                
+                # Validate data quality
+                logger.info("Validating pre-fetched data quality...")
+                quality_report = self.backtest_data_manager.validate_data_quality(trading_data_cache)
+                
+                # Log quality summary
+                good_symbols = [s for s, r in quality_report.items() if r['status'] == 'GOOD']
+                warning_symbols = [s for s, r in quality_report.items() if r['status'] == 'WARNING']
+                poor_symbols = [s for s, r in quality_report.items() if r['status'] in ['POOR', 'EMPTY']]
+                
+                logger.info(f"Trading Data Quality Summary:")
+                logger.info(f"  ✅ GOOD: {len(good_symbols)} symbols")
+                logger.info(f"  ⚠️ WARNING: {len(warning_symbols)} symbols")
+                logger.info(f"  ❌ POOR/EMPTY: {len(poor_symbols)} symbols")
+                
+                if poor_symbols:
+                    logger.warning(f"Poor quality data for: {', '.join(poor_symbols)}")
+                    logger.warning("These symbols may affect trading quality")
+                
+                # Store pre-fetched data cache in trader
+                if hasattr(self.trader, 'trader') and hasattr(self.trader.trader, 'set_historical_data_cache'):
+                    self.trader.trader.set_historical_data_cache(trading_data_cache)
+                    logger.info(f"✅ Pre-fetched data cache set in trader: {len(trading_data_cache)} symbols")
+                elif hasattr(self.trader, 'set_historical_data_cache'):
+                    self.trader.set_historical_data_cache(trading_data_cache)
+                    logger.info(f"✅ Pre-fetched data cache set in trader: {len(trading_data_cache)} symbols")
+                else:
+                    logger.warning("⚠️ Trader does not support historical data cache")
+                
+                # Log data availability
+                total_points = sum(len(data) for data in trading_data_cache.values() if not data.empty)
+                logger.info(f"📊 Total historical data points loaded: {total_points}")
+                
+                logger.info("="*60)
+                logger.info("DATA PREPARATION COMPLETED")
+                logger.info("="*60)
+                logger.info("✅ Historical data successfully pre-fetched using intelligent data management")
+                logger.info("✅ Trading system ready with complete historical context")
+                logger.info("✅ Reactor-safe: All data fetched before reactor startup")
+                
+                return True
+                
+            else:
+                # For MT5, no special data pre-fetching needed
+                logger.info(f"No data pre-fetching required for {self.broker}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error preparing trading data: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
     def start_real_time_trading(self) -> bool:
         """Start real-time trading with selected broker"""
         logger.info(f"Starting real-time trading with {self.broker} broker...")
@@ -935,23 +1069,29 @@ class EnhancedTradingSystemV3:
                 logger.error("Trader not initialized")
                 return False
             
-            # Initialize trader
-            logger.info(f"Initializing {self.broker} trader...")
+            # Step 1: Pre-fetch all required data BEFORE starting any reactors
+            logger.info("Step 1: Pre-fetching required trading data...")
+            if not self._prepare_trading_data():
+                logger.error("Failed to pre-fetch trading data")
+                return False
+            
+            # Step 2: Initialize trader
+            logger.info(f"Step 2: Initializing {self.broker} trader...")
             if not self.trader.initialize():
                 logger.error(f"Failed to initialize {self.broker} trader")
                 return False
             
             logger.info(f"{self.broker} trader initialized successfully")
             
-            # Handle different brokers differently
+            # Step 3: Start trading based on broker type
             if self.broker == 'ctrader':
-                # For cTrader, we need to handle the Twisted reactor
+                # For cTrader, start the reactor-based trading
                 def start_ctrader_trading():
                     try:
-                        logger.info("Starting cTrader trading thread...")
+                        logger.info("Starting cTrader reactor-based trading...")
                         
-                        # Start the trader (this will set up callbacks but not block)
-                        logger.info("Calling trader.start_trading()...")
+                        # Start the trader (this will set up callbacks and start the reactor)
+                        logger.info("Starting cTrader trading with pre-fetched data...")
                         self.trader.start_trading()
                         
                         # Add a connection verification step
@@ -966,6 +1106,9 @@ class EnhancedTradingSystemV3:
                                 reactor.run(installSignalHandlers=False)
                             except Exception as reactor_error:
                                 logger.error(f"Error in cTrader reactor: {reactor_error}")
+                                import traceback
+                                logger.error(f"Full reactor error traceback:")
+                                traceback.print_exc()
                                 # Don't re-raise here, log and continue
                         else:
                             logger.info("cTrader Twisted reactor already running")
@@ -1129,14 +1272,10 @@ class EnhancedTradingSystemV3:
                 try:
                     # Log periodic status
                     if iteration % 12 == 1:  # Every minute (5sec * 12 = 60sec)
-                        logger.info(f"📊 Live Data Collection - Iteration {iteration}")
-                        logger.info(f"   Data from: {self.data_provider}")
-                        logger.info(f"   Trading via: {self.broker}")
                         
                         # Check trader status
                         if self.trader:
                             is_trading = getattr(self.trader, 'is_trading', False)
-                            logger.info(f"   Trader Active: {is_trading}")
                         else:
                             logger.warning("   Trader: Not available")
                     
@@ -1157,8 +1296,8 @@ class EnhancedTradingSystemV3:
                                 active_positions = portfolio_status.get('positions', [])
                                 total_exposure = portfolio_status.get('total_exposure', 0)
                                 
-                                if iteration % 12 == 1:  # Log every minute
-                                    logger.info(f"   📈 Portfolio: ${portfolio_value:.2f}, PnL: ${current_pnl:.2f}, Positions: {open_positions_count}")
+                                # if iteration % 12 == 1:  # Log every minute
+                                #     logger.info(f"   📈 Portfolio: ${portfolio_value:.2f}, PnL: ${current_pnl:.2f}, Positions: {open_positions_count}")
                             else:
                                 if iteration % 12 == 1:
                                     logger.debug(f"   ⚠️ No portfolio status from {self.broker}")
@@ -1244,8 +1383,8 @@ class EnhancedTradingSystemV3:
                             self.dashboard.websocket_handler.broadcast_live_update(live_trading_data)
                             self.dashboard.websocket_handler.broadcast_portfolio_update(live_trading_data)
                             
-                            if iteration % 12 == 1:  # Log every minute
-                                logger.info(f"   📡 Dashboard update sent: {active_pairs_count} pairs, {open_positions_count} positions")
+                            # if iteration % 12 == 1:  # Log every minute
+                            #     logger.info(f"   📡 Dashboard update sent: {active_pairs_count} pairs, {open_positions_count} positions")
                         except Exception as e:
                             if iteration % 12 == 1:
                                 logger.error(f"   ❌ Dashboard broadcast error: {e}")
@@ -1329,15 +1468,17 @@ class EnhancedTradingSystemV3:
             logger.error(f"Error during shutdown: {e}")
 
 
-def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'backtest', force_refresh: bool = False):
+def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'backtest', 
+         force_refresh: bool = False, strategy: str = 'pairs'):
     """
-    Main execution function with enhanced features and configurable data provider and broker
+    Main execution function with enhanced features and configurable data provider, broker, and strategy
     
     Args:
         data_provider: 'ctrader' or 'mt5' - provider for all data operations
         broker: 'ctrader' or 'mt5' - broker for trade execution
         mode: 'backtest' or 'live' - execution mode
         force_refresh: Force re-fetch all data ignoring cache
+        strategy: 'pairs' or other strategy types - trading strategy to use
     """
     system = None
     
@@ -1345,12 +1486,22 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
         logger.info(f"=== Enhanced Pairs Trading System V3 Starting ===")
         logger.info(f"Data Provider: {data_provider}")
         logger.info(f"Execution Broker: {broker}")
+        logger.info(f"Strategy: {strategy}")
         logger.info(f"Execution Mode: {mode}")
         logger.info(f"Force Data Refresh: {force_refresh}")
         logger.info(f"Configuration: {CONFIG.pairs[:3]}... ({len(CONFIG.pairs)} total pairs)")
         
-        # Create system with selected providers
-        system = EnhancedTradingSystemV3(data_provider=data_provider, broker=broker)
+        # Create strategy instance based on parameter
+        if strategy == 'pairs':
+            strategy_instance = OptimizedPairsStrategy(CONFIG, None)  # data_manager will be set later
+            logger.info("Using OptimizedPairsStrategy")
+        else:
+            # Future: Add support for other strategies
+            logger.warning(f"Unknown strategy '{strategy}', falling back to pairs strategy")
+            strategy_instance = OptimizedPairsStrategy(CONFIG, None)
+        
+        # Create system with selected providers and strategy
+        system = EnhancedTradingSystemV3(data_provider=data_provider, broker=broker, strategy=strategy_instance)
         
         if not system.initialize():
             logger.error("Failed to initialize trading system")
@@ -1429,24 +1580,15 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
                         status_check_count += 1
                         
                         # Log status every 5 minutes
-                        if status_check_count % 10 == 0:  # 30 seconds * 10 = 5 minutes
-                            logger.info("="*60)
-                            logger.info("LIVE TRADING STATUS CHECK")
-                            logger.info("="*60)
-                            logger.info(f"Data Provider: {system.data_provider}")
-                            logger.info(f"Execution Broker: {system.broker}")
-                            
+                        if status_check_count % 10 == 0:  # 30 seconds * 10 = 5 minutes                          
                             # Check thread status
-                            if live_data_thread.is_alive():
-                                logger.info("✅ Live data collection: Active")
-                            else:
+                            if not live_data_thread.is_alive():
                                 logger.error("❌ Live data collection: Stopped")
                             
                             # Check trader status with timeout handling
                             try:
                                 if system.trader and hasattr(system.trader, 'is_trading'):
                                     is_trading = system.trader.is_trading
-                                    logger.info(f"✅ Trading Status: {is_trading}")
                                     
                                     # Special status for CTrader
                                     if system.broker == 'ctrader' and hasattr(system.trader, 'trader'):
@@ -1456,7 +1598,6 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
                                             degraded_mode = getattr(trader, '_degraded_mode', False)
                                             
                                             if symbols_ready:
-                                                logger.info("✅ CTrader Symbols: Loaded")
                                                 timeout_warning_shown = False  # Reset flag
                                             elif degraded_mode:
                                                 if not timeout_warning_shown:
@@ -1502,7 +1643,7 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Enhanced Pairs Trading System V3 with Configurable Data Provider and Broker')
+    parser = argparse.ArgumentParser(description='Enhanced Pairs Trading System V3 with Configurable Data Provider, Broker, and Strategy')
     parser.add_argument('--data-provider', '-d', 
                        choices=['ctrader', 'mt5'], 
                        default='ctrader',
@@ -1511,6 +1652,10 @@ if __name__ == "__main__":
                        choices=['ctrader', 'mt5'], 
                        default='ctrader',
                        help='Broker for trade execution (default: ctrader)')
+    parser.add_argument('--strategy', '-s',
+                       choices=['pairs'],
+                       default='pairs',
+                       help='Trading strategy to use (default: pairs)')
     parser.add_argument('--mode', '-m', 
                        choices=['backtest', 'live'], 
                        default='backtest',
@@ -1524,4 +1669,5 @@ if __name__ == "__main__":
     # Set environment variables for mode (if needed by other components)
     os.environ['TRADING_MODE'] = args.mode
     
-    main(data_provider=args.data_provider, broker=args.broker, mode=args.mode, force_refresh=args.force_refresh)
+    main(data_provider=args.data_provider, broker=args.broker, mode=args.mode, 
+         force_refresh=args.force_refresh, strategy=args.strategy)

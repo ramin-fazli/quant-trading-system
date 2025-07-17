@@ -36,44 +36,26 @@ try:
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import *
     from twisted.internet import reactor, defer
     
-    # Import specific classes to handle import issues
-    try:
-        from ctrader_open_api.messages.OpenApiMessages_pb2 import (
-            ProtoOAApplicationAuthReq, ProtoOAApplicationAuthRes,
-            ProtoOAAccountAuthReq, ProtoOAAccountAuthRes,
-            ProtoOASymbolsListReq, ProtoOASymbolsListRes,
-            ProtoOASymbolByIdReq, ProtoOASymbolByIdRes,
-            ProtoOANewOrderReq, ProtoOASubscribeSpotsReq, ProtoOAUnsubscribeSpotsReq,
-            ProtoOASpotEvent, ProtoOAExecutionEvent, ProtoOAGetTrendbarsRes,
-            ProtoOASubscribeSpotsRes
-        )
-        from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
-            ProtoOAOrderType, ProtoOATradeSide
-        )
-    except ImportError as specific_import_error:
-        logger.warning(f"Some specific cTrader classes not available: {specific_import_error}")
+    # Verify key classes are available
+    _required_classes = [
+        'ProtoOAApplicationAuthReq', 'ProtoOAApplicationAuthRes',
+        'ProtoOAAccountAuthReq', 'ProtoOAAccountAuthRes', 
+        'ProtoOASymbolsListReq', 'ProtoOASymbolsListRes',
+        'ProtoOASymbolByIdReq', 'ProtoOASymbolByIdRes',
+        'ProtoOANewOrderReq', 'ProtoOAOrderType', 'ProtoOATradeSide',
+        'ProtoOASubscribeSpotsReq', 'ProtoOAUnsubscribeSpotsReq',
+        'ProtoOASpotEvent', 'ProtoOAExecutionEvent', 'ProtoOAGetTrendbarsRes',
+        'ProtoOASubscribeSpotsRes'
+    ]
     
-    # Define message type constants as fallbacks
-    # cTrader Open API message types - official values from cTrader documentation
-    # CRITICAL FIX: Updated to handle ProtoOAExecutionEvent properly
-    # According to cTrader docs, execution events contain order/deal/position objects
-    MESSAGE_TYPES = {
-        'APPLICATION_AUTH_RES': 2101,  # PROTO_OA_APPLICATION_AUTH_RES
-        'ACCOUNT_AUTH_RES': 2103,     # PROTO_OA_ACCOUNT_AUTH_RES
-        'SYMBOLS_LIST_RES': 2115,     # PROTO_OA_SYMBOLS_LIST_RES
-        'SYMBOL_BY_ID_RES': 2117,     # PROTO_OA_SYMBOL_BY_ID_RES
-        'SPOT_EVENT': 2131,           # PROTO_OA_SPOT_EVENT
-        'EXECUTION_EVENT': 2126,      # PROTO_OA_EXECUTION_EVENT (critical for order confirmations!)
-        'ORDER_ERROR_EVENT': 2132,    # PROTO_OA_ORDER_ERROR_EVENT
-        'SUBSCRIBE_SPOTS_RES': 2128,  # PROTO_OA_SUBSCRIBE_SPOTS_RES
-        'TRENDBAR_RES': 2138          # PROTO_OA_GET_TRENDBARS_RES
-    }
+    for cls_name in _required_classes:
+        if cls_name not in globals():
+            logger.warning(f"Required class {cls_name} not found, but continuing anyway")
     
     CTRADER_API_AVAILABLE = True
 except ImportError as e:
     CTRADER_API_AVAILABLE = False
     logger.warning(f"cTrader Open API not available: {e}")
-    MESSAGE_TYPES = {}
 
 
 class CTraderRealTimeTrader:
@@ -135,7 +117,6 @@ class CTraderRealTimeTrader:
         self.price_history = defaultdict(lambda: deque(maxlen=500))
         self.subscribed_symbols = set()
         self.execution_requests = {}
-        self.pending_pair_trades = {}  # Track pending pair trades awaiting execution confirmation
         self.next_order_id = 1
         
         # Data throttling to reduce duplicate processing
@@ -167,75 +148,6 @@ class CTraderRealTimeTrader:
         logger.info(f"  Type: {strategy_info['type']}")
         logger.info(f"  Required symbols: {len(strategy_info['required_symbols'])}")
         logger.info(f"  Tradeable instruments: {len(strategy_info['tradeable_instruments'])}")
-    
-    def _create_protobuf_request(self, request_type: str, **kwargs):
-        """Safely create protobuf requests with fallback handling"""
-        try:
-            if request_type == 'APPLICATION_AUTH':
-                if globals().get('ProtoOAApplicationAuthReq'):
-                    request = ProtoOAApplicationAuthReq()
-                    request.clientId = kwargs.get('client_id')
-                    request.clientSecret = kwargs.get('client_secret')
-                    return request
-            elif request_type == 'ACCOUNT_AUTH':
-                if globals().get('ProtoOAAccountAuthReq'):
-                    request = ProtoOAAccountAuthReq()
-                    request.ctidTraderAccountId = kwargs.get('account_id')
-                    request.accessToken = kwargs.get('access_token')
-                    return request
-            elif request_type == 'SYMBOLS_LIST':
-                if globals().get('ProtoOASymbolsListReq'):
-                    request = ProtoOASymbolsListReq()
-                    request.ctidTraderAccountId = kwargs.get('account_id')
-                    request.includeArchivedSymbols = kwargs.get('include_archived', False)
-                    return request
-            elif request_type == 'SYMBOL_BY_ID':
-                if globals().get('ProtoOASymbolByIdReq'):
-                    request = ProtoOASymbolByIdReq()
-                    request.ctidTraderAccountId = kwargs.get('account_id')
-                    request.symbolId.extend(kwargs.get('symbol_ids', []))
-                    return request
-            elif request_type == 'SUBSCRIBE_SPOTS':
-                if globals().get('ProtoOASubscribeSpotsReq'):
-                    request = ProtoOASubscribeSpotsReq()
-                    request.ctidTraderAccountId = kwargs.get('account_id')
-                    request.symbolId.extend(kwargs.get('symbol_ids', []))
-                    return request
-            elif request_type == 'NEW_ORDER':
-                if globals().get('ProtoOANewOrderReq'):
-                    request = ProtoOANewOrderReq()
-                    request.ctidTraderAccountId = kwargs.get('account_id')
-                    request.symbolId = kwargs.get('symbol_id')
-                    if globals().get('ProtoOAOrderType'):
-                        request.orderType = ProtoOAOrderType.Value("MARKET")
-                    request.tradeSide = kwargs.get('trade_side')
-                    request.clientOrderId = kwargs.get('client_order_id')
-                    request.volume = kwargs.get('volume')
-                    return request
-            elif request_type == 'UNSUBSCRIBE_SPOTS':
-                if globals().get('ProtoOAUnsubscribeSpotsReq'):
-                    request = ProtoOAUnsubscribeSpotsReq()
-                    request.ctidTraderAccountId = kwargs.get('account_id')
-                    request.symbolId.extend(kwargs.get('symbol_ids', []))
-                    return request
-                    
-        except Exception as e:
-            logger.error(f"Error creating {request_type} request: {e}")
-            
-        return None
-    
-    def _get_trade_side_value(self, side_name: str):
-        """Safely get trade side value with fallback"""
-        try:
-            if globals().get('ProtoOATradeSide'):
-                return ProtoOATradeSide.Value(side_name)
-            else:
-                # Fallback numeric values for trade sides
-                side_values = {'BUY': 1, 'SELL': 2}
-                return side_values.get(side_name, 1)
-        except Exception as e:
-            logger.error(f"Error getting trade side for {side_name}: {e}")
-            return 1 if side_name == 'BUY' else 2
     
     def initialize(self) -> bool:
         """Initialize cTrader real-time trading system"""
@@ -331,28 +243,20 @@ class CTraderRealTimeTrader:
     def _authenticate_application(self):
         """Authenticate the application with cTrader"""
         logger.info("Authenticating application with cTrader...")
-        request = self._create_protobuf_request('APPLICATION_AUTH', 
-                                               client_id=self.client_id, 
-                                               client_secret=self.client_secret)
+        request = ProtoOAApplicationAuthReq()
+        request.clientId = self.client_id
+        request.clientSecret = self.client_secret
         
-        if request is None:
-            logger.error("Failed to create application authentication request")
-            return
-            
         deferred = self.client.send(request)
         deferred.addErrback(self._on_error)
     
     def _authenticate_account(self):
         """Authenticate the trading account"""
         logger.info("Authenticating account with cTrader...")
-        request = self._create_protobuf_request('ACCOUNT_AUTH',
-                                               account_id=self.account_id,
-                                               access_token=self.access_token)
+        request = ProtoOAAccountAuthReq()
+        request.ctidTraderAccountId = self.account_id
+        request.accessToken = self.access_token
         
-        if request is None:
-            logger.error("Failed to create account authentication request")
-            return
-            
         deferred = self.client.send(request)
         deferred.addErrback(self._on_error)
     
@@ -366,14 +270,10 @@ class CTraderRealTimeTrader:
         self.symbols_request_time = datetime.now()
         
         try:
-            request = self._create_protobuf_request('SYMBOLS_LIST',
-                                                   account_id=self.account_id,
-                                                   include_archived=False)
+            request = ProtoOASymbolsListReq()
+            request.ctidTraderAccountId = self.account_id
+            request.includeArchivedSymbols = False
             
-            if request is None:
-                logger.error("Failed to create symbols list request")
-                return
-                
             deferred = self.client.send(request)
             deferred.addErrback(self._on_error)
             deferred.addTimeout(30, reactor)
@@ -392,13 +292,9 @@ class CTraderRealTimeTrader:
             for chunk_idx, chunk in enumerate(symbol_chunks):
                 logger.info(f"Requesting symbol details chunk {chunk_idx + 1}/{len(symbol_chunks)} ({len(chunk)} symbols)")
                 
-                request = self._create_protobuf_request('SYMBOL_BY_ID',
-                                                       account_id=self.account_id,
-                                                       symbol_ids=chunk)
-                
-                if request is None:
-                    logger.error(f"Failed to create symbol details request for chunk {chunk_idx + 1}")
-                    continue
+                request = ProtoOASymbolByIdReq()
+                request.ctidTraderAccountId = self.account_id
+                request.symbolId.extend(chunk)
                 
                 deferred = self.client.send(request)
                 deferred.addErrback(self._on_symbol_details_error)
@@ -532,29 +428,13 @@ class CTraderRealTimeTrader:
     def _on_message_received(self, client, message):
         """Handle incoming messages from cTrader API"""
         try:
-            # Count message types for debugging
-            if not hasattr(self, '_message_type_counts'):
-                self._message_type_counts = defaultdict(int)
-            self._message_type_counts[message.payloadType] += 1
-            
-            # Log message types periodically for debugging
-            if sum(self._message_type_counts.values()) % 100 == 0:  # Back to normal frequency
-                logger.info(f"📨 Message stats (last 100): {dict(self._message_type_counts)}")
-                # Reset counts to avoid memory buildup
-                if sum(self._message_type_counts.values()) > 500:
-                    self._message_type_counts.clear()
-            
             logger.debug(f"Received message type: {message.payloadType}")
             
-            # Use both protobuf class checks and numeric fallbacks for message type detection
-            if (hasattr(message, 'payloadType') and 
-                (message.payloadType == MESSAGE_TYPES.get('APPLICATION_AUTH_RES', 2101) or
-                 message.payloadType == 2101)):
+            if message.payloadType == ProtoOAApplicationAuthRes().payloadType:
                 logger.info("Application authenticated with cTrader")
                 self._authenticate_account()
                 
-            elif (message.payloadType == MESSAGE_TYPES.get('ACCOUNT_AUTH_RES', 2103) or
-                  message.payloadType == 2103):
+            elif message.payloadType == ProtoOAAccountAuthRes().payloadType:
                 logger.info("Account authenticated with cTrader")
                 # Extract account details for verification
                 response = Protobuf.extract(message)
@@ -566,94 +446,45 @@ class CTraderRealTimeTrader:
                 if not self.symbols_initialized:  # Only request once
                     self._get_symbols_list()
                     
-            elif (message.payloadType == MESSAGE_TYPES.get('SYMBOLS_LIST_RES', 2115) or
-                  message.payloadType == 2115):
+            elif message.payloadType == 2142:  # Account auth response type
+                if not hasattr(self, '_account_authenticated'):
+                    self._account_authenticated = True
+                    logger.info("Account authenticated with cTrader (type 2142)")
+                    if not self.symbols_initialized:  # Only request once
+                        self._get_symbols_list()
+                        
+            elif message.payloadType == ProtoOASymbolsListRes().payloadType:
                 logger.info("Received symbols list response")
                 self._process_symbols_list(message)
+            elif message.payloadType == 2143:  # Alternative symbols list response type
+                logger.info("Received symbols list response (type 2143)")
+                self._process_symbols_list(message)
                 
-            elif (message.payloadType == MESSAGE_TYPES.get('SYMBOL_BY_ID_RES', 2117) or
-                  message.payloadType == 2117):
+            elif message.payloadType == ProtoOASymbolByIdRes().payloadType:
                 logger.info("Received symbol details response")
                 self._process_symbol_details(message)
+            elif message.payloadType == 2144:  # Alternative symbol details response type
+                logger.info("Received symbol details response (type 2144)")
+                self._process_symbol_details(message)
                 
-            elif (message.payloadType == MESSAGE_TYPES.get('TRENDBAR_RES', 2138) or
-                  message.payloadType == 2138):
+            elif message.payloadType == ProtoOAGetTrendbarsRes().payloadType:
                 self._process_trendbar_data(message)
                 
-            elif (message.payloadType == MESSAGE_TYPES.get('SPOT_EVENT', 2131) or
-                  message.payloadType == 2131):
+            elif message.payloadType == ProtoOASpotEvent().payloadType:
                 # Extract the spot event properly
                 event = Protobuf.extract(message)
                 self._process_spot_event(event)
                 
-            elif (message.payloadType == MESSAGE_TYPES.get('EXECUTION_EVENT', 2126) or
-                  message.payloadType == 2126):  # Direct check for correct EXECUTION_EVENT type
+            elif message.payloadType == ProtoOAExecutionEvent().payloadType:
                 # Extract the execution event properly  
-                logger.info(f"🎯 RECEIVED EXECUTION EVENT - payload type: {message.payloadType}")
-                try:
-                    event = Protobuf.extract(message)
-                    logger.info(f"🎯 Successfully extracted execution event: {type(event)}")
-                    self._process_execution_event(event)
-                except Exception as e:
-                    logger.error(f"🎯 Error extracting/processing execution event: {e}")
-                    logger.error(f"🎯 Raw message: {message}")
-                    traceback.print_exc()
+                event = Protobuf.extract(message)
+                self._process_execution_event(event)
                 
-            elif (message.payloadType == MESSAGE_TYPES.get('SUBSCRIBE_SPOTS_RES', 2128) or
-                  message.payloadType == 2128):
-                # Extract the subscription response to see if it was successful
-                response = Protobuf.extract(message)
-                logger.info(f"📡 Spot subscription response received: {response}")
+            elif message.payloadType == ProtoOASubscribeSpotsRes().payloadType:
                 logger.debug("Spot subscription confirmed")
                 
-            elif (message.payloadType == MESSAGE_TYPES.get('ORDER_ERROR_EVENT', 2132) or
-                  message.payloadType == 2132):
-                # Handle order error events
-                logger.error(f"❌ RECEIVED ORDER ERROR EVENT - payload type: {message.payloadType}")
-                try:
-                    event = Protobuf.extract(message)
-                    logger.error(f"❌ Order error details: {event}")
-                    # TODO: Add specific order error handling
-                except Exception as e:
-                    logger.error(f"❌ Error extracting order error event: {e}")
-                
             else:
-                # Log unhandled message types to help debug missing execution events
-                if not hasattr(self, '_unhandled_messages_logged'):
-                    self._unhandled_messages_logged = set()
-                
-                # Log each unhandled message type only once to avoid spam
-                if message.payloadType not in self._unhandled_messages_logged:
-                    logger.info(f"🔍 UNHANDLED MESSAGE TYPE: {message.payloadType}")
-                    # Try to identify if this could be an execution event with different type
-                    if message.payloadType in [2130, 2131, 2132, 2133, 2134, 2135]:  # Range around expected execution event
-                        logger.warning(f"⚠️ Message type {message.payloadType} might be an execution event - check cTrader API docs")
-                        # Since we see 2131 frequently, try processing it as execution event
-                        if message.payloadType == 2131:
-                            logger.warning(f"🚨 PROCESSING MESSAGE TYPE 2131 AS EXECUTION EVENT")
-                            try:
-                                event = Protobuf.extract(message)
-                                self._process_execution_event(event)
-                                return  # Exit early after processing
-                            except Exception as e:
-                                logger.debug(f"Failed to process 2131 as execution event: {e}")
-                    self._unhandled_messages_logged.add(message.payloadType)
-                
-                # Always log execution-related messages for debugging
-                if 'execution' in str(message).lower() or 'order' in str(message).lower():
-                    logger.warning(f"🚨 POTENTIAL EXECUTION MESSAGE: type={message.payloadType}, content preview: {str(message)[:200]}")
-                    
-                    # Try to extract and process as execution event regardless of type
-                    try:
-                        event = Protobuf.extract(message)
-                        if (hasattr(event, 'clientOrderId') or hasattr(event, 'orderStatus') or 
-                            hasattr(event, 'executionType') or hasattr(event, 'dealId')):
-                            logger.warning(f"🚨 PROCESSING AS EXECUTION EVENT: {message.payloadType}")
-                            self._process_execution_event(event)
-                            return  # Exit early after processing
-                    except Exception as e:
-                        logger.debug(f"Failed to process as execution event: {e}")
-                
+                # Reduce log noise from unhandled message types
                 logger.debug(f"Unhandled message type: {message.payloadType}")  # Changed from info to debug
                 
         except Exception as e:
@@ -676,42 +507,21 @@ class CTraderRealTimeTrader:
             
             logger.info(f"Received symbols list: {len(response.symbol)} symbols")
             
-            # Get required symbols from strategy before processing
-            required_symbols = self.strategy.get_required_symbols()
-            logger.info(f"Strategy requires {len(required_symbols)} symbols: {required_symbols}")
-            
-            # Collect symbol IDs only for symbols our strategy needs
-            required_symbol_ids = []
-            found_symbols = []
+            # Collect symbol IDs for detailed symbol information request
+            symbol_ids = []
             
             for symbol in response.symbol:
+                logger.info(f"Processing symbol: {symbol.symbolName}")
                 symbol_name = symbol.symbolName
                 symbol_id = symbol.symbolId
                 
-                # Only store mappings for symbols our strategy needs
-                if symbol_name in required_symbols:
-                    self.symbols_map[symbol_name] = symbol_id
-                    self.symbol_id_to_name_map[symbol_id] = symbol_name
-                    required_symbol_ids.append(symbol_id)
-                    found_symbols.append(symbol_name)
+                self.symbols_map[symbol_name] = symbol_id
+                self.symbol_id_to_name_map[symbol_id] = symbol_name
+                symbol_ids.append(symbol_id)
             
-            # Identify missing symbols
-            missing_symbols = set(required_symbols) - set(found_symbols)
-            
-            logger.info(f"Found {len(found_symbols)} required symbols in cTrader: {found_symbols}")
-            if missing_symbols:
-                logger.warning(f"Missing {len(missing_symbols)} required symbols: {missing_symbols}")
-                logger.info("Trading system will continue with available symbols only")
-            
-            # Only request detailed symbol information for symbols we actually need
-            if required_symbol_ids:
-                logger.info(f"Requesting detailed symbol information for {len(required_symbol_ids)} required symbols...")
-                self._request_symbol_details(required_symbol_ids)
-            else:
-                logger.error("No required symbols found in cTrader symbol list!")
-                # Still finalize initialization to prevent hanging, but with empty symbol details
-                if not hasattr(self, '_pair_states_initialized'):
-                    self._finalize_initialization()
+            # Request detailed symbol information for all symbols
+            logger.info(f"Requesting detailed symbol information for {len(symbol_ids)} symbols...")
+            self._request_symbol_details(symbol_ids)
             
             logger.info(f"Successfully retrieved {len(self.symbols_map)} symbols from cTrader")
             self.symbols_initialized = True
@@ -726,7 +536,7 @@ class CTraderRealTimeTrader:
     
     def _process_symbol_details(self, message):
         """Process detailed symbol information from ProtoOASymbolByIdRes"""
-        logger.info("Processing detailed symbol information for required symbols...")
+        logger.info("Processing detailed symbol information...")
         
         try:
             # Extract the message content properly using Protobuf.extract
@@ -738,18 +548,12 @@ class CTraderRealTimeTrader:
                 return
                 
             symbols_processed = 0
-            required_symbols = self.strategy.get_required_symbols()
             
             for symbol in response.symbol:
                 symbol_name = self.symbol_id_to_name_map.get(symbol.symbolId)
                 
                 if not symbol_name:
                     logger.warning(f"Symbol ID {symbol.symbolId} not found in name mapping")
-                    continue
-                
-                # Verify this is a symbol we actually need
-                if symbol_name not in required_symbols:
-                    logger.debug(f"Skipping symbol {symbol_name} - not required by strategy")
                     continue
                 
                 # Extract detailed symbol information with proper error handling
@@ -794,84 +598,26 @@ class CTraderRealTimeTrader:
                 for local_name, api_name in optional_fields.items():
                     if hasattr(symbol, api_name):
                         value = getattr(symbol, api_name)
-                        
-                        # Convert volume-related fields from centilots to standard lots
-                        # According to cTrader API, volume fields are in centilots (lots * 100)
-                        if local_name in ['min_volume', 'max_volume','lot_size','step_volume']:
-                            # Convert from centilots to lots (divide by 100)
-                            converted_value = value / 100.0
-                            
-                            # Additional validation and correction for unrealistic values
-                            if local_name == 'min_volume' and converted_value >= 1:
-                            #     # If min_volume > 10 lots after conversion, likely needs more division
-                            #     # Try dividing by 1000 instead (some brokers use micro-lots)
-                                converted_value = 0.01
-                                logger.info(f"Applied lot conversion for {symbol_name} {local_name}: {value} -> {converted_value}")
-                            elif local_name == 'step_volume' and converted_value >= 1:
-                            #     # If step_volume > 1 lot after conversion, likely needs more division
-                                converted_value = 0.01
-                                logger.info(f"Applied lot conversion for {symbol_name} {local_name}: {value} -> {converted_value}")
-                            
-                            # # Ensure reasonable minimums
-                            # if local_name == 'min_volume' and converted_value < 0.001:
-                            #     converted_value = 0.01  # Default to 0.01 lots minimum
-                            # elif local_name == 'step_volume' and converted_value < 0.001:
-                            #     converted_value = 0.01  # Default to 0.01 lots step
-                            
-                            symbol_details[local_name] = converted_value
-                            logger.info(f"Converted {local_name} from {value} centilots to {converted_value} lots")
-                        # elif local_name == 'lot_size':
-                        #     converted_value = value / 100.0
-                        #     # lot_size represents contract size and should remain large
-                        #     # Only convert if it seems to be in centilots format
-                        #     if value < 1000:  # If lot_size is suspiciously small, it might be in wrong units
-                        #         converted_value = value * 100.0  # Convert up
-                        #         logger.info(f"Applied contract size conversion for {symbol_name}: {value} -> {converted_value}")
-                        #     else:
-                        #         converted_value = value  # Keep as-is if reasonable
-                            
-                        #     symbol_details[local_name] = converted_value
-                        #     logger.debug(f"Lot size for {symbol_name}: {value} -> {converted_value}")
-                        # else:
-                        #     symbol_details[local_name] = value
+                        symbol_details[local_name] = value
                     else:
                         logger.debug(f"Optional field {api_name} not available for symbol {symbol_name}")
-                        # Set reasonable defaults for missing volume constraints
-                        # if local_name == 'min_volume':
-                        #     symbol_details[local_name] = 0.01  # 0.01 lots minimum
-                        # elif local_name == 'max_volume':
-                        #     symbol_details[local_name] = 1000.0  # 1000 lots maximum  
-                        # elif local_name == 'step_volume':
-                        #     symbol_details[local_name] = 0.01  # 0.01 lots step
-                        # elif local_name == 'lot_size':
-                        #     symbol_details[local_name] = 100000.0  # Standard forex lot size
-                logger.info(f"📊 Raw symbol details for {symbol_name}:")
-                logger.info(f"   digits={symbol.digits if hasattr(symbol, 'digits') else 'N/A'}")
-                logger.info(f"   pipPosition={symbol.pipPosition if hasattr(symbol, 'pipPosition') else 'N/A'}")
-                logger.info(f"   minVolume={getattr(symbol, 'minVolume', 'N/A')} (raw)")
-                logger.info(f"   maxVolume={getattr(symbol, 'maxVolume', 'N/A')} (raw)")
-                logger.info(f"   stepVolume={getattr(symbol, 'stepVolume', 'N/A')} (raw)")
-                logger.info(f"   lotSize={getattr(symbol, 'lotSize', 'N/A')} (raw)")
                 
-                logger.info(f"📊 Processed symbol details for {symbol_name}: {symbol_details}")
                 # Store the detailed symbol information
                 self.symbol_details[symbol_name] = symbol_details
                 symbols_processed += 1
                 
-                logger.info(f"✅ Processed detailed info for {symbol_name}: "
+                logger.info(f"Processed detailed info for {symbol_name}: "
                           f"digits={symbol_details.get('digits')}, "
                           f"min_volume={symbol_details.get('min_volume')}, "
                           f"max_volume={symbol_details.get('max_volume')}, "
                           f"lot_size={symbol_details.get('lot_size')}")
             
-            logger.info(f"✅ Successfully processed detailed information for {symbols_processed}/{len(required_symbols)} required symbols")
+            logger.info(f"Successfully processed detailed information for {symbols_processed} symbols")
             
-            # Check if we have processed all required symbols
-            if symbols_processed < len(required_symbols):
-                missing_count = len(required_symbols) - symbols_processed
-                logger.warning(f"⚠️ Missing detailed info for {missing_count} required symbols")
-            else:
-                logger.info("🎯 All required symbols have detailed information")
+            # Check if we have processed all expected symbols
+            expected_symbols = len(self.symbols_map)
+            if symbols_processed < expected_symbols:
+                logger.warning(f"Only processed {symbols_processed}/{expected_symbols} symbols - some may be missing detailed info")
             
             # Now we can safely proceed with initialization since we have detailed symbol info
             if not hasattr(self, '_pair_states_initialized'):
@@ -889,20 +635,6 @@ class CTraderRealTimeTrader:
     def _finalize_initialization(self):
         """Finalize initialization after symbol details are processed"""
         logger.info("Finalizing trading system initialization...")
-        
-        # Verify we have symbol details for all required symbols
-        required_symbols = self.strategy.get_required_symbols()
-        missing_details = []
-        
-        for symbol in required_symbols:
-            if symbol not in self.symbol_details:
-                missing_details.append(symbol)
-        
-        if missing_details:
-            logger.warning(f"⚠️ Missing symbol details for required symbols: {missing_details}")
-            logger.warning("Some trading functionality may be limited")
-        else:
-            logger.info("✅ All required symbols have detailed information")
         
         # Mark that we've processed symbol details
         self._pair_states_initialized = True
@@ -1253,9 +985,6 @@ class CTraderRealTimeTrader:
         if unavailable_symbols:
             logger.warning(f"Some required symbols not available: {unavailable_symbols}")
         
-        logger.info(f"🔔 Starting spot price subscriptions for {len(available_symbols)} symbols...")
-        logger.info(f"🔔 Available symbols: {sorted(available_symbols)}")
-        
         # Subscribe to spot prices for available symbols
         successful_subscriptions = 0
         for symbol in available_symbols:
@@ -1266,43 +995,25 @@ class CTraderRealTimeTrader:
         logger.info(f"✅ Trading system ready with {self.strategy.__class__.__name__}")
         if unavailable_symbols:
             logger.info("📝 Note: Some symbols were unavailable and skipped")
-        
-        # Add debug info about current spot prices
-        logger.info(f"🔍 Current spot prices count: {len(self.spot_prices)}")
-        if len(self.spot_prices) > 0:
-            logger.info(f"🔍 Available spot prices: {list(self.spot_prices.keys())}")
-        else:
-            logger.warning("⚠️ No spot prices available yet - waiting for cTrader price updates...")
     
     def _subscribe_to_spot_prices(self, symbol):
         """Subscribe to real-time price updates for a symbol"""
         if symbol in self.symbols_map and symbol not in self.subscribed_symbols:
             symbol_id = self.symbols_map[symbol]
             
-            logger.info(f"🔔 Subscribing to spot prices for {symbol} (ID: {symbol_id})")
-            
-            request = self._create_protobuf_request('SUBSCRIBE_SPOTS',
-                                                   account_id=self.account_id,
-                                                   symbol_ids=[symbol_id])
-            
-            if request is None:
-                logger.error(f"Failed to create subscription request for {symbol}")
-                return False
+            request = ProtoOASubscribeSpotsReq()
+            request.ctidTraderAccountId = self.account_id
+            request.symbolId.append(symbol_id)
             
             try:
                 deferred = self.client.send(request)
                 deferred.addErrback(self._on_subscription_error, symbol)
                 self.subscribed_symbols.add(symbol)
-                logger.debug(f"Subscription request sent for {symbol}")
+                logger.debug(f"Subscribed to spot prices for {symbol}")
                 return True
             except Exception as e:
                 logger.error(f"Error subscribing to {symbol}: {e}")
                 return False
-        else:
-            if symbol not in self.symbols_map:
-                logger.warning(f"Symbol {symbol} not found in symbols_map")
-            elif symbol in self.subscribed_symbols:
-                logger.debug(f"Already subscribed to {symbol}")
         return False
     
     def _on_subscription_error(self, failure, symbol=None):
@@ -1319,103 +1030,32 @@ class CTraderRealTimeTrader:
         """Process trendbar data (not used for real-time trading but needed for handler)"""
         logger.debug("Received trendbar data - ignored in real-time trading mode")
     
-    def _get_price_from_relative(self, symbol_details, relative_price):
-        """
-        Convert relative price to actual price according to cTrader documentation
-        
-        According to cTrader API documentation:
-        - All prices (bid, ask, trendbar prices) are returned in relative format
-        - To get actual price: divide by 100000 and round to symbol digits
-        - This applies to spot events, historical trendbars, and depth quotes
-        
-        Args:
-            symbol_details: Dictionary containing symbol information including 'digits'
-            relative_price: Raw price value from cTrader API
-            
-        Returns:
-            Properly formatted price rounded to symbol digits
-        """
-        # Divide by 100000 and round to symbol digits as per cTrader documentation
-        digits = symbol_details.get('digits', 5)  # Default to 5 digits if not available
-        actual_price = relative_price / 100000.0
-        return round(actual_price, digits)
-    
     def _process_spot_event(self, event):
-        """Process real-time price updates according to cTrader documentation"""
+        """Process real-time price updates with throttling to reduce duplicates"""
         symbol_id = event.symbolId
         symbol_name = self.symbol_id_to_name_map.get(symbol_id)
         
         if not symbol_name:
-            # Log the first few unknown symbol IDs for debugging
-            if not hasattr(self, '_unknown_symbol_debug_count'):
-                self._unknown_symbol_debug_count = 0
-            self._unknown_symbol_debug_count += 1
-            if self._unknown_symbol_debug_count <= 10:
-                logger.debug(f"Received spot event for unknown symbol ID: {symbol_id}")
-                logger.debug(f"  Available mappings: {list(self.symbol_id_to_name_map.items())[:5]}...")
             return
         
         # Get symbol details for price conversion
         details = self.symbol_details.get(symbol_name)
         if not details:
-            if not hasattr(self, '_missing_details_debug_count'):
-                self._missing_details_debug_count = 0
-            self._missing_details_debug_count += 1
-            if self._missing_details_debug_count <= 10:
-                logger.debug(f"No symbol details available for {symbol_name}")
-                logger.debug(f"  Available details: {list(self.symbol_details.keys())[:5]}...")
             return
         
-        # Extract bid/ask prices and convert according to cTrader documentation
-        # Divide by 100000 and round to symbol digits
-        bid = None
-        ask = None
+        digits = details['digits']
         
-        if hasattr(event, 'bid') and event.bid is not None and event.bid > 0:
-            bid = self._get_price_from_relative(details, event.bid)
-            
-        if hasattr(event, 'ask') and event.ask is not None and event.ask > 0:
-            ask = self._get_price_from_relative(details, event.ask)
-        
+        # Extract bid/ask prices
+        bid = event.bid / (10 ** digits) if hasattr(event, 'bid') else None
+        ask = event.ask / (10 ** digits) if hasattr(event, 'ask') else None
         timestamp = datetime.fromtimestamp(event.timestamp / 1000)
         
-        # Handle incomplete price data - use last known good price or skip
-        if bid is None or ask is None or bid <= 0 or ask <= 0:
-            # Try to use previous price if available
-            if symbol_name in self.spot_prices:
-                # Keep existing price if we have partial update
-                existing_price = self.spot_prices[symbol_name]
-                if not hasattr(self, '_incomplete_price_debug_count'):
-                    self._incomplete_price_debug_count = {}
-                if symbol_name not in self._incomplete_price_debug_count:
-                    self._incomplete_price_debug_count[symbol_name] = 0
-                self._incomplete_price_debug_count[symbol_name] += 1
-                
-                if self._incomplete_price_debug_count[symbol_name] <= 5:
-                    logger.debug(f"Incomplete price data for {symbol_name}: bid={bid}, ask={ask}, keeping existing price=${existing_price:.5f}")
-                return
-            else:
-                # No previous price available, skip this update
-                if not hasattr(self, '_missing_prices_debug_count'):
-                    self._missing_prices_debug_count = 0
-                self._missing_prices_debug_count += 1
-                if self._missing_prices_debug_count <= 10:
-                    logger.debug(f"Missing or invalid bid/ask for {symbol_name}: bid={bid}, ask={ask}")
-                return
+        if bid is None or ask is None:
+            return
         
         # Store mid price
         price = (bid + ask) / 2
         self.spot_prices[symbol_name] = price
-        
-        # Log first few price updates to confirm data flow
-        if not hasattr(self, '_spot_debug_count'):
-            self._spot_debug_count = 0
-        self._spot_debug_count += 1
-        
-        if self._spot_debug_count <= 50:  # Log first 50 spot events for debugging
-            logger.info(f"🔥 SPOT EVENT #{self._spot_debug_count}: {symbol_name} = ${price:.5f} (bid={bid}, ask={ask})")
-            if self._spot_debug_count == 50:
-                logger.info("🔥 Spot event debugging complete - future price updates will be throttled")
         
         # Log price updates periodically to prove data flow
         if not hasattr(self, '_price_log_counter'):
@@ -1476,12 +1116,12 @@ class CTraderRealTimeTrader:
             self._current_pair_index += 1
             
             # Log signal checking process every 20th check to prove it's working
-            # if not hasattr(self, '_signal_check_counter'):
-            #     self._signal_check_counter = 0
-            # self._signal_check_counter += 1
+            if not hasattr(self, '_signal_check_counter'):
+                self._signal_check_counter = 0
+            self._signal_check_counter += 1
             
-            # if self._signal_check_counter % 20 == 0:
-            #     logger.info(f"🧠 SIGNAL CHECKING: Processing {pair_str} (check #{self._signal_check_counter})")
+            if self._signal_check_counter % 20 == 0:
+                logger.info(f"🧠 SIGNAL CHECKING: Processing {pair_str} (check #{self._signal_check_counter})")
             
             # Check this specific pair
             self._check_pair_trading_signals(pair_str)
@@ -1725,10 +1365,6 @@ class CTraderRealTimeTrader:
         # Get current prices
         if s1 not in self.spot_prices or s2 not in self.spot_prices:
             logger.warning(f"Missing spot prices for {pair_str}")
-            logger.warning(f"  Required: {s1}, {s2}")
-            logger.warning(f"  Available spot prices ({len(self.spot_prices)}): {list(self.spot_prices.keys())}")
-            logger.warning(f"  Missing: {[s for s in [s1, s2] if s not in self.spot_prices]}")
-            logger.warning(f"  Subscribed symbols: {self.subscribed_symbols}")
             return False
         
         price1 = self.spot_prices[s1]
@@ -1756,55 +1392,40 @@ class CTraderRealTimeTrader:
         
         # Determine trade directions
         if direction == 'LONG':
-            side1 = self._get_trade_side_value("BUY")   # Buy first symbol
-            side2 = self._get_trade_side_value("SELL")  # Sell second symbol
+            side1 = ProtoOATradeSide.Value("BUY")   # Buy first symbol
+            side2 = ProtoOATradeSide.Value("SELL")  # Sell second symbol
         else:
-            side1 = self._get_trade_side_value("SELL")  # Sell first symbol
-            side2 = self._get_trade_side_value("BUY")   # Buy second symbol
+            side1 = ProtoOATradeSide.Value("SELL")  # Sell first symbol
+            side2 = ProtoOATradeSide.Value("BUY")   # Buy second symbol
         
         # Execute trades
         order1 = self._send_market_order(s1, side1, volume1)
         order2 = self._send_market_order(s2, side2, volume2)
         
-        # Only proceed if both orders were successfully sent
         if order1 and order2:
-            logger.info(f"📨 Both orders sent for {direction} trade on {pair_str}")
-            logger.info(f"   Order 1: {s1} {('BUY' if side1 == self._get_trade_side_value('BUY') else 'SELL')} {volume1:.5f} lots (ID: {order1})")
-            logger.info(f"   Order 2: {s2} {('BUY' if side2 == self._get_trade_side_value('BUY') else 'SELL')} {volume2:.5f} lots (ID: {order2})")
-            logger.info(f"⏳ Waiting for execution confirmations from cTrader before confirming trade success...")
+            # Store position with thread safety
+            with self._update_lock:
+                self.active_positions[pair_str] = {
+                    'direction': direction,
+                    'symbol1': s1,
+                    'symbol2': s2,
+                    'volume1': volume1,
+                    'volume2': volume2,
+                    'entry_price1': price1,
+                    'entry_price2': price2,
+                    'entry_time': datetime.now(),
+                    'order_ids': (order1, order2)
+                }
+                
+                state['position'] = direction
+                state['entry_time'] = datetime.now()
+                state['entry_price1'] = price1
+                state['entry_price2'] = price2
             
-            # Store pending pair trade for execution tracking
-            pending_trade = {
-                'pair_str': pair_str,
-                'direction': direction,
-                'symbol1': s1,
-                'symbol2': s2,
-                'volume1': volume1,
-                'volume2': volume2,
-                'entry_price1': price1,
-                'entry_price2': price2,
-                'order1_id': order1,
-                'order2_id': order2,
-                'order1_filled': False,
-                'order2_filled': False,
-                'timestamp': datetime.now()
-            }
-            
-            # Track pending pair trade
-            if not hasattr(self, 'pending_pair_trades'):
-                self.pending_pair_trades = {}
-            self.pending_pair_trades[f"{order1}_{order2}"] = pending_trade
-            
-            # Note: The trade will be confirmed as successful only after both orders are FILLED
-            # This is handled in _process_execution_event when we receive ORDER_STATUS_FILLED
+            logger.info(f"Successfully executed {direction} trade for {pair_str} - Portfolio now: {len(self.active_positions)}/{self.config.max_open_positions}")
             return True
         else:
-            failed_orders = []
-            if not order1:
-                failed_orders.append(f"{s1}")
-            if not order2:
-                failed_orders.append(f"{s2}")
-            logger.error(f"[ERROR] Failed to send orders for {direction} trade on {pair_str}: {', '.join(failed_orders)}")
+            logger.error(f"[ERROR] Failed to execute {direction} trade for {pair_str}")
         
         return False
     
@@ -1822,11 +1443,11 @@ class CTraderRealTimeTrader:
         
         # Determine closing sides (opposite of opening)
         if direction == 'LONG':
-            close_side1 = self._get_trade_side_value("SELL")  # Sell to close long position
-            close_side2 = self._get_trade_side_value("BUY")   # Buy to close short position
+            close_side1 = ProtoOATradeSide.Value("SELL")  # Sell to close long position
+            close_side2 = ProtoOATradeSide.Value("BUY")   # Buy to close short position
         else:
-            close_side1 = self._get_trade_side_value("BUY")   # Buy to close short position  
-            close_side2 = self._get_trade_side_value("SELL")  # Sell to close long position
+            close_side1 = ProtoOATradeSide.Value("BUY")   # Buy to close short position  
+            close_side2 = ProtoOATradeSide.Value("SELL")  # Sell to close long position
         
         # Close positions with the same volumes as opening
         self._send_market_order(s1, close_side1, volume1, is_close=True)
@@ -1857,51 +1478,12 @@ class CTraderRealTimeTrader:
         logger.info(f"🔍 TRADING DEBUG - Symbol: {symbol} (ID: {symbol_id})")
         logger.info(f"🔍 TRADING DEBUG - Client Order ID: {client_order_id}")
         
-        # Validate volume is provided and reasonable
-        if volume is None:
-            logger.error(f"Volume is required for all orders")
-            return None
-            
-        if volume <= 0:
-            logger.error(f"Invalid volume for {symbol}: {volume}")
-            return None
-        
-        # Get symbol details for validation
-        symbol_details = self.symbol_details.get(symbol, {})
-        min_volume_lots = symbol_details.get('min_volume', 0.01)
-        max_volume_lots = symbol_details.get('max_volume', 1000.0)
-        # Validate volume is within constraints (in lots)
-        if volume < min_volume_lots:
-            logger.warning(f"Volume {volume} below minimum {min_volume_lots} for {symbol}, adjusting")
-            volume = min_volume_lots
-            
-        if volume > max_volume_lots:
-            logger.warning(f"Volume {volume} above maximum {max_volume_lots} for {symbol}, adjusting")
-            volume = max_volume_lots
-        
-        # Convert volume to cTrader centilots format for the API
-        # According to cTrader API: volume in centilots = volume in lots * 100
-        # Special case for XRPUSD which requires different volume conversion
-        if symbol == 'XRPUSD':
-            broker_volume = int(round(volume * 10000))
-            logger.info(f"Special volume conversion for {symbol}: {volume:.5f} lots -> {broker_volume} (x10000)")
-        else:
-            broker_volume = int(round(volume * 100))
-            logger.info(f"Volume conversion for {symbol}: {volume:.5f} lots -> {broker_volume} centilots")
-        
-        # Ensure minimum volume (at least 1 unit)
-        broker_volume = max(broker_volume, 1)
-        
-        request = self._create_protobuf_request('NEW_ORDER',
-                               account_id=self.account_id,
-                               symbol_id=symbol_id,
-                               trade_side=side,
-                               client_order_id=client_order_id,
-                               volume=broker_volume)
-        
-        if request is None:
-            logger.error(f"Failed to create market order request for {symbol}")
-            return None
+        request = ProtoOANewOrderReq()
+        request.ctidTraderAccountId = self.account_id
+        request.symbolId = symbol_id
+        request.orderType = ProtoOAOrderType.Value("MARKET")
+        request.tradeSide = side
+        request.clientOrderId = client_order_id
         
         if is_close:
             # For closing positions, we need to use ProtoOAClosePositionReq instead
@@ -1909,9 +1491,25 @@ class CTraderRealTimeTrader:
             # TODO: Implement proper position ID tracking for ProtoOAClosePositionReq
             logger.debug(f"Using market order to close position for {symbol} (fallback method)")
         
+        # Validate volume is provided
+        if volume is None:
+            logger.error(f"Volume is required for all orders")
+            return None
+        
+        # Convert volume to cTrader format - following the sample pattern
+        # The sample uses: request.volume = int(volume) * 100
+        # This means volume should be in centilots (standard lots * 100)
+        symbol_details = self.symbol_details.get(symbol, {})
+        min_volume = symbol_details.get('min_volume', 1000)
+        
+        # Convert to centilots format like the sample
+        broker_volume = int(volume) * 100
+        # Ensure volume meets minimum requirements
+        broker_volume = max(broker_volume, min_volume)
+        request.volume = broker_volume
+        
         # Convert side to readable string for logging
-        buy_side_value = self._get_trade_side_value("BUY")
-        side_name = "BUY" if side == buy_side_value else "SELL"
+        side_name = "BUY" if side == ProtoOATradeSide.Value("BUY") else "SELL"
         action_type = "Closing" if is_close else "Opening"
         logger.info(f"{action_type} {side_name} order for {symbol}: {volume:.5f} lots ({broker_volume} centilots)")
         
@@ -1930,8 +1528,6 @@ class CTraderRealTimeTrader:
             
             logger.info(f"📨 ORDER SENT - ID: {client_order_id}, Symbol: {symbol}, Side: {side_name}, Volume: {volume:.5f}")
             logger.info(f"📨 Awaiting execution confirmation from cTrader...")
-            logger.info(f"📨 Total pending orders: {len(self.execution_requests)}")
-            logger.info(f"📨 Pending order IDs: {list(self.execution_requests.keys())}")
             
             return client_order_id
             
@@ -1944,321 +1540,83 @@ class CTraderRealTimeTrader:
         logger.error(f"Order execution error: {failure}")
     
     def _process_execution_event(self, event):
-        """Process order execution events according to cTrader documentation"""
-        
-        # According to cTrader docs, ProtoOAExecutionEvent contains:
-        # - executionType: Type of operation (ACCEPTED, FILLED, etc.)
-        # - order: Reference to the initial order (contains clientOrderId, orderStatus)
-        # - deal: Reference to the deal (execution details)
-        # - position: Reference to the position
-        
-        execution_type = getattr(event, 'executionType', None)
-        order = getattr(event, 'order', None)
-        deal = getattr(event, 'deal', None)
-        position = getattr(event, 'position', None)
-        
-        # Extract order details from the order object (not directly from event)
-        client_order_id = None
-        order_status = None
-        
-        if order:
-            client_order_id = getattr(order, 'clientOrderId', None)
-            order_status = getattr(order, 'orderStatus', None)
+        """Process order execution events"""
+        client_order_id = getattr(event, 'clientOrderId', None)
         
         # Log all execution events for debugging
         logger.info(f"🎯 EXECUTION EVENT RECEIVED:")
-        logger.info(f"   Execution Type: {execution_type}")
         logger.info(f"   Client Order ID: {client_order_id}")
-        logger.info(f"   Order Status: {order_status} ({self._get_order_status_name(order_status) if order_status else 'None'})")
-        logger.info(f"   Has Order Object: {order is not None}")
-        logger.info(f"   Has Deal Object: {deal is not None}")
-        logger.info(f"   Has Position Object: {position is not None}")
-        logger.info(f"   Current pending orders: {list(self.execution_requests.keys())}")
-        
-        # Handle cases where clientOrderId might be directly on event (fallback)
-        if not client_order_id:
-            client_order_id = getattr(event, 'clientOrderId', None)
-            logger.info(f"   Fallback Client Order ID: {client_order_id}")
-        
-        if not client_order_id:
-            logger.warning(f"⚠️ No client order ID found in execution event")
-            # Log raw event structure for debugging
-            logger.info(f"🔍 Raw execution event attributes:")
-            for attr in dir(event):
-                if not attr.startswith('_'):
-                    try:
-                        value = getattr(event, attr)
-                        if not callable(value):
-                            logger.info(f"🔍   {attr}: {value}")
-                    except:
-                        pass
-            return
+        logger.info(f"   Event Type: {getattr(event, 'executionType', 'Unknown')}")
+        logger.info(f"   Order Status: {getattr(event, 'orderStatus', 'Unknown')}")
+        logger.info(f"   Position ID: {getattr(event, 'positionId', 'None')}")
+        logger.info(f"   Deal ID: {getattr(event, 'dealId', 'None')}")
         
         if client_order_id in self.execution_requests:
             order_data = self.execution_requests[client_order_id]
             
-            # Process execution type (primary indicator)
-            if execution_type:
-                logger.info(f"✅ Order {client_order_id} execution type: {execution_type}")
+            # Process execution details
+            if hasattr(event, 'executionType'):
+                execution_type = event.executionType
+                logger.info(f"✅ Order {client_order_id} execution: {execution_type}")
                 
-                # Handle different execution types
-                if execution_type == 'ORDER_ACCEPTED':
-                    logger.info(f"📝 Order {client_order_id} ACCEPTED for {order_data['symbol']} - awaiting fill...")
-                elif execution_type == 'ORDER_FILLED':
-                    logger.info(f"✅ Order {client_order_id} FILLED successfully for {order_data['symbol']}")
-                    self._handle_order_filled(client_order_id, event)
-                elif execution_type == 'ORDER_REJECTED':
-                    logger.error(f"❌ Order {client_order_id} REJECTED for {order_data['symbol']}")
-                    self._handle_order_failed(client_order_id, 'REJECTED')
-                elif execution_type == 'ORDER_EXPIRED':
-                    logger.error(f"❌ Order {client_order_id} EXPIRED for {order_data['symbol']}")
-                    self._handle_order_failed(client_order_id, 'EXPIRED')
-                elif execution_type == 'ORDER_CANCELLED':
-                    logger.warning(f"⚠️ Order {client_order_id} CANCELLED for {order_data['symbol']}")
-                    self._handle_order_failed(client_order_id, 'CANCELLED')
-                else:
-                    logger.info(f"🔍 Order {client_order_id} execution type: {execution_type}")
-            
-            # Also process order status as secondary indicator (if available)
-            if order_status:
-                if order_status == 2:  # ORDER_STATUS_FILLED
-                    logger.info(f"✅ Order {client_order_id} status FILLED for {order_data['symbol']}")
-                    if execution_type != 'ORDER_FILLED':  # Only handle if not already handled by execution type
-                        self._handle_order_filled(client_order_id, event)
-                elif order_status == 3:  # ORDER_STATUS_REJECTED
-                    logger.error(f"❌ Order {client_order_id} status REJECTED for {order_data['symbol']}")
-                    if execution_type != 'ORDER_REJECTED':
-                        self._handle_order_failed(client_order_id, 'REJECTED')
-                elif order_status == 4:  # ORDER_STATUS_EXPIRED
-                    logger.error(f"❌ Order {client_order_id} status EXPIRED for {order_data['symbol']}")
-                    if execution_type != 'ORDER_EXPIRED':
-                        self._handle_order_failed(client_order_id, 'EXPIRED')
-                elif order_status == 5:  # ORDER_STATUS_CANCELLED
-                    logger.warning(f"⚠️ Order {client_order_id} status CANCELLED for {order_data['symbol']}")
-                    if execution_type != 'ORDER_CANCELLED':
-                        self._handle_order_failed(client_order_id, 'CANCELLED')
-                elif order_status == 1:  # ORDER_STATUS_ACCEPTED
-                    logger.info(f"📝 Order {client_order_id} status ACCEPTED for {order_data['symbol']}")
-            
-            # Log deal details if available
-            if deal:
-                deal_volume = getattr(deal, 'volume', 0)
-                deal_price = getattr(deal, 'executionPrice', 0)
-                deal_id = getattr(deal, 'dealId', 'Unknown')
-                logger.info(f"💰 Deal details - ID: {deal_id}, Volume: {deal_volume}, Price: {deal_price}")
+                # Log additional details for successful executions
+                if hasattr(event, 'executedVolume'):
+                    logger.info(f"   Executed Volume: {getattr(event, 'executedVolume', 0)}")
+                if hasattr(event, 'executionPrice'):
+                    logger.info(f"   Execution Price: {getattr(event, 'executionPrice', 0)}")
             
             # Clean up completed orders
-            if execution_type in ['ORDER_FILLED', 'ORDER_REJECTED', 'ORDER_EXPIRED', 'ORDER_CANCELLED'] or order_status in [2, 3, 4, 5]:
-                logger.info(f"🏁 Order {client_order_id} completed - removing from pending orders")
-                if client_order_id in self.execution_requests:
-                    del self.execution_requests[client_order_id]
+            if hasattr(event, 'orderStatus') and event.orderStatus in ['FILLED', 'CANCELLED', 'REJECTED']:
+                logger.info(f"🏁 Order {client_order_id} completed with status: {event.orderStatus}")
+                del self.execution_requests[client_order_id]
         else:
-            logger.warning(f"⚠️ Received execution event for unknown order: {client_order_id}")
-            logger.warning(f"⚠️ Known pending orders: {list(self.execution_requests.keys())}")
-            logger.warning(f"⚠️ Total pending orders: {len(self.execution_requests)}")
-            
-            # Check if this might be a case sensitivity or format issue
-            if client_order_id:
-                similar_orders = [oid for oid in self.execution_requests.keys() if client_order_id.lower() in oid.lower() or oid.lower() in client_order_id.lower()]
-                if similar_orders:
-                    logger.warning(f"⚠️ Similar order IDs found: {similar_orders}")
-    
-    def _get_order_status_name(self, status_code):
-        """Convert order status code to readable name"""
-        status_names = {
-            1: "ACCEPTED",
-            2: "FILLED", 
-            3: "REJECTED",
-            4: "EXPIRED",
-            5: "CANCELLED"
-        }
-        return status_names.get(status_code, f"UNKNOWN({status_code})")
-    
-    def _handle_order_filled(self, order_id: str, event):
-        """Handle a successfully filled order and check if pair trade is complete"""
-        logger.info(f"🎉 Processing FILLED order: {order_id}")
-        
-        if not hasattr(self, 'pending_pair_trades'):
-            logger.warning(f"⚠️ No pending_pair_trades attribute - initializing")
-            self.pending_pair_trades = {}
-            return
-        
-        if not self.pending_pair_trades:
-            logger.warning(f"⚠️ No pending pair trades to process for order {order_id}")
-            return
-        
-        # Find which pending pair trade this order belongs to
-        for trade_key, pending_trade in list(self.pending_pair_trades.items()):
-            if pending_trade['order1_id'] == order_id:
-                pending_trade['order1_filled'] = True
-                logger.info(f"✅ First leg of pair trade filled: {pending_trade['symbol1']} (Order: {order_id})")
-                logger.info(f"   Pair: {pending_trade['pair_str']}, Direction: {pending_trade['direction']}")
-            elif pending_trade['order2_id'] == order_id:
-                pending_trade['order2_filled'] = True
-                logger.info(f"✅ Second leg of pair trade filled: {pending_trade['symbol2']} (Order: {order_id})")
-                logger.info(f"   Pair: {pending_trade['pair_str']}, Direction: {pending_trade['direction']}")
-            else:
-                continue  # This order doesn't belong to this pending trade
-            
-            # Check if both orders are now filled
-            if pending_trade['order1_filled'] and pending_trade['order2_filled']:
-                logger.info(f"🎉 BOTH LEGS FILLED - Completing pair trade for {pending_trade['pair_str']}")
-                self._complete_pair_trade(pending_trade)
-                del self.pending_pair_trades[trade_key]
-            else:
-                remaining_orders = []
-                if not pending_trade['order1_filled']:
-                    remaining_orders.append(f"{pending_trade['symbol1']} ({pending_trade['order1_id']})")
-                if not pending_trade['order2_filled']:
-                    remaining_orders.append(f"{pending_trade['symbol2']} ({pending_trade['order2_id']})")
-                logger.info(f"⏳ Pair trade {pending_trade['pair_str']} waiting for: {', '.join(remaining_orders)}")
-            break
-        else:
-            logger.warning(f"⚠️ Order {order_id} not found in any pending pair trade")
-            logger.info(f"   Current pending trades: {list(self.pending_pair_trades.keys())}")
-            for trade_key, pending_trade in self.pending_pair_trades.items():
-                logger.info(f"   {trade_key}: {pending_trade['order1_id']}, {pending_trade['order2_id']}")
-    
-    def _handle_order_failed(self, order_id: str, reason: str):
-        """Handle a failed order and cancel the entire pair trade if needed"""
-        logger.error(f"💥 Processing FAILED order: {order_id}, Reason: {reason}")
-        
-        if not hasattr(self, 'pending_pair_trades'):
-            logger.warning(f"⚠️ No pending_pair_trades attribute for failed order {order_id}")
-            return
-        
-        if not self.pending_pair_trades:
-            logger.warning(f"⚠️ No pending pair trades to process for failed order {order_id}")
-            return
-        
-        # Find which pending pair trade this order belongs to
-        for trade_key, pending_trade in list(self.pending_pair_trades.items()):
-            if pending_trade['order1_id'] == order_id or pending_trade['order2_id'] == order_id:
-                failed_symbol = pending_trade['symbol1'] if pending_trade['order1_id'] == order_id else pending_trade['symbol2']
-                other_order_id = pending_trade['order2_id'] if pending_trade['order1_id'] == order_id else pending_trade['order1_id']
-                other_symbol = pending_trade['symbol2'] if pending_trade['order1_id'] == order_id else pending_trade['symbol1']
-                
-                logger.error(f"❌ PAIR TRADE FAILED for {pending_trade['pair_str']}: {failed_symbol} order {reason}")
-                logger.error(f"   Failed order: {order_id} ({failed_symbol})")
-                logger.error(f"   Other order: {other_order_id} ({other_symbol})")
-                logger.error(f"   Direction: {pending_trade['direction']}")
-                
-                # Check if the other order was already filled
-                if pending_trade['order1_filled'] or pending_trade['order2_filled']:
-                    logger.warning(f"⚠️ CRITICAL: One leg already filled! This creates an imbalanced position.")
-                    logger.warning(f"   Order 1 ({pending_trade['symbol1']}) filled: {pending_trade['order1_filled']}")
-                    logger.warning(f"   Order 2 ({pending_trade['symbol2']}) filled: {pending_trade['order2_filled']}")
-                    logger.warning(f"   Manual intervention may be required to balance the position.")
-                    
-                    # TODO: Implement automatic hedging/closing of the filled leg
-                    # For now, just log the imbalance for manual handling
-                else:
-                    logger.info(f"✅ Both orders failed/cancelled - no imbalanced position created")
-                
-                # Remove the pending trade regardless
-                logger.info(f"🗑️ Removing failed pair trade: {trade_key}")
-                del self.pending_pair_trades[trade_key]
-                break
-        else:
-            logger.warning(f"⚠️ Failed order {order_id} not found in any pending pair trade")
-            logger.info(f"   Current pending trades: {list(self.pending_pair_trades.keys())}")
-            for trade_key, pending_trade in self.pending_pair_trades.items():
-                logger.info(f"   {trade_key}: {pending_trade['order1_id']}, {pending_trade['order2_id']}")
-    
-    def _complete_pair_trade(self, pending_trade):
-        """Complete a successful pair trade by updating position tracking"""
-        pair_str = pending_trade['pair_str']
-        direction = pending_trade['direction']
-        
-        # Store position with thread safety
-        with self._update_lock:
-            self.active_positions[pair_str] = {
-                'direction': direction,
-                'symbol1': pending_trade['symbol1'],
-                'symbol2': pending_trade['symbol2'],
-                'volume1': pending_trade['volume1'],
-                'volume2': pending_trade['volume2'],
-                'entry_price1': pending_trade['entry_price1'],
-                'entry_price2': pending_trade['entry_price2'],
-                'entry_time': pending_trade['timestamp'],
-                'order_ids': (pending_trade['order1_id'], pending_trade['order2_id'])
-            }
-            
-            # Update pair state
-            if pair_str in self.pair_states:
-                state = self.pair_states[pair_str]
-                state['position'] = direction
-                state['entry_time'] = pending_trade['timestamp']
-                state['entry_price1'] = pending_trade['entry_price1']
-                state['entry_price2'] = pending_trade['entry_price2']
-        
-        logger.info(f"🎉 PAIR TRADE COMPLETED SUCCESSFULLY!")
-        logger.info(f"   Pair: {pair_str}")
-        logger.info(f"   Direction: {direction}")
-        logger.info(f"   {pending_trade['symbol1']}: {'BUY' if direction == 'LONG' else 'SELL'} {pending_trade['volume1']:.5f} lots")
-        logger.info(f"   {pending_trade['symbol2']}: {'SELL' if direction == 'LONG' else 'BUY'} {pending_trade['volume2']:.5f} lots")
-        logger.info(f"   Portfolio now: {len(self.active_positions)}/{self.config.max_open_positions} positions")
+            logger.warning(f"⚠️  Received execution event for unknown order: {client_order_id}")
     
     def _calculate_balanced_volumes(self, symbol1: str, symbol2: str, price1: float, price2: float) -> Optional[Tuple[float, float, float, float]]:
         """Calculate volumes for equal monetary exposure between two symbols with comprehensive validation"""
         
-        # Get symbol information with strict validation and fallbacks
+        # Get symbol information
         details1 = self.symbol_details.get(symbol1)
+        logger.info(f"Symbol details for {symbol1}: {details1}")
         details2 = self.symbol_details.get(symbol2)
+        logger.info(f"Symbol details for {symbol2}: {details2}")
         
-        if not details1:
-            logger.error(f"No symbol details available for {symbol1}")
-            logger.error(f"Available symbol details: {list(self.symbol_details.keys())}")
+        if not details1 or not details2:
+            logger.error(f"Missing symbol details for {symbol1} or {symbol2}")
             return None
         
-        if not details2:
-            logger.error(f"No symbol details available for {symbol2}")
-            logger.error(f"Available symbol details: {list(self.symbol_details.keys())}")
-            return None
-        
-        # Ensure required fields are available with proper fallbacks
-        required_fields = ['digits', 'min_volume', 'step_volume', 'lot_size']
-        
-        for symbol, details in [(symbol1, details1), (symbol2, details2)]:
-            for field in required_fields:
-                if field not in details or details[field] is None:
-                    logger.warning(f"Missing or null field '{field}' for symbol {symbol}")
-        
+        # Enhanced logging for debugging
         logger.info(f"Volume calculation for {symbol1}-{symbol2}:")
-        logger.info(f"  {symbol1}: price={price1:.5f}, min_volume={details1.get('min_volume', 'MISSING')}, step_volume={details1.get('step_volume', 'MISSING')}")
-        logger.info(f"  {symbol2}: price={price2:.5f}, min_volume={details2.get('min_volume', 'MISSING')}, step_volume={details2.get('step_volume', 'MISSING')}")
-        
-        # Log lot sizes for debugging
-        lot_size1_raw = details1.get('lot_size', 'MISSING')
-        lot_size2_raw = details2.get('lot_size', 'MISSING')
-        logger.info(f"  Lot sizes: {symbol1}={lot_size1_raw}, {symbol2}={lot_size2_raw}")
+        logger.info(f"  {symbol1}: price={price1:.5f}, min_volume={details1.get('min_volume', 'N/A')}")
+        logger.info(f"  {symbol2}: price={price2:.5f}, min_volume={details2.get('min_volume', 'N/A')}")
         
         # Calculate target monetary value per leg (half of max position size for each leg)
         target_monetary_value = self.config.max_position_size / 2
         
+        # For crypto pairs, we need to scale down the position size significantly
+        # to avoid enormous volumes on low-priced assets like SOLUSD, XRPUSD, etc.
+        crypto_symbols = {'BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'DOT', 'LINK', 'UNI', 'AVAX', 'MATIC'}
+        is_crypto_pair = any(crypto in symbol1 for crypto in crypto_symbols) or any(crypto in symbol2 for crypto in crypto_symbols)
+        
+        if is_crypto_pair:
+            # For crypto pairs, use much smaller position sizes to avoid massive volumes
+            # Scale down by 100x for crypto to keep volumes reasonable
+            target_monetary_value = target_monetary_value / 100
+            logger.info(f"Crypto pair detected ({symbol1}-{symbol2}), scaling position size down to ${target_monetary_value:.2f} per leg")
+        
         logger.info(f"  Target monetary value per leg: ${target_monetary_value:.2f}")
         
-        # Get lot sizes from symbol details (this is the contract size in cTrader)
-        # According to cTrader API documentation, lotSize is in centilots initially
-        # After conversion, it represents the actual contract size
-        lot_size1 = details1.get('lot_size')
-        lot_size2 = details2.get('lot_size')
+        # Get contract sizes - cTrader typically uses different contract size model
+        # For cTrader: 1 standard lot = 100,000 units for major forex pairs
+        # For other instruments, we need to get the actual contract size from symbol details
+        contract_size1 = details1.get('contract_size', 100000)  # Default to 100,000 for forex
+        contract_size2 = details2.get('contract_size', 100000)
         
-        if lot_size1 is None:
-            logger.error(f"No lot size information available for {symbol1}")
-            logger.error(f"Available details for {symbol1}: {list(details1.keys())}")
-            return None
-            
-        if lot_size2 is None:
-            logger.error(f"No lot size information available for {symbol2}")
-            logger.error(f"Available details for {symbol2}: {list(details2.keys())}")
-            return None
-        
-        # Use lot sizes directly - they have been converted from centilots to standard units
-        # For Forex pairs, this should be around 100000 (1 standard lot)
-        # For CFDs and other instruments, this varies by instrument
-        contract_size1 = lot_size1
-        contract_size2 = lot_size2
+        # If contract size not available, estimate based on symbol type
+        if contract_size1 == 100000 and any(crypto in symbol1 for crypto in crypto_symbols):
+            contract_size1 = 1  # Crypto typically has contract size of 1
+        if contract_size2 == 100000 and any(crypto in symbol2 for crypto in crypto_symbols):
+            contract_size2 = 1  # Crypto typically has contract size of 1
         
         logger.info(f"  Contract sizes: {symbol1}={contract_size1}, {symbol2}={contract_size2}")
         
@@ -2329,53 +1687,27 @@ class CTraderRealTimeTrader:
             logger.warning(f"  Consider increasing monetary_value_tolerance or adjusting max_position_size")
             return None
         
+        # Additional safety check: Cap volumes to reasonable maximum values for crypto
+        if is_crypto_pair:
+            max_crypto_notional = 500  # No single leg should exceed $500 notional for crypto
+            if monetary_value1 > max_crypto_notional or monetary_value2 > max_crypto_notional:
+                logger.warning(f"Crypto position size too large for {symbol1}-{symbol2}: ${monetary_value1:.2f}, ${monetary_value2:.2f}")
+                return None
+        
         logger.info(f"  Successfully calculated balanced volumes with {final_diff_pct:.4f} difference")
         return volume1, volume2, monetary_value1, monetary_value2
     
     def _normalize_ctrader_volume(self, symbol: str, volume_raw: float, symbol_details: Dict) -> Optional[float]:
-        """
-        Normalize volume to valid increments and constraints for cTrader
+        """Normalize volume to valid increments and constraints for cTrader"""
         
-        According to cTrader API documentation:
-        - Volume constraints (minVolume, maxVolume, stepVolume) are in centilots initially
-        - After conversion, they represent standard lots (0.01, 0.1, 1.0, etc.)
-        - Volume for trading orders should be in lots (e.g., 0.01 = 0.01 lots)
+        # Extract volume constraints from symbol details
+        min_vol = symbol_details.get('min_volume', 0.01)  # Default minimum
+        max_vol = symbol_details.get('max_volume', 100.0)  # Default maximum
         
-        Args:
-            symbol: Symbol name
-            volume_raw: Raw calculated volume in lots
-            symbol_details: Symbol details including volume constraints (already converted)
-            
-        Returns:
-            Normalized volume in lots, or None if normalization fails
-        """
+        # For cTrader, volume step is typically 0.01 for most instruments
+        step = symbol_details.get('volume_step', 0.01)
         
-        # Validate that required volume constraints are available
-        required_volume_fields = ['min_volume', 'step_volume']
-        for field in required_volume_fields:
-            if field not in symbol_details:
-                logger.error(f"Missing required volume field '{field}' for symbol {symbol}")
-                return None
-        
-        min_vol = symbol_details['min_volume']  # Already converted from centilots
-        max_vol = symbol_details.get('max_volume')  # Already converted from centilots
-        step = symbol_details['step_volume']  # Already converted from centilots
-        
-        # These values are now in standard lots (already converted)
-        min_vol_standard = min_vol
-        max_vol_standard = max_vol if max_vol is not None else None
-        step_standard = step
-        
-        # Validate the converted values are reasonable
-        # if min_vol_standard >= 1:
-        #     logger.warning(f"Suspicious min_volume for {symbol}: {min_vol_standard}, using default 0.01")
-        #     min_vol_standard = 0.01
-            
-        # if step_standard >= 1:
-        #     logger.warning(f"Suspicious step_volume for {symbol}: {step_standard}, using default 0.01")
-        #     step_standard = 0.01
-        
-        logger.debug(f"Normalizing volume for {symbol}: raw={volume_raw:.6f}, min={min_vol_standard}, max={max_vol_standard or 'None'}, step={step_standard}")
+        logger.info(f"Normalizing volume for {symbol}: raw={volume_raw:.6f}, min={min_vol}, max={max_vol}, step={step}")
         
         # Handle edge case where raw volume is 0 or negative
         if volume_raw <= 0:
@@ -2383,34 +1715,27 @@ class CTraderRealTimeTrader:
             return None
         
         # Round to valid step increments
-        if step_standard > 0:
-            volume = round(volume_raw / step_standard) * step_standard
-        else:
-            volume = volume_raw
+        volume = round(volume_raw / step) * step
         
-        # Apply minimum constraint
-        volume = max(min_vol_standard, volume)
-        
-        # Apply maximum constraint if available
-        if max_vol_standard is not None:
-            volume = min(max_vol_standard, volume)
+        # Apply min/max constraints
+        volume = max(min_vol, min(max_vol, volume))
         
         # Validate minimum volume requirement
-        if volume < min_vol_standard:
-            logger.warning(f"Volume {volume:.6f} below minimum {min_vol_standard} for {symbol}")
+        if volume < min_vol:
+            logger.warning(f"Volume {volume:.6f} below minimum {min_vol} for {symbol}")
             return None
         
-        # Validate maximum volume requirement if available
-        if max_vol_standard is not None and volume > max_vol_standard:
-            logger.warning(f"Volume {volume:.6f} exceeds maximum {max_vol_standard} for {symbol}")
-            volume = max_vol_standard
+        # Validate maximum volume requirement  
+        if volume > max_vol:
+            logger.warning(f"Volume {volume:.6f} exceeds maximum {max_vol} for {symbol}")
+            volume = max_vol
         
         # Additional validation: ensure volume is not zero after rounding
         if volume == 0:
             logger.warning(f"Volume became zero after normalization for {symbol} (raw: {volume_raw:.6f})")
             return None
         
-        logger.debug(f"Normalized volume for {symbol}: {volume:.6f}")
+        logger.info(f"Normalized volume for {symbol}: {volume:.6f}")
         return volume
     
     def _check_drawdown_limits(self, pair_str: str = None) -> bool:
@@ -2446,7 +1771,6 @@ class CTraderRealTimeTrader:
         
         status_counter = 0
         symbols_check_counter = 0
-        spot_price_check_counter = 0
         
         while self.is_trading:
             try:
@@ -2456,29 +1780,13 @@ class CTraderRealTimeTrader:
                     self._check_symbols_timeout()
                     symbols_check_counter = 0
                 
-                # Check spot price availability periodically
-                spot_price_check_counter += 1
-                if spot_price_check_counter % 30 == 0:  # Check every 30 seconds
-                    if len(self.spot_prices) == 0:
-                        logger.warning(f"⚠️ No spot prices received yet after {spot_price_check_counter} seconds")
-                        logger.warning(f"   Subscribed to {len(self.subscribed_symbols)} symbols: {self.subscribed_symbols}")
-                    # else:
-                        # logger.info(f"✅ Spot prices available for {len(self.spot_prices)} symbols")
-                    spot_price_check_counter = 0
-                
                 # Only proceed with trading if symbols are available or in degraded mode
                 if self.symbols_initialized or self._degraded_mode:
-                    # Only check trading signals if we have some spot prices
-                    if len(self.spot_prices) > 0:
-                        # Check trading signals for all pairs
-                        self._check_trading_signals()
-                        
-                        # Monitor existing positions
-                        self._monitor_positions()
-                    else:
-                        # Wait for spot prices to start arriving
-                        if spot_price_check_counter % 10 == 0:
-                            logger.debug("Waiting for spot price data to arrive from cTrader...")
+                    # Check trading signals for all pairs
+                    self._check_trading_signals()
+                    
+                    # Monitor existing positions
+                    self._monitor_positions()
                 else:
                     # Log status periodically while waiting for symbols (less frequently)
                     if symbols_check_counter % 30 == 0:
@@ -2488,7 +1796,6 @@ class CTraderRealTimeTrader:
                 status_counter += 1
                 if status_counter % 300 == 0:
                     self._log_portfolio_status()
-                    self._cleanup_stale_pending_trades()
                     status_counter = 0
                 
                 # Sleep for a short interval to prevent excessive CPU usage
@@ -2523,24 +1830,6 @@ class CTraderRealTimeTrader:
                 
                 # Don't raise exception - let trading continue without full symbol data
     
-    def _cleanup_stale_pending_trades(self):
-        """Clean up pending trades that have been waiting too long"""
-        if not hasattr(self, 'pending_pair_trades') or not self.pending_pair_trades:
-            return
-        
-        current_time = datetime.now()
-        stale_timeout = timedelta(minutes=5)  # 5 minutes timeout
-        
-        stale_trades = []
-        for trade_key, pending_trade in self.pending_pair_trades.items():
-            if current_time - pending_trade['timestamp'] > stale_timeout:
-                stale_trades.append((trade_key, pending_trade))
-        
-        for trade_key, pending_trade in stale_trades:
-            logger.warning(f"⏰ Cleaning up stale pending trade for {pending_trade['pair_str']} (waited {current_time - pending_trade['timestamp']})")
-            logger.warning(f"   Order 1 filled: {pending_trade['order1_filled']}, Order 2 filled: {pending_trade['order2_filled']}")
-            del self.pending_pair_trades[trade_key]
-    
     def _log_portfolio_status(self):
         """Log current portfolio status"""
         try:
@@ -2561,11 +1850,6 @@ class CTraderRealTimeTrader:
             logger.info(f"Trading Status   : {'ACTIVE' if self.is_trading else 'STOPPED'}")
             logger.info(f"Suspended Pairs  : {len(self.suspended_pairs)}")
             logger.info(f"Open P&L        : ${status['unrealized_pnl']:,.2f} ({status['unrealized_pnl']/self.config.initial_portfolio_value*100:+.2f}%)")
-            
-            # Log pending trades awaiting execution
-            if hasattr(self, 'pending_pair_trades') and self.pending_pair_trades:
-                logger.info(f"Pending Trades   : {len(self.pending_pair_trades)} awaiting execution")
-            
             logger.info("-" * 80)
             
             # Log signal generation status
@@ -2601,21 +1885,6 @@ class CTraderRealTimeTrader:
                     position_value = abs(pos['volume1'] * pos['current_price1']) + abs(pos['volume2'] * pos['current_price2'])
                     pnl_pct = (pos['pnl'] / position_value * 100) if position_value > 0 else 0
                     logger.info(f"{pos['pair']:<15} {pos['pnl']:>8.2f}   {pnl_pct:>6.2f}    {position_value:>8,.0f}")
-            
-            # Show pending trades if any
-            if hasattr(self, 'pending_pair_trades') and self.pending_pair_trades:
-                logger.info("-" * 40)
-                logger.info("PENDING TRADES")
-                logger.info("-" * 40)
-                logger.info("PAIR            DIRECTION   ELAPSED   LEG1  LEG2")
-                logger.info("-" * 40)
-                
-                for trade_key, pending_trade in self.pending_pair_trades.items():
-                    elapsed = datetime.now() - pending_trade['timestamp']
-                    elapsed_str = f"{elapsed.total_seconds():.0f}s"
-                    leg1_status = "✓" if pending_trade['order1_filled'] else "○"
-                    leg2_status = "✓" if pending_trade['order2_filled'] else "○"
-                    logger.info(f"{pending_trade['pair_str']:<15} {pending_trade['direction']:<9} {elapsed_str:>7}   {leg1_status:>4}  {leg2_status:>4}")
             
             logger.info("=" * 80)
             logger.info("")
@@ -2722,13 +1991,9 @@ class CTraderRealTimeTrader:
         if symbol in self.symbols_map and symbol in self.subscribed_symbols:
             symbol_id = self.symbols_map[symbol]
             
-            request = self._create_protobuf_request('UNSUBSCRIBE_SPOTS',
-                                                   account_id=self.account_id,
-                                                   symbol_ids=[symbol_id])
-            
-            if request is None:
-                logger.error(f"Failed to create unsubscribe request for {symbol}")
-                return
+            request = ProtoOAUnsubscribeSpotsReq()
+            request.ctidTraderAccountId = self.account_id
+            request.symbolId.append(symbol_id)
             
             try:
                 deferred = self.client.send(request)

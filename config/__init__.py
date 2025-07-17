@@ -27,8 +27,8 @@ class TradingConfig:
     end_date: Optional[str] = None
     
     # Strategy parameters
-    z_entry: float = 2.0
-    z_exit: float = 5
+    z_entry: float = 1.0
+    z_exit: float = 0.5
     z_period: int = 100
     min_distance: float = 0  # Minimum distance from mean to enter trade (in percentage)
     min_volatility: float = 0 # Minimum volatility of Pair Ratio to consider pair
@@ -60,7 +60,7 @@ class TradingConfig:
     max_portfolio_drawdown_perc: float = 10  # Maximum portfolio drawdown (%) before suspending all trading
     initial_portfolio_value: float = 100000.0  # Initial portfolio value for drawdown calculation
 
-    # Algo Trading parameters
+    # MT5 specific parameters
     magic_number: int = 12345
     mt5_server: str = "MT5Server"
     mt5_login: Optional[int] = None
