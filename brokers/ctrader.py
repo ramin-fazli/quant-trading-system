@@ -1649,46 +1649,75 @@ class CTraderRealTimeTrader:
             
             current_position = state['position']
             
-            # Thread-safe check of active positions
+            # Thread-safe check of active positions AND pending trades
             with self._update_lock:
                 has_active_position = pair_str in self.active_positions
                 current_position_count = len(self.active_positions)
+                
+                # CRITICAL FIX: Also check if there are pending trades for this pair
+                # This prevents multiple trades being started for the same pair before completion
+                has_pending_trade = False
+                if hasattr(self, 'pending_pair_trades'):
+                    for pending_key, pending_trade in self.pending_pair_trades.items():
+                        if pending_trade['pair_str'] == pair_str:
+                            has_pending_trade = True
+                            break
             
             # Check if trading conditions are suitable
             if not getattr(latest_signal, 'suitable', True):
                 return
             
-            # Check portfolio limits before entry
-            if current_position is None and not has_active_position:
-                if current_position_count >= self.config.max_open_positions:
-                    return
+            # CRITICAL FIX: Block new trades if pair already has active position OR pending trade
+            if current_position is not None or has_active_position or has_pending_trade:
+                if has_pending_trade and current_position is None and not has_active_position:
+                    # Only log occasionally to avoid spam
+                    if not hasattr(self, '_pending_trade_log'):
+                        self._pending_trade_log = {}
+                    if pair_str not in self._pending_trade_log:
+                        self._pending_trade_log[pair_str] = 0
+                    self._pending_trade_log[pair_str] += 1
+                    
+                    if self._pending_trade_log[pair_str] % 20 == 1:  # Log every 20th occurrence
+                        # Determine direction from signals to provide better logging
+                        signal_direction = "entry"
+                        if getattr(latest_signal, 'long_entry', False):
+                            signal_direction = "LONG"
+                        elif getattr(latest_signal, 'short_entry', False):
+                            signal_direction = "SHORT"
+                        logger.info(f"⏳ PENDING TRADE: Skipping new {signal_direction} signal for {pair_str} - already has pending trade")
+                
+                # Skip to exit signal processing if this is an active position
+                if current_position is not None or has_active_position:
+                    # Process exit signals (existing logic)
+                    should_exit = False
+                    if current_position == 'LONG' and getattr(latest_signal, 'long_exit', False):
+                        should_exit = True
+                    elif current_position == 'SHORT' and getattr(latest_signal, 'short_exit', False):
+                        should_exit = True
+                    
+                    if should_exit:
+                        # Get additional info for logging if available
+                        info_str = ""
+                        if 'zscore' in indicators:
+                            zscore_val = indicators['zscore'].iloc[-1] if hasattr(indicators['zscore'], 'iloc') else indicators['zscore']
+                            info_str = f", z-score: {zscore_val:.2f}"
+                        
+                        logger.info(f"[{current_position} EXIT] Signal for {pair_str}{info_str}")
+                        self._close_pair_position(pair_str)
+                return
+            
+            # Check portfolio limits before entry (only for new positions)
+            if current_position_count >= self.config.max_open_positions:
+                return
             
             # Process entry signals using strategy output
-            if current_position is None and not has_active_position:
-                if getattr(latest_signal, 'short_entry', False):
-                    logger.info(f"[SHORT ENTRY] Signal for {pair_str} - Positions: {current_position_count}/{self.config.max_open_positions}")
-                    self._execute_pair_trade(pair_str, 'SHORT')
-                elif getattr(latest_signal, 'long_entry', False):
-                    logger.info(f"[LONG ENTRY] Signal for {pair_str} - Positions: {current_position_count}/{self.config.max_open_positions}")
-                    self._execute_pair_trade(pair_str, 'LONG')
-            
-            # Process exit signals using strategy output
-            elif current_position is not None or has_active_position:
-                should_exit = False
-                if current_position == 'LONG' and getattr(latest_signal, 'long_exit', False):
-                    should_exit = True
-                elif current_position == 'SHORT' and getattr(latest_signal, 'short_exit', False):
-                    should_exit = True
-                
-                if should_exit:
-                    # Get additional info for logging if available
-                    info_str = ""
-                    if 'zscore' in indicators:
-                        zscore_val = indicators['zscore'].iloc[-1] if hasattr(indicators['zscore'], 'iloc') else indicators['zscore']
-                        info_str = f", z-score: {zscore_val:.2f}"
-                    
-                    logger.info(f"[{current_position} EXIT] Signal for {pair_str}{info_str}")
-                    self._close_pair_position(pair_str)
+            # CRITICAL FIX: This section should only be reached if no active/pending positions exist
+            if getattr(latest_signal, 'short_entry', False):
+                logger.info(f"[SHORT ENTRY] Signal for {pair_str} - Positions: {current_position_count}/{self.config.max_open_positions}")
+                self._execute_pair_trade(pair_str, 'SHORT')
+            elif getattr(latest_signal, 'long_entry', False):
+                logger.info(f"[LONG ENTRY] Signal for {pair_str} - Positions: {current_position_count}/{self.config.max_open_positions}")
+                self._execute_pair_trade(pair_str, 'LONG')
                     
         except Exception as e:
             logger.error(f"Error checking trading signals for {pair_str}: {e}")
@@ -1714,6 +1743,18 @@ class CTraderRealTimeTrader:
             if len(self.active_positions) >= self.config.max_open_positions:
                 logger.warning(f"[PORTFOLIO LIMIT] Cannot open {direction} position for {pair_str} - already at max positions: {len(self.active_positions)}/{self.config.max_open_positions}")
                 return False
+            
+            # CRITICAL FIX: Check if pair already has an active position
+            if pair_str in self.active_positions:
+                logger.warning(f"[DUPLICATE PREVENTION] Cannot open {direction} position for {pair_str} - pair already has active position")
+                return False
+            
+            # CRITICAL FIX: Check if pair already has pending trades to prevent duplicates
+            if hasattr(self, 'pending_pair_trades'):
+                for pending_key, pending_trade in self.pending_pair_trades.items():
+                    if pending_trade['pair_str'] == pair_str:
+                        logger.warning(f"[DUPLICATE PREVENTION] Cannot open {direction} position for {pair_str} - pair already has pending trade (ID: {pending_key})")
+                        return False
         
         if not self._check_drawdown_limits(pair_str):
             logger.error(f"[ERROR] Trade blocked by drawdown limits for {pair_str}")
@@ -2078,6 +2119,25 @@ class CTraderRealTimeTrader:
         """Handle a successfully filled order and check if pair trade is complete"""
         logger.info(f"🎉 Processing FILLED order: {order_id}")
         
+        # Monitor emergency hedges first
+        self._monitor_emergency_hedges()
+        
+        # Check if this is an emergency hedge order
+        if hasattr(self, 'emergency_hedges') and order_id in self.emergency_hedges:
+            hedge_info = self.emergency_hedges[order_id]
+            logger.info(f"✅ EMERGENCY HEDGE ORDER FILLED - RISK NEUTRALIZED!")
+            logger.info(f"   Hedged symbol: {hedge_info['symbol']}, Volume: {hedge_info['volume']:.5f}")
+            logger.info(f"   Original pair: {hedge_info['original_pair']}")
+            
+            # Suspend the pair if not already suspended (in case hedge completed before pair was suspended)
+            if 'failed_trade_data' in hedge_info:
+                pair_to_suspend = hedge_info['original_pair']
+                self._suspend_problematic_pair(pair_to_suspend, "Emergency hedge completed - pair requires review")
+            
+            # Remove from tracking once filled
+            del self.emergency_hedges[order_id]
+            return  # Don't process as pair trade order
+        
         if not hasattr(self, 'pending_pair_trades'):
             logger.warning(f"⚠️ No pending_pair_trades attribute - initializing")
             self.pending_pair_trades = {}
@@ -2123,6 +2183,24 @@ class CTraderRealTimeTrader:
         """Handle a failed order and cancel the entire pair trade if needed"""
         logger.error(f"💥 Processing FAILED order: {order_id}, Reason: {reason}")
         
+        # Monitor emergency hedges first
+        self._monitor_emergency_hedges()
+        
+        # Check if this is an emergency hedge order that failed
+        if hasattr(self, 'emergency_hedges') and order_id in self.emergency_hedges:
+            hedge_info = self.emergency_hedges[order_id]
+            logger.critical(f"🚨 EMERGENCY HEDGE ORDER FAILED!")
+            logger.critical(f"   Failed hedge symbol: {hedge_info['symbol']}, Volume: {hedge_info['volume']:.5f}")
+            logger.critical(f"   Original pair: {hedge_info['original_pair']}")
+            logger.critical(f"   ONE-LEGGED POSITION STILL EXISTS - MANUAL INTERVENTION REQUIRED!")
+            
+            # Send alert but keep tracking the failed hedge
+            self._send_emergency_alert(
+                f"CRITICAL: Emergency hedge order FAILED for {hedge_info['symbol']} "
+                f"({hedge_info['volume']:.5f} shares). One-legged position still exists!"
+            )
+            return  # Don't process as pair trade order
+        
         if not hasattr(self, 'pending_pair_trades'):
             logger.warning(f"⚠️ No pending_pair_trades attribute for failed order {order_id}")
             return
@@ -2143,15 +2221,29 @@ class CTraderRealTimeTrader:
                 logger.error(f"   Other order: {other_order_id} ({other_symbol})")
                 logger.error(f"   Direction: {pending_trade['direction']}")
                 
-                # Check if the other order was already filled
+                # CRITICAL: Check if the other order was already filled - IMMEDIATE HEDGING REQUIRED
                 if pending_trade['order1_filled'] or pending_trade['order2_filled']:
-                    logger.warning(f"⚠️ CRITICAL: One leg already filled! This creates an imbalanced position.")
-                    logger.warning(f"   Order 1 ({pending_trade['symbol1']}) filled: {pending_trade['order1_filled']}")
-                    logger.warning(f"   Order 2 ({pending_trade['symbol2']}) filled: {pending_trade['order2_filled']}")
-                    logger.warning(f"   Manual intervention may be required to balance the position.")
+                    logger.critical(f"🚨 CRITICAL: ONE-LEGGED POSITION DETECTED!")
+                    logger.critical(f"   Order 1 ({pending_trade['symbol1']}) filled: {pending_trade['order1_filled']}")
+                    logger.critical(f"   Order 2 ({pending_trade['symbol2']}) filled: {pending_trade['order2_filled']}")
+                    logger.critical(f"   IMMEDIATE HEDGING REQUIRED TO PREVENT UNCONTROLLED RISK!")
                     
-                    # TODO: Implement automatic hedging/closing of the filled leg
-                    # For now, just log the imbalance for manual handling
+                    # Determine which leg is filled and needs immediate closing
+                    if pending_trade['order1_filled'] and not pending_trade['order2_filled']:
+                        # Order 1 (symbol1) is filled, order 2 failed
+                        filled_symbol = pending_trade['symbol1']
+                        filled_volume = pending_trade['volume1']
+                        filled_side = "BUY" if pending_trade['direction'] == 'LONG' else "SELL"
+                        logger.critical(f"   Filled leg: {filled_symbol} {filled_side} {filled_volume:.5f} lots")
+                        self._emergency_hedge_position(filled_symbol, filled_side, filled_volume, pending_trade)
+                        
+                    elif pending_trade['order2_filled'] and not pending_trade['order1_filled']:
+                        # Order 2 (symbol2) is filled, order 1 failed
+                        filled_symbol = pending_trade['symbol2']
+                        filled_volume = pending_trade['volume2']
+                        filled_side = "SELL" if pending_trade['direction'] == 'LONG' else "BUY"
+                        logger.critical(f"   Filled leg: {filled_symbol} {filled_side} {filled_volume:.5f} lots")
+                        self._emergency_hedge_position(filled_symbol, filled_side, filled_volume, pending_trade)
                 else:
                     logger.info(f"✅ Both orders failed/cancelled - no imbalanced position created")
                 
@@ -2164,6 +2256,269 @@ class CTraderRealTimeTrader:
             logger.info(f"   Current pending trades: {list(self.pending_pair_trades.keys())}")
             for trade_key, pending_trade in self.pending_pair_trades.items():
                 logger.info(f"   {trade_key}: {pending_trade['order1_id']}, {pending_trade['order2_id']}")
+    
+    def _emergency_hedge_position(self, symbol: str, original_side: str, volume: float, failed_trade: dict):
+        """Emergency hedging function - first retry failed leg, then close filled leg if needed"""
+        logger.critical(f"🚨 EXECUTING EMERGENCY HEDGE PROTOCOL for {symbol}")
+        logger.critical(f"   Original side: {original_side}, Volume: {volume:.5f}")
+        logger.critical(f"   Failed pair: {failed_trade['pair_str']}")
+        
+        try:
+            # First, attempt to retry the failed leg up to 3 times
+            retry_success = self._retry_failed_leg(failed_trade)
+            
+            if retry_success:
+                logger.info(f"✅ RETRY SUCCESSFUL - Original trade completed, no hedging needed")
+                return
+            
+            # If retries failed, proceed with closing the filled leg
+            logger.critical(f"🚨 ALL RETRIES FAILED - Proceeding to close filled leg: {symbol}")
+            
+            # Determine the opposite side to close the position
+            if original_side == "BUY":
+                hedge_side = self._get_trade_side_value("SELL")
+                hedge_side_name = "SELL"
+            else:
+                hedge_side = self._get_trade_side_value("BUY")
+                hedge_side_name = "BUY"
+            
+            logger.critical(f"   Hedge action: {hedge_side_name} {volume:.5f} lots of {symbol}")
+            
+            # Send immediate market order to close the position
+            hedge_order_id = self._send_market_order(symbol, hedge_side, volume, is_close=True)
+            
+            if hedge_order_id:
+                logger.critical(f"✅ EMERGENCY HEDGE ORDER SENT: {hedge_order_id}")
+                logger.critical(f"   Symbol: {symbol}, Side: {hedge_side_name}, Volume: {volume:.5f}")
+                logger.critical(f"   This should close the one-legged position")
+                
+                # Mark this as an emergency hedge in tracking
+                if not hasattr(self, 'emergency_hedges'):
+                    self.emergency_hedges = {}
+                
+                self.emergency_hedges[hedge_order_id] = {
+                    'symbol': symbol,
+                    'volume': volume,
+                    'hedge_side': hedge_side_name,
+                    'original_pair': failed_trade['pair_str'],
+                    'timestamp': datetime.now(),
+                    'reason': 'one_legged_position_after_retries',
+                    'failed_trade_data': failed_trade  # Store for pair suspension
+                }
+                
+                logger.critical(f"   Emergency hedge tracked under ID: {hedge_order_id}")
+                
+                # Suspend the pair immediately to prevent further issues
+                self._suspend_problematic_pair(failed_trade['pair_str'], "Emergency hedge required after failed retries")
+                
+            else:
+                logger.critical(f"❌ FAILED TO SEND EMERGENCY HEDGE ORDER!")
+                logger.critical(f"   MANUAL INTERVENTION REQUIRED IMMEDIATELY!")
+                logger.critical(f"   Action needed: {hedge_side_name} {volume:.5f} lots of {symbol}")
+                
+                # Still suspend the pair even if hedge failed
+                self._suspend_problematic_pair(failed_trade['pair_str'], "Emergency hedge failed to send")
+                
+                # Send alert/notification (implement as needed)
+                self._send_emergency_alert(symbol, original_side, volume, failed_trade)
+                
+        except Exception as e:
+            logger.critical(f"❌ EXCEPTION IN EMERGENCY HEDGE: {e}")
+            logger.critical(f"   MANUAL INTERVENTION REQUIRED IMMEDIATELY!")
+            logger.critical(f"   Action needed: Close {volume:.5f} lots of {symbol} (opposite to {original_side})")
+            
+            # Suspend pair even on exception
+            self._suspend_problematic_pair(failed_trade['pair_str'], f"Emergency hedge exception: {e}")
+            
+            # Send emergency alert
+            self._send_emergency_alert(symbol, original_side, volume, failed_trade)
+    
+    def _retry_failed_leg(self, failed_trade: dict, max_retries: int = 3) -> bool:
+        """Retry the failed leg of a pair trade to complete the original trade"""
+        logger.critical(f"🔄 ATTEMPTING TO RETRY FAILED LEG for {failed_trade['pair_str']}")
+        
+        # Determine which leg failed and needs to be retried
+        failed_symbol = None
+        failed_side = None
+        failed_volume = None
+        failed_order_id = None
+        
+        if failed_trade['order1_filled'] and not failed_trade['order2_filled']:
+            # Order 2 failed, retry it
+            failed_symbol = failed_trade['symbol2']
+            failed_volume = failed_trade['volume2']
+            failed_side = "SELL" if failed_trade['direction'] == 'LONG' else "BUY"
+            failed_order_id = failed_trade['order2_id']
+            logger.critical(f"   Retrying Order 2: {failed_symbol} {failed_side} {failed_volume:.5f}")
+            
+        elif failed_trade['order2_filled'] and not failed_trade['order1_filled']:
+            # Order 1 failed, retry it
+            failed_symbol = failed_trade['symbol1']
+            failed_volume = failed_trade['volume1']
+            failed_side = "BUY" if failed_trade['direction'] == 'LONG' else "SELL"
+            failed_order_id = failed_trade['order1_id']
+            logger.critical(f"   Retrying Order 1: {failed_symbol} {failed_side} {failed_volume:.5f}")
+            
+        else:
+            logger.error(f"❌ Invalid failed trade state - cannot determine which leg to retry")
+            return False
+        
+        if not failed_symbol:
+            logger.error(f"❌ Could not determine failed leg details")
+            return False
+        
+        # Convert side to cTrader format
+        side_value = self._get_trade_side_value(failed_side)
+        
+        # Attempt retries
+        for retry_attempt in range(1, max_retries + 1):
+            logger.critical(f"🔄 RETRY ATTEMPT {retry_attempt}/{max_retries} for {failed_symbol}")
+            
+            try:
+                # Generate new order ID for retry
+                retry_order_id = self._send_market_order(failed_symbol, side_value, failed_volume)
+                
+                if retry_order_id:
+                    logger.critical(f"✅ RETRY ORDER SENT: {retry_order_id}")
+                    logger.critical(f"   Waiting for execution confirmation...")
+                    
+                    # Wait for order execution (with timeout)
+                    retry_success = self._wait_for_order_execution(retry_order_id, timeout_seconds=30)
+                    
+                    if retry_success:
+                        logger.critical(f"🎉 RETRY SUCCESSFUL! Original pair trade completed")
+                        logger.critical(f"   Completed pair: {failed_trade['pair_str']}")
+                        
+                        # Update the pending trade to mark both legs as filled
+                        if failed_trade['order1_filled'] and not failed_trade['order2_filled']:
+                            failed_trade['order2_filled'] = True
+                            failed_trade['order2_id'] = retry_order_id  # Update with new order ID
+                        elif failed_trade['order2_filled'] and not failed_trade['order1_filled']:
+                            failed_trade['order1_filled'] = True
+                            failed_trade['order1_id'] = retry_order_id  # Update with new order ID
+                        
+                        # Complete the pair trade normally
+                        self._complete_pair_trade(failed_trade)
+                        
+                        return True  # Success!
+                    else:
+                        logger.error(f"❌ RETRY ATTEMPT {retry_attempt} FAILED - Order did not execute within timeout")
+                        
+                else:
+                    logger.error(f"❌ RETRY ATTEMPT {retry_attempt} FAILED - Could not send order")
+                    
+            except Exception as e:
+                logger.error(f"❌ RETRY ATTEMPT {retry_attempt} FAILED with exception: {e}")
+            
+            # Wait before next retry (except on last attempt)
+            if retry_attempt < max_retries:
+                import time
+                wait_time = retry_attempt * 2  # Increasing wait time: 2s, 4s, 6s
+                logger.critical(f"   Waiting {wait_time}s before next retry...")
+                time.sleep(wait_time)
+        
+        logger.critical(f"❌ ALL {max_retries} RETRY ATTEMPTS FAILED for {failed_symbol}")
+        return False
+    
+    def _wait_for_order_execution(self, order_id: str, timeout_seconds: int = 30) -> bool:
+        """Wait for an order to be executed or rejected within timeout"""
+        import time
+        
+        start_time = time.time()
+        check_interval = 0.5  # Check every 500ms
+        
+        while time.time() - start_time < timeout_seconds:
+            # Check if order is no longer pending (executed or failed)
+            if order_id not in self.execution_requests:
+                # Order was processed, check if it was successful
+                # We'll consider it successful if it's not in pending anymore
+                # (the actual success/failure handling is done in _process_execution_event)
+                logger.debug(f"Order {order_id} processed (no longer pending)")
+                return True
+            
+            time.sleep(check_interval)
+        
+        # Timeout reached
+        logger.warning(f"Order {order_id} execution timeout after {timeout_seconds}s")
+        return False
+    
+    def _suspend_problematic_pair(self, pair_str: str, reason: str):
+        """Add a pair to the suspended list to prevent further trading"""
+        if not hasattr(self, 'suspended_pairs'):
+            self.suspended_pairs = set()
+        
+        if pair_str not in self.suspended_pairs:
+            self.suspended_pairs.add(pair_str)
+            logger.critical(f"🚫 PAIR SUSPENDED: {pair_str}")
+            logger.critical(f"   Reason: {reason}")
+            logger.critical(f"   This pair will not be traded until manually re-enabled")
+            logger.critical(f"   Total suspended pairs: {len(self.suspended_pairs)}")
+            
+            # Log all suspended pairs for visibility
+            if len(self.suspended_pairs) > 1:
+                logger.critical(f"   All suspended pairs: {', '.join(sorted(self.suspended_pairs))}")
+        else:
+            logger.warning(f"⚠️ Pair {pair_str} already suspended")
+    
+    def _unsuspend_pair(self, pair_str: str, reason: str = "Manual re-enable"):
+        """Remove a pair from the suspended list to re-enable trading"""
+        if not hasattr(self, 'suspended_pairs'):
+            self.suspended_pairs = set()
+            
+        if pair_str in self.suspended_pairs:
+            self.suspended_pairs.remove(pair_str)
+            logger.info(f"✅ PAIR RE-ENABLED: {pair_str}")
+            logger.info(f"   Reason: {reason}")
+            logger.info(f"   Remaining suspended pairs: {len(self.suspended_pairs)}")
+            
+            if self.suspended_pairs:
+                logger.info(f"   Still suspended: {', '.join(sorted(self.suspended_pairs))}")
+            else:
+                logger.info(f"   No pairs currently suspended")
+        else:
+            logger.warning(f"⚠️ Pair {pair_str} was not suspended")
+    
+    def get_suspended_pairs_status(self) -> dict:
+        """Get status of all suspended pairs"""
+        if not hasattr(self, 'suspended_pairs'):
+            self.suspended_pairs = set()
+            
+        return {
+            'suspended_pairs': list(self.suspended_pairs),
+            'count': len(self.suspended_pairs),
+            'active_pairs': [pair for pair in self.pair_states.keys() if pair not in self.suspended_pairs]
+        }
+    
+    def _send_emergency_alert(self, symbol: str, original_side: str, volume: float, failed_trade: dict):
+        """Send emergency alert for manual intervention (implement based on your alert system)"""
+        alert_message = f"""
+        🚨 EMERGENCY: ONE-LEGGED POSITION DETECTED! 🚨
+        
+        Pair: {failed_trade['pair_str']}
+        Filled Symbol: {symbol}
+        Original Side: {original_side}
+        Volume: {volume:.5f} lots
+        
+        IMMEDIATE ACTION REQUIRED:
+        - Manually close this position by executing opposite trade
+        - Required action: {'SELL' if original_side == 'BUY' else 'BUY'} {volume:.5f} lots of {symbol}
+        
+        Timestamp: {datetime.now()}
+        """
+        
+        logger.critical(alert_message)
+        
+        # TODO: Implement your preferred alert mechanism:
+        # - Email notification
+        # - SMS alert
+        # - Webhook to monitoring system
+        # - Dashboard alert
+        # - etc.
+        
+        # For now, log prominently
+        logger.critical("=" * 80)
+        logger.critical("MANUAL INTERVENTION REQUIRED - ONE-LEGGED POSITION")
+        logger.critical("=" * 80)
     
     def _complete_pair_trade(self, pending_trade):
         """Complete a successful pair trade by updating position tracking"""
@@ -2419,8 +2774,14 @@ class CTraderRealTimeTrader:
         if self.portfolio_trading_suspended:
             return False
         
-        if pair_str and pair_str in self.suspended_pairs:
-            return False
+        # Check if this specific pair is suspended
+        if pair_str:
+            if not hasattr(self, 'suspended_pairs'):
+                self.suspended_pairs = set()
+            
+            if pair_str in self.suspended_pairs:
+                logger.debug(f"Trading blocked for suspended pair: {pair_str}")
+                return False
         
         return True
     
@@ -2486,7 +2847,7 @@ class CTraderRealTimeTrader:
                 
                 # Log portfolio status every 5 minutes (300 seconds)
                 status_counter += 1
-                if status_counter % 300 == 0:
+                if status_counter % 60 == 0:
                     self._log_portfolio_status()
                     self._cleanup_stale_pending_trades()
                     status_counter = 0
@@ -2539,7 +2900,100 @@ class CTraderRealTimeTrader:
         for trade_key, pending_trade in stale_trades:
             logger.warning(f"⏰ Cleaning up stale pending trade for {pending_trade['pair_str']} (waited {current_time - pending_trade['timestamp']})")
             logger.warning(f"   Order 1 filled: {pending_trade['order1_filled']}, Order 2 filled: {pending_trade['order2_filled']}")
+            
+            # CRITICAL: Check for one-legged positions before cleanup
+            if pending_trade['order1_filled'] and not pending_trade['order2_filled']:
+                logger.critical(f"🚨 STALE TRADE WITH ONE-LEGGED POSITION DETECTED!")
+                filled_symbol = pending_trade['symbol1']
+                filled_volume = pending_trade['volume1']
+                filled_side = "BUY" if pending_trade['direction'] == 'LONG' else "SELL"
+                self._emergency_hedge_position(filled_symbol, filled_side, filled_volume, pending_trade)
+                
+            elif pending_trade['order2_filled'] and not pending_trade['order1_filled']:
+                logger.critical(f"🚨 STALE TRADE WITH ONE-LEGGED POSITION DETECTED!")
+                filled_symbol = pending_trade['symbol2']
+                filled_volume = pending_trade['volume2']
+                filled_side = "SELL" if pending_trade['direction'] == 'LONG' else "BUY"
+                self._emergency_hedge_position(filled_symbol, filled_side, filled_volume, pending_trade)
+            
             del self.pending_pair_trades[trade_key]
+    
+    def _monitor_emergency_hedges(self):
+        """Monitor emergency hedge orders to ensure they complete successfully"""
+        if not hasattr(self, 'emergency_hedges'):
+            return
+        
+        current_time = datetime.now()
+        
+        for hedge_order_id, hedge_info in list(self.emergency_hedges.items()):
+            # Check if the hedge order is still pending after too long
+            time_elapsed = current_time - hedge_info['timestamp']
+            
+            if hedge_order_id in self.execution_requests and time_elapsed.total_seconds() > 30:
+                logger.critical(f"🚨 EMERGENCY HEDGE ORDER {hedge_order_id} STILL PENDING AFTER {time_elapsed.total_seconds():.0f} seconds!")
+                logger.critical(f"   Symbol: {hedge_info['symbol']}, Volume: {hedge_info['volume']:.5f}")
+                logger.critical(f"   Original pair: {hedge_info['original_pair']}")
+                logger.critical(f"   MANUAL INTERVENTION MAY BE REQUIRED!")
+    
+    def _get_emergency_hedges_status(self):
+        """Get status of all emergency hedges for reporting"""
+        if not hasattr(self, 'emergency_hedges'):
+            return []
+        
+        hedge_status = []
+        current_time = datetime.now()
+        
+        for hedge_order_id, hedge_info in self.emergency_hedges.items():
+            status = "PENDING" if hedge_order_id in self.execution_requests else "COMPLETED"
+            elapsed = current_time - hedge_info['timestamp']
+            
+            hedge_status.append({
+                'order_id': hedge_order_id,
+                'symbol': hedge_info['symbol'],
+                'volume': hedge_info['volume'],
+                'hedge_side': hedge_info['hedge_side'],
+                'original_pair': hedge_info['original_pair'],
+                'status': status,
+                'elapsed_seconds': elapsed.total_seconds()
+            })
+        
+        return hedge_status
+    
+    def get_risk_status_report(self):
+        """Get comprehensive risk status report for monitoring"""
+        report = {
+            'timestamp': datetime.now().isoformat(),
+            'pending_pair_trades': len(self.pending_pair_trades) if hasattr(self, 'pending_pair_trades') else 0,
+            'emergency_hedges': self._get_emergency_hedges_status(),
+            'one_legged_positions': 0,  # Will be calculated below
+            'suspended_pairs': self.get_suspended_pairs_status()
+        }
+        
+        # Count one-legged positions in pending trades
+        if hasattr(self, 'pending_pair_trades'):
+            for pending_trade in self.pending_pair_trades.values():
+                if (pending_trade['order1_filled'] and not pending_trade['order2_filled']) or \
+                   (pending_trade['order2_filled'] and not pending_trade['order1_filled']):
+                    report['one_legged_positions'] += 1
+        
+        # Add detailed pending trades info
+        report['pending_trades_detail'] = []
+        if hasattr(self, 'pending_pair_trades'):
+            for trade_key, pending_trade in self.pending_pair_trades.items():
+                current_time = datetime.now()
+                elapsed = current_time - pending_trade['timestamp']
+                
+                report['pending_trades_detail'].append({
+                    'pair': pending_trade['pair_str'],
+                    'direction': pending_trade['direction'],
+                    'order1_filled': pending_trade['order1_filled'],
+                    'order2_filled': pending_trade['order2_filled'],
+                    'elapsed_seconds': elapsed.total_seconds(),
+                    'is_one_legged': (pending_trade['order1_filled'] and not pending_trade['order2_filled']) or 
+                                   (pending_trade['order2_filled'] and not pending_trade['order1_filled'])
+                })
+        
+        return report
     
     def _log_portfolio_status(self):
         """Log current portfolio status"""
@@ -2559,7 +3013,16 @@ class CTraderRealTimeTrader:
             drawdown_pct = max(0, (self.portfolio_peak_value - status['portfolio_value']) / self.portfolio_peak_value * 100)
             logger.info(f"Drawdown         : {drawdown_pct:.2f}%")
             logger.info(f"Trading Status   : {'ACTIVE' if self.is_trading else 'STOPPED'}")
-            logger.info(f"Suspended Pairs  : {len(self.suspended_pairs)}")
+            
+            # Handle suspended pairs safely
+            suspended_count = len(self.suspended_pairs) if hasattr(self, 'suspended_pairs') else 0
+            logger.info(f"Suspended Pairs  : {suspended_count}")
+            
+            # Show suspended pairs if any
+            if suspended_count > 0 and hasattr(self, 'suspended_pairs'):
+                suspended_list = ', '.join(sorted(self.suspended_pairs))
+                logger.info(f"  Suspended: {suspended_list}")
+            
             logger.info(f"Open P&L        : ${status['unrealized_pnl']:,.2f} ({status['unrealized_pnl']/self.config.initial_portfolio_value*100:+.2f}%)")
             
             # Log pending trades awaiting execution

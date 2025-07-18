@@ -69,7 +69,7 @@ class TradingConfig:
     # System parameters
     use_multiprocessing: bool = True
     max_workers: int = 8
-    log_level: str = "INFO"
+    log_level: str = "DEBUG"     # Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
     
     def __post_init__(self):
         """Initialize paths and load configuration"""
