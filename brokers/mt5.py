@@ -13,6 +13,10 @@ from config import TradingConfig
 from strategies.pairs_trading import OptimizedPairsStrategy
 from data.mt5 import MT5DataManager
 from utils.state_manager import TradingStateManager
+from utils.risk_manager import RiskManager, RiskLimits, CurrencyConverter
+from utils.portfolio_manager import PortfolioManager, PriceProvider
+from utils.signal_processor import SignalProcessor, PairState, TradingSignal
+from brokers.base_broker import BaseBroker
 
 
 def get_mt5_config():
@@ -31,242 +35,181 @@ logger = logging.getLogger(__name__)
 logger.setLevel(getattr(logging, CONFIG.log_level))
 
 # === REAL-TIME TRADING ENGINE ===
-class MT5RealTimeTrader:
+class MT5RealTimeTrader(BaseBroker):
     """High-performance real-time trading engine for MetaTrader5"""
     
-    def __init__(self, config: TradingConfig, data_manager: MT5DataManager):
-        self.config = config
-        self.data_manager = data_manager
-        self.strategy = OptimizedPairsStrategy(config, data_manager)
-        
-        # Trading state
-        self.active_positions = {}
-        self.pair_states = {}
-        self.is_trading = False
-        self.last_update = {}
-
-        # Performance optimization
-        self._price_buffer = defaultdict(lambda: deque(maxlen=1000))
-        self._update_lock = threading.Lock()
-        
-        # Initialize state manager
-        self.state_manager = TradingStateManager(config.state_file, self._update_lock)
-        
-        # Add drawdown tracking
-        self.portfolio_peak_value = config.initial_portfolio_value
-        self.pair_peak_values = {}
-        self.suspended_pairs = set()
-        self.portfolio_trading_suspended = False
-
+    def __init__(self, config: TradingConfig, data_manager: MT5DataManager, strategy=None):
+        # Set account currency before calling parent constructor
         # Fetch initial portfolio value and currency from MT5 account info
         account_info = mt5.account_info()
         if account_info is not None:
             self.account_currency = getattr(account_info, 'currency', 'USD')
         else:
             self.account_currency = 'USD'
+        
+        # Initialize base broker first
+        super().__init__(config, data_manager, strategy)
+        
+        # MT5-specific initialization
+        self.data_manager = data_manager  # Ensure we have the MT5 data manager
+        
+        # Initialize MT5-specific currency converter
+        self._setup_mt5_currency_converter()
+        
+        # Update risk manager with correct account currency (now that it's initialized)
+        self.risk_manager.account_currency = self.account_currency
+    
+    def _setup_mt5_currency_converter(self):
+        """Setup MT5-specific currency converter"""
+        class MT5CurrencyConverter(CurrencyConverter):
+            def __init__(self, account_currency: str, data_manager):
+                super().__init__(account_currency)
+                self.data_manager = data_manager
+            
+            def get_fx_rate_from_broker(self, from_currency: str, to_currency: str) -> float:
+                """Get FX rate from MT5"""
+                if from_currency == to_currency:
+                    return 1.0
+                
+                # Try direct symbol
+                direct_symbol = f"{from_currency}{to_currency}"
+                inverse_symbol = f"{to_currency}{from_currency}"
+                
+                for symbol in [direct_symbol, inverse_symbol]:
+                    price = mt5.symbol_info_tick(symbol)
+                    if price:
+                        bid = price.bid
+                        ask = price.ask
+                        if symbol == direct_symbol:
+                            return (bid + ask) / 2
+                        else:
+                            return 1 / ((bid + ask) / 2)
+                
+                logger.warning(f"FX rate not found for {from_currency}->{to_currency}, using 1.0")
+                return 1.0
+            
+            def get_symbol_currency(self, symbol: str, symbol_info_cache: Dict) -> str:
+                """Get the profit currency for a symbol from symbol_info"""
+                info = symbol_info_cache.get(symbol)
+                if info and 'currency_profit' in info:
+                    return info['currency_profit']
+                
+                # Fallback: try mt5.symbol_info
+                mt5_info = mt5.symbol_info(symbol)
+                if mt5_info and hasattr(mt5_info, 'currency_profit'):
+                    return mt5_info.currency_profit
+                return self.account_currency
+        
+        self.currency_converter = MT5CurrencyConverter(self.account_currency, self.data_manager)
+    
+    # Implementation of abstract methods from BaseBroker
+    
+    def get_current_prices(self, symbols: List[str]) -> Dict[str, float]:
+        """Get current prices for symbols"""
+        return self.data_manager.get_multiple_prices(symbols)
+    
+    def get_bid_ask_prices(self, symbols: List[str]) -> Dict[str, Tuple[float, float]]:
+        """Get bid/ask prices for symbols"""
+        return self.data_manager.get_multiple_bid_ask(symbols)
+    
+    def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
+        """Get symbol information"""
+        return self.data_manager.symbol_info_cache.get(symbol, {})
+    
+    def get_account_info(self) -> Dict[str, Any]:
+        """Get account information from MT5"""
+        try:
+            account_info = mt5.account_info()
+            if account_info is not None:
+                return {
+                    'balance': float(account_info.balance),
+                    'equity': float(account_info.equity),
+                    'margin': float(account_info.margin),
+                    'free_margin': float(account_info.margin_free),
+                    'margin_level': float(account_info.margin_level) if account_info.margin_level else 0,
+                    'profit': float(account_info.profit),
+                    'currency': account_info.currency,
+                    'leverage': int(account_info.leverage),
+                    'server': account_info.server,
+                    'name': account_info.name
+                }
+            return {}
+        except Exception as e:
+            logger.error(f"Error getting MT5 account info: {e}")
+            return {}
+    
+    def _execute_trade(self, signal: TradingSignal) -> bool:
+        """Execute a trading signal"""
+        try:
+            if signal.signal_type in ['OPEN_LONG', 'OPEN_SHORT']:
+                return self._execute_pair_trade(signal.pair_str, signal.signal_type.replace('OPEN_', ''))
+            elif signal.signal_type == 'CLOSE':
+                return self._close_pair_position(signal.pair_str)
+            else:
+                logger.warning(f"Unknown signal type: {signal.signal_type}")
+                return False
+        except Exception as e:
+            logger.error(f"Error executing trade signal: {e}")
+            return False
+    
+    # MT5-specific helper methods using shared modules
     
     def _get_fx_rate(self, from_currency: str, to_currency: str) -> float:
-        """Fetch the FX rate to convert from one currency to another using MT5 symbols."""
-        if from_currency == to_currency:
-            return 1.0
-        # Try direct symbol
-        direct_symbol = f"{from_currency}{to_currency}"
-        inverse_symbol = f"{to_currency}{from_currency}"
-        # Try with a separator (e.g., EURUSD, USDJPY, etc.)
-        for symbol in [direct_symbol, inverse_symbol]:
-            price = mt5.symbol_info_tick(symbol)
-            if price:
-                bid = price.bid
-                ask = price.ask
-                # logger.info(f"FX rate for {from_currency}->{to_currency} using {symbol}: bid={bid}, ask={ask}")
-                if symbol == direct_symbol:
-                    return (bid + ask) / 2
-                else:
-                    return 1 / ((bid + ask) / 2)
-        logger.warning(f"FX rate not found for {from_currency}->{to_currency}, using 1.0")
-        return 1.0
-
+        """Get FX rate using shared currency converter"""
+        return self.currency_converter.get_fx_rate(from_currency, to_currency)
+    
     def _get_symbol_currency(self, symbol: str) -> str:
-        """Get the profit currency for a symbol from symbol_info."""
-        info = self.data_manager.symbol_info_cache.get(symbol)
-        if info and 'currency_profit' in info:
-            return info['currency_profit']
-        # Fallback: try mt5.symbol_info
-        mt5_info = mt5.symbol_info(symbol)
-        if mt5_info and hasattr(mt5_info, 'currency_profit'):
-            return mt5_info.currency_profit
-        return self.account_currency  # fallback
-
+        """Get symbol currency using shared currency converter"""
+        return self.currency_converter.get_symbol_currency(symbol, self.data_manager.symbol_info_cache)
+    
     def _calculate_portfolio_current_value(self) -> float:
-        """Calculate current portfolio value including unrealized P&L"""
-        current_value = self.config.initial_portfolio_value
-        
-        for pair_str, position in self.active_positions.items():
-            try:
-                bid_ask_prices = self.data_manager.get_multiple_bid_ask([position['symbol1'], position['symbol2']])
-                if len(bid_ask_prices) != 2:
-                    continue
-                
-                bid1, ask1 = bid_ask_prices[position['symbol1']]
-                bid2, ask2 = bid_ask_prices[position['symbol2']]
-                
-                # Calculate P&L based on position direction and order types
-                if position['order1_type'] == 'buy':
-                    current_market_price1 = bid1
-                else:
-                    current_market_price1 = ask1
-                
-                if position['order2_type'] == 'buy':
-                    current_market_price2 = bid2
-                else:
-                    current_market_price2 = ask2
-                
-                current_value1 = position['volume1'] * current_market_price1 * self.data_manager.symbol_info_cache[position['symbol1']]['trade_contract_size']
-                current_value2 = position['volume2'] * current_market_price2 * self.data_manager.symbol_info_cache[position['symbol2']]['trade_contract_size']
-                
-                entry_value1 = position['volume1'] * position['entry_exec_price1'] * self.data_manager.symbol_info_cache[position['symbol1']]['trade_contract_size']
-                entry_value2 = position['volume2'] * position['entry_exec_price2'] * self.data_manager.symbol_info_cache[position['symbol2']]['trade_contract_size']
-                
-                if position['direction'] == 'LONG':
-                    pnl = (current_value1 - entry_value1) + (entry_value2 - current_value2)
-                else:
-                    pnl = (entry_value1 - current_value1) + (current_value2 - entry_value2)
-                
-                current_value += pnl
-                
-            except Exception as e:
-                logger.error(f"Error calculating P&L for {pair_str}: {e}")
-        
-        return current_value
-
+        """Calculate current portfolio value using shared portfolio manager"""
+        return self.portfolio_manager.portfolio_calculator.calculate_portfolio_current_value(
+            self.active_positions, self, self.data_manager.symbol_info_cache)
+    
     def _calculate_position_pnl(self, pair_str: str) -> float:
-        """Calculate the current P&L for a given pair position in dollar terms"""
+        """Calculate position P&L using shared portfolio manager"""
         if pair_str not in self.active_positions:
             return 0.0
         
         position = self.active_positions[pair_str]
-        s1 = position['symbol1']
-        s2 = position['symbol2']
-        
-        try:
-            # Get current bid/ask prices for accurate P&L calculation
-            bid_ask_prices = self.data_manager.get_multiple_bid_ask([s1, s2])
-            if s1 not in bid_ask_prices or s2 not in bid_ask_prices:
-                return 0.0
-            
-            bid1, ask1 = bid_ask_prices[s1]
-            bid2, ask2 = bid_ask_prices[s2]
-            
-            # Determine close prices based on order types
-            if position['order1_type'] == 'buy':
-                close_price1 = bid1
-            else:
-                close_price1 = ask1
-            
-            if position['order2_type'] == 'buy':
-                close_price2 = bid2
-            else:
-                close_price2 = ask2
-            
-            # Calculate values
-            contract_size1 = self.data_manager.symbol_info_cache[s1]['trade_contract_size']
-            contract_size2 = self.data_manager.symbol_info_cache[s2]['trade_contract_size']
-            
-            entry_value1 = position['volume1'] * position['entry_exec_price1'] * contract_size1
-            entry_value2 = position['volume2'] * position['entry_exec_price2'] * contract_size2
-            close_value1 = position['volume1'] * close_price1 * contract_size1
-            close_value2 = position['volume2'] * close_price2 * contract_size2
-            
-            if position['direction'] == 'LONG':
-                pnl_dollar = (close_value1 - entry_value1) + (entry_value2 - close_value2)
-            else:
-                pnl_dollar = (entry_value1 - close_value1) + (close_value2 - entry_value2)
-            
-            return pnl_dollar
-            
-        except Exception as e:
-            logger.error(f"Error calculating P&L for {pair_str}: {e}")
-            return 0.0
-
+        return self.portfolio_manager.portfolio_calculator.calculate_position_pnl(
+            position, self, self.data_manager.symbol_info_cache)
+    
     def _check_drawdown_limits(self, pair_str: str = None) -> bool:
-        """Check if trading should be allowed based on drawdown limits"""
+        """Check drawdown limits using shared risk manager"""
+        current_portfolio_value = self._calculate_portfolio_current_value()
         
-        # Check portfolio-level drawdown
-        current_value = self._calculate_portfolio_current_value()
-        if current_value > self.portfolio_peak_value:
-            self.portfolio_peak_value = current_value
-        
-        portfolio_drawdown = ((self.portfolio_peak_value - current_value) / self.portfolio_peak_value) * 100
-        
-        # Update portfolio suspension status
-        if portfolio_drawdown > self.config.max_portfolio_drawdown_perc:
-            if not self.portfolio_trading_suspended:
-                logger.warning(f"Portfolio drawdown limit exceeded: {portfolio_drawdown:.2f}% > {self.config.max_portfolio_drawdown_perc:.2f}%")
-                logger.warning("All new trading suspended until drawdown improves")
-                self.portfolio_trading_suspended = True
-            return False
-        elif self.portfolio_trading_suspended and portfolio_drawdown <= self.config.max_portfolio_drawdown_perc * 0.8:  # 80% recovery rule
-            logger.info(f"Portfolio drawdown improved to {portfolio_drawdown:.2f}%. Resuming trading")
-            self.portfolio_trading_suspended = False
-        
-        # If checking specific pair
+        # Prepare pair P&L data if checking specific pair
+        pair_pnl_data = {}
         if pair_str and pair_str in self.active_positions:
             position = self.active_positions[pair_str]
-            if pair_str not in self.pair_peak_values:
-                self.pair_peak_values[pair_str] = 0
-            
-            # Calculate pair P&L - use fallback calculation if monetary values are missing
-            total_initial_value = (position.get('monetary_value1', 0) + position.get('monetary_value2', 0)) / 2
-            if total_initial_value == 0:
+            current_pnl = self._calculate_position_pnl(pair_str)
+            initial_value = (position.get('monetary_value1', 0) + position.get('monetary_value2', 0)) / 2
+            if initial_value == 0:
                 # Fallback calculation if monetary values are missing
                 contract_size1 = self.data_manager.symbol_info_cache[position['symbol1']]['trade_contract_size']
                 contract_size2 = self.data_manager.symbol_info_cache[position['symbol2']]['trade_contract_size']
                 entry_value1 = position['volume1'] * position['entry_exec_price1'] * contract_size1
                 entry_value2 = position['volume2'] * position['entry_exec_price2'] * contract_size2
-                total_initial_value = (abs(entry_value1) + abs(entry_value2)) / 2
-            
-            current_pnl = self._calculate_position_pnl(pair_str)
-            
-            # Update pair peak value
-            if current_pnl > self.pair_peak_values[pair_str]:
-                self.pair_peak_values[pair_str] = current_pnl
-            
-            # Calculate pair drawdown
-            pair_drawdown = ((self.pair_peak_values[pair_str] - current_pnl) / total_initial_value) * 100
-            
-            # Check pair-level drawdown
-            if pair_drawdown > self.config.max_pair_drawdown_perc:
-                if pair_str not in self.suspended_pairs:
-                    logger.warning(f"Pair {pair_str} drawdown limit exceeded: {pair_drawdown:.2f}% > {self.config.max_pair_drawdown_perc:.2f}%")
-                    logger.warning(f"Suspending trading for {pair_str} until drawdown improves")
-                    self.suspended_pairs.add(pair_str)
-                return False
-            elif pair_str in self.suspended_pairs and pair_drawdown <= self.config.max_pair_drawdown_perc * 0.8:  # 80% recovery rule
-                logger.info(f"Pair {pair_str} drawdown improved to {pair_drawdown:.2f}%. Resuming trading")
-                self.suspended_pairs.remove(pair_str)
+                initial_value = (abs(entry_value1) + abs(entry_value2)) / 2
+            pair_pnl_data[pair_str] = (current_pnl, initial_value)
         
-        return True
-
+        return self.risk_manager.drawdown_tracker.check_drawdown_limits(
+            current_portfolio_value, pair_pnl_data)
+    
     def _can_open_new_position(self, estimated_position_size: float = None) -> Tuple[bool, str]:
-        """Check if we can open a new position based on portfolio limits"""
+        """Check if we can open new position using shared risk manager"""
+        current_exposure = self.portfolio_manager.portfolio_calculator.calculate_total_exposure(
+            self.active_positions)
         
-        # Check if trading is suspended due to drawdown
-        if self.portfolio_trading_suspended:
-            return False, "Trading suspended due to portfolio drawdown limit"
-        
-        # Check position count limit
-        current_positions = len(self.active_positions)
-        if current_positions >= self.config.max_open_positions:
-            return False, f"Position count limit reached: {current_positions}/{self.config.max_open_positions}"
-        
-        # Check monetary exposure limit
-        current_exposure = self._calculate_total_exposure()
-        if estimated_position_size:
-            projected_exposure = current_exposure + estimated_position_size
-            if projected_exposure > self.config.max_monetary_exposure:
-                return False, f"Monetary exposure limit would be exceeded: ${projected_exposure:.2f} > ${self.config.max_monetary_exposure:.2f}"
-        
-        return True, f"OK - Positions: {current_positions}/{self.config.max_open_positions}, Exposure: ${current_exposure:.2f}/${self.config.max_monetary_exposure:.2f}"
+        return self.risk_manager.position_size_manager.can_open_new_position(
+            len(self.active_positions), current_exposure, estimated_position_size)
+    
+    def _calculate_total_exposure(self) -> float:
+        """Calculate total exposure using shared portfolio manager"""
+        return self.portfolio_manager.portfolio_calculator.calculate_total_exposure(
+            self.active_positions)
 
     def initialize(self) -> bool:
         """Initialize real-time trading system"""
@@ -830,7 +773,7 @@ class MT5RealTimeTrader:
 
     def _calculate_balanced_volumes(self, symbol1: str, symbol2: str, 
                                   price1: float, price2: float) -> Optional[Tuple[float, float, float, float]]:
-        """Calculate volumes for equal monetary exposure between two symbols"""
+        """Calculate volumes for equal monetary exposure between two symbols using shared VolumeBalancer"""
         
         # Get symbol information
         if symbol1 not in self.data_manager.symbol_info_cache or symbol2 not in self.data_manager.symbol_info_cache:
@@ -840,115 +783,45 @@ class MT5RealTimeTrader:
         info1 = self.data_manager.symbol_info_cache[symbol1]
         info2 = self.data_manager.symbol_info_cache[symbol2]
         
-        # Enhanced logging for debugging
-        # logger.info(f"Volume calculation for {symbol1}-{symbol2}:")
-        # logger.info(f"  {symbol1}: price={price1:.5f}, contract_size={info1['trade_contract_size']}, "
-        #            f"vol_min={info1['volume_min']}, vol_step={info1['volume_step']}")
-        # logger.info(f"  {symbol2}: price={price2:.5f}, contract_size={info2['trade_contract_size']}, "
-        #            f"vol_min={info2['volume_min']}, vol_step={info2['volume_step']}")
-        
         # Get contract sizes
         contract_size1 = info1['trade_contract_size']
         contract_size2 = info2['trade_contract_size']
         
-        # Calculate target monetary value (half of max position size for each leg)
-        target_monetary_value = self.config.max_position_size / 2
-        # logger.info(f"  Target monetary value per leg: ${target_monetary_value:.2f}")
+        # Prepare volume constraints
+        volume_constraints1 = {
+            'volume_min': info1['volume_min'],
+            'volume_max': info1['volume_max'],
+            'volume_step': info1['volume_step']
+        }
+        volume_constraints2 = {
+            'volume_min': info2['volume_min'],
+            'volume_max': info2['volume_max'],
+            'volume_step': info2['volume_step']
+        }
         
-        # Calculate required volumes for target monetary value
-        volume1_raw = target_monetary_value / (price1 * contract_size1)
-        volume2_raw = target_monetary_value / (price2 * contract_size2)
-        
-               
-        # logger.info(f"     Raw volumes: {symbol1}={volume1_raw:.6f}, {symbol2}={volume2_raw:.6f}")
-        
-        # Apply volume constraints
-        volume1 = self._normalize_volume(symbol1, volume1_raw, info1)
-        volume2 = self._normalize_volume(symbol2, volume2_raw, info2)
-        
-        if volume1 is None or volume2 is None:
-            logger.error(f"Volume normalization failed for {symbol1}-{symbol2}")
-            return None
-        
-        # logger.info(f"  Normalized volumes: {symbol1}={volume1:.6f}, {symbol2}={volume2:.6f}")
-        
-        # Calculate actual monetary values with normalized volumes
-        monetary_value1 = volume1 * price1 * contract_size1
-        monetary_value2 = volume2 * price2 * contract_size2
-        
-        # logger.info(f"  Initial monetary values: {symbol1}=${monetary_value1:.2f}, {symbol2}=${monetary_value2:.2f}")
-        
-        # Try iterative adjustment for better balance
-        best_volume1, best_volume2 = volume1, volume2
-        best_monetary1, best_monetary2 = monetary_value1, monetary_value2
-        best_diff = abs(monetary_value1 - monetary_value2) / max(monetary_value1, monetary_value2)
-        
-        # Try small adjustments to improve balance
-        for multiplier in [0.95, 0.98, 1.02, 1.05]:
-            try:
-                # Adjust the larger volume down or smaller volume up
-                if monetary_value1 > monetary_value2:
-                    test_volume1 = self._normalize_volume(symbol1, volume1 * multiplier, info1)
-                    test_volume2 = volume2
-                else:
-                    test_volume1 = volume1
-
-                    test_volume2 = self._normalize_volume(symbol2, volume2 * multiplier, info2)
-                
-                if test_volume1 and test_volume2:
-                    test_monetary1 = test_volume1 * price1 * contract_size1
-                   
-                    test_monetary2 = test_volume2 * price2 * contract_size2
-                    test_diff = abs(test_monetary1 - test_monetary2) / max(test_monetary1, test_monetary2)
-                    
-                    if test_diff < best_diff:
-                        best_volume1, best_volume2 = test_volume1, test_volume2
-                        best_monetary1, best_monetary2 = test_monetary1, test_monetary2
-                        best_diff = test_diff
-                        # logger.info(f"  Improved balance with multiplier {multiplier}: diff={test_diff:.4f}")
-            except:
-                continue
-        
-        volume1, volume2 = best_volume1, best_volume2
-        monetary_value1, monetary_value2 = best_monetary1, best_monetary2
-        
-        # Final validation
-        final_diff_pct = abs(monetary_value1 - monetary_value2) / max(monetary_value1, monetary_value2)
-        
-        # logger.info(f"  Final monetary values: {symbol1}=${monetary_value1:.2f}, {symbol2}=${monetary_value2:.2f}")
-        # logger.info(f"  Final difference: {final_diff_pct:.4f} vs tolerance: {self.config.monetary_value_tolerance:.4f}")
-        
-        if final_diff_pct > self.config.monetary_value_tolerance:
-            # logger.error(f"Cannot achieve monetary balance for {symbol1}-{symbol2}: "
-            #             f"final difference {final_diff_pct:.4f} > tolerance {self.config.monetary_value_tolerance:.4f}")
-            # logger.error(f"  Consider increasing monetary_value_tolerance or adjusting max_position_size")
-            return None
-        
-        # logger.info(f"  Successfully calculated balanced volumes with {final_diff_pct:.4f} difference")
-        return volume1, volume2, monetary_value1, monetary_value2
+        # Use shared VolumeBalancer
+        return self.risk_manager.volume_balancer.calculate_balanced_volumes(
+            symbol1=symbol1,
+            symbol2=symbol2,
+            price1=price1,
+            price2=price2,
+            contract_size1=contract_size1,
+            contract_size2=contract_size2,
+            max_position_size=self.config.max_position_size,
+            volume_constraints1=volume_constraints1,
+            volume_constraints2=volume_constraints2
+        )
     
     def _normalize_volume(self, symbol: str, volume_raw: float, symbol_info: Dict) -> Optional[float]:
-        """Normalize volume to valid increments and constraints"""
+        """Normalize volume to valid increments and constraints using shared VolumeBalancer"""
         
-        min_vol = symbol_info['volume_min']
-        max_vol = symbol_info['volume_max']
-        step = symbol_info['volume_step']
+        volume_constraints = {
+            'volume_min': symbol_info['volume_min'],
+            'volume_max': symbol_info['volume_max'],
+            'volume_step': symbol_info['volume_step']
+        }
         
-        # logger.debug(f"Normalizing volume for {symbol}: raw={volume_raw:.6f}, min={min_vol}, max={max_vol}, step={step}")
-        
-        # Round to valid step increments
-        volume = round(volume_raw / step) * step
-        
-        # Apply min/max constraints
-        volume = max(min_vol, min(max_vol, volume))
-        
-        # Validate minimum volume requirement
-        if volume < min_vol:
-            logger.error(f"Calculated volume {volume} below minimum {min_vol} for {symbol}")
-            return None
-        
-        logger.debug(f"Normalized volume for {symbol}: {volume:.6f}")
-        return volume
+        return self.risk_manager.volume_balancer._normalize_volume(volume_raw, volume_constraints)
     
     def _calculate_volume(self, symbol: str, price: float) -> Optional[float]:
         """Legacy method - kept for backward compatibility but now uses balanced calculation"""

@@ -1,4 +1,4 @@
-"""
+﻿"""
 CTrader Real-Time Trading Engine (Strategy-Agnostic)
 ===================================================
 
@@ -25,6 +25,10 @@ from typing import Dict, List, Tuple, Optional, Union, Any
 
 from config import TradingConfig
 from strategies.base_strategy import BaseStrategy, PairsStrategyInterface
+from utils.risk_manager import RiskManager, RiskLimits, CurrencyConverter
+from utils.portfolio_manager import PortfolioManager, PriceProvider
+from utils.signal_processor import SignalProcessor, PairState, TradingSignal
+from brokers.base_broker import BaseBroker
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +80,7 @@ except ImportError as e:
     MESSAGE_TYPES = {}
 
 
-class CTraderRealTimeTrader:
+class CTraderRealTimeTrader(BaseBroker):
     """
     Strategy-agnostic real-time trading engine for cTrader Open API.
     
@@ -89,26 +93,17 @@ class CTraderRealTimeTrader:
         if not CTRADER_API_AVAILABLE:
             raise ImportError("cTrader Open API not available. Install with: pip install ctrader-open-api")
         
-        self.config = config
-        self.data_manager = data_manager
+        # Set account currency before calling parent constructor
+        self.account_currency = "USD"  # Default, will be updated from account info
         
-        # Strategy handling - backwards compatibility
-        if strategy is None:
-            # Import here to avoid circular dependency
-            from strategies.pairs_trading import OptimizedPairsStrategy
-            self.strategy = OptimizedPairsStrategy(config, data_manager)
-            logger.warning("No strategy provided, using default OptimizedPairsStrategy for backwards compatibility")
-        else:
-            if not isinstance(strategy, BaseStrategy):
-                raise TypeError("Strategy must implement BaseStrategy interface")
-            self.strategy = strategy
-            # Ensure the strategy has access to the data manager
-            if hasattr(self.strategy, 'data_manager') and self.strategy.data_manager is None:
-                self.strategy.data_manager = data_manager
-                logger.info("Updated strategy with data manager for cost calculations")
+        # Initialize base broker first
+        super().__init__(config, data_manager, strategy)
         
-        # Detect strategy type for optimized handling
-        self.is_pairs_strategy = isinstance(self.strategy, PairsStrategyInterface)
+        # CTrader-specific initialization
+        self.data_manager = data_manager  # Ensure we have the CTrader data manager
+        
+        # Initialize CTrader-specific currency converter
+        self._setup_ctrader_currency_converter()
         
         # cTrader API setup
         self.client = None
@@ -117,19 +112,6 @@ class CTraderRealTimeTrader:
         self.client_secret = os.getenv('CTRADER_CLIENT_SECRET')
         self.access_token = os.getenv('CTRADER_ACCESS_TOKEN')
         
-        # Trading state
-        self.active_positions = {}
-        self.pair_states = {}
-        self.is_trading = False
-        self.last_update = {}
-        self.symbols_map = {}
-        self.symbol_id_to_name_map = {}
-        self.symbol_details = {}
-        
-        # Performance optimization
-        self._price_buffer = defaultdict(lambda: deque(maxlen=1000))
-        self._update_lock = threading.Lock()
-        
         # Real-time data state
         self.spot_prices = {}
         self.price_history = defaultdict(lambda: deque(maxlen=500))
@@ -137,6 +119,9 @@ class CTraderRealTimeTrader:
         self.execution_requests = {}
         self.pending_pair_trades = {}  # Track pending pair trades awaiting execution confirmation
         self.next_order_id = 1
+        self.symbols_map = {}
+        self.symbol_id_to_name_map = {}
+        self.symbol_details = {}
         
         # Data throttling to reduce duplicate processing
         self._last_strategy_check = {}  # Track last strategy check time per pair
@@ -151,14 +136,12 @@ class CTraderRealTimeTrader:
         self.authentication_in_progress = False
         self._degraded_mode = False  # Flag for degraded mode operation
         
-        # Drawdown tracking (consistent with MT5 implementation)
-        self.portfolio_peak_value = config.initial_portfolio_value
-        self.pair_peak_values = {}
-        self.suspended_pairs = set()
-        self.portfolio_trading_suspended = False
+        # Update risk manager with correct account currency (now that it's initialized)
+        self.risk_manager.account_currency = self.account_currency
         
-        # Get account currency
-        self.account_currency = "USD"  # Default, will be updated from account info
+        # Portfolio tracking attributes
+        self.portfolio_peak_value = self.config.initial_portfolio_value
+        self.portfolio_trading_suspended = False
         
         # Log strategy information
         strategy_info = self.strategy.get_strategy_info()
@@ -167,6 +150,143 @@ class CTraderRealTimeTrader:
         logger.info(f"  Type: {strategy_info['type']}")
         logger.info(f"  Required symbols: {len(strategy_info['required_symbols'])}")
         logger.info(f"  Tradeable instruments: {len(strategy_info['tradeable_instruments'])}")
+        
+        # Determine if this is a pairs trading strategy
+        from strategies.base_strategy import PairsStrategyInterface
+        self.is_pairs_strategy = isinstance(self.strategy, PairsStrategyInterface)
+    
+    def _setup_ctrader_currency_converter(self):
+        """Setup CTrader-specific currency converter"""
+        class CTraderCurrencyConverter(CurrencyConverter):
+            def __init__(self, account_currency: str, trader_instance):
+                super().__init__(account_currency)
+                self.trader = trader_instance
+            
+            def get_fx_rate_from_broker(self, from_currency: str, to_currency: str) -> float:
+                """Get FX rate from CTrader spot prices"""
+                if from_currency == to_currency:
+                    return 1.0
+                
+                # Try direct symbol
+                direct_symbol = f"{from_currency}{to_currency}"
+                inverse_symbol = f"{to_currency}{from_currency}"
+                
+                for symbol in [direct_symbol, inverse_symbol]:
+                    if symbol in self.trader.spot_prices:
+                        spot_data = self.trader.spot_prices[symbol]
+                        if 'bid' in spot_data and 'ask' in spot_data:
+                            bid = spot_data['bid']
+                            ask = spot_data['ask']
+                            if symbol == direct_symbol:
+                                return (bid + ask) / 2
+                            else:
+                                return 1 / ((bid + ask) / 2)
+                
+                logger.warning(f"FX rate not found for {from_currency}->{to_currency}, using 1.0")
+                return 1.0
+            
+            def get_symbol_currency(self, symbol: str, symbol_info_cache: Dict) -> str:
+                """Get the profit currency for a symbol from CTrader symbol details"""
+                if symbol in self.trader.symbol_details:
+                    symbol_detail = self.trader.symbol_details[symbol]
+                    if hasattr(symbol_detail, 'quoteCurrency'):
+                        return symbol_detail.quoteCurrency
+                return self.account_currency
+        
+        self.currency_converter = CTraderCurrencyConverter(self.account_currency, self)
+    
+    # Implementation of abstract methods from BaseBroker
+    
+    def get_current_prices(self, symbols: List[str]) -> Dict[str, float]:
+        """Get current prices for symbols from spot prices"""
+        prices = {}
+        for symbol in symbols:
+            if symbol in self.spot_prices:
+                spot_data = self.spot_prices[symbol]
+                if 'bid' in spot_data and 'ask' in spot_data:
+                    # Use mid price for current price
+                    prices[symbol] = (spot_data['bid'] + spot_data['ask']) / 2
+                elif 'price' in spot_data:
+                    prices[symbol] = spot_data['price']
+        return prices
+    
+    def get_current_price(self, symbol: str) -> Optional[float]:
+        """Get current price for a single symbol"""
+        if symbol in self.spot_prices:
+            spot_data = self.spot_prices[symbol]
+            if 'bid' in spot_data and 'ask' in spot_data:
+                # Use mid price for current price
+                return (spot_data['bid'] + spot_data['ask']) / 2
+            elif 'price' in spot_data:
+                return spot_data['price']
+        return None
+    
+    def get_bid_ask_prices(self, symbols: List[str]) -> Dict[str, Tuple[float, float]]:
+        """Get bid/ask prices for symbols from spot prices"""
+        bid_ask_prices = {}
+        for symbol in symbols:
+            if symbol in self.spot_prices:
+                spot_data = self.spot_prices[symbol]
+                if 'bid' in spot_data and 'ask' in spot_data:
+                    bid_ask_prices[symbol] = (spot_data['bid'], spot_data['ask'])
+        return bid_ask_prices
+    
+    def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
+        """Get symbol information from symbol details"""
+        if symbol in self.symbol_details:
+            symbol_detail = self.symbol_details[symbol]
+            return {
+                'symbol_id': getattr(symbol_detail, 'symbolId', 0),
+                'symbol_name': getattr(symbol_detail, 'symbolName', symbol),
+                'digits': getattr(symbol_detail, 'digits', 5),
+                'pip_position': getattr(symbol_detail, 'pipPosition', -5),
+                'enable_short_selling': getattr(symbol_detail, 'enableShortSelling', True),
+                'min_volume': getattr(symbol_detail, 'minVolume', 0.01),
+                'max_volume': getattr(symbol_detail, 'maxVolume', 100.0),
+                'volume_step': getattr(symbol_detail, 'stepVolume', 0.01),
+                'base_currency': getattr(symbol_detail, 'baseCurrency', 'USD'),
+                'quote_currency': getattr(symbol_detail, 'quoteCurrency', 'USD'),
+                'trade_contract_size': 1.0  # CTrader typically uses 1.0 for contract size
+            }
+        return {}
+    
+    def get_account_info(self) -> Dict[str, Any]:
+        """Get account information from CTrader (placeholder implementation)"""
+        # Note: CTrader account info would need to be retrieved via API calls
+        # This is a placeholder implementation
+        return {
+            'balance': 0.0,
+            'equity': 0.0,
+            'margin': 0.0,
+            'free_margin': 0.0,
+            'margin_level': 0.0,
+            'profit': 0.0,
+            'currency': self.account_currency,
+            'leverage': 100,
+            'server': 'cTrader',
+            'name': 'CTrader Account'
+        }
+    
+    def get_symbol_info_cache(self) -> Dict[str, Dict]:
+        """Get symbol info cache for shared modules"""
+        cache = {}
+        for symbol, details in self.symbol_details.items():
+            cache[symbol] = self.get_symbol_info(symbol)
+        return cache
+    
+    def _execute_trade(self, signal: TradingSignal) -> bool:
+        """Execute a trading signal"""
+        try:
+            if signal.signal_type in ['OPEN_LONG', 'OPEN_SHORT']:
+                return self._execute_pair_trade(signal.pair_str, signal.signal_type.replace('OPEN_', ''))
+            elif signal.signal_type == 'CLOSE':
+                return self._close_pair_position(signal.pair_str)
+            else:
+                logger.warning(f"Unknown signal type: {signal.signal_type}")
+                return False
+        except Exception as e:
+            logger.error(f"Error executing trade signal: {e}")
+            return False
     
     def _create_protobuf_request(self, request_type: str, **kwargs):
         """Safely create protobuf requests with fallback handling"""
@@ -1775,8 +1895,21 @@ class CTraderRealTimeTrader:
         price1 = self.spot_prices[s1]
         price2 = self.spot_prices[s2]
         
-        # Calculate volumes
-        volumes = self._calculate_balanced_volumes(s1, s2, price1, price2)
+        # Get symbol details for volume calculation
+        details1 = self.symbol_details.get(s1)
+        details2 = self.symbol_details.get(s2)
+        
+        if not details1 or not details2:
+            logger.error(f"Missing symbol details for volume calculation: {s1}={bool(details1)}, {s2}={bool(details2)}")
+            return False
+        
+        # Calculate volumes using enhanced shared VolumeBalancer
+        volumes = self.risk_manager.volume_balancer.calculate_balanced_volumes(
+            s1, s2, price1, price2,
+            details1, details2,
+            self.config.max_position_size
+        )
+        
         if volumes is None:
             logger.error(f"Cannot calculate balanced volumes for {pair_str}")
             return False
@@ -2554,236 +2687,32 @@ class CTraderRealTimeTrader:
         logger.info(f"   {pending_trade['symbol2']}: {'SELL' if direction == 'LONG' else 'BUY'} {pending_trade['volume2']:.5f} lots")
         logger.info(f"   Portfolio now: {len(self.active_positions)}/{self.config.max_open_positions} positions")
     
-    def _calculate_balanced_volumes(self, symbol1: str, symbol2: str, price1: float, price2: float) -> Optional[Tuple[float, float, float, float]]:
-        """Calculate volumes for equal monetary exposure between two symbols with comprehensive validation"""
-        
-        # Get symbol information with strict validation and fallbacks
-        details1 = self.symbol_details.get(symbol1)
-        details2 = self.symbol_details.get(symbol2)
-        
-        if not details1:
-            logger.error(f"No symbol details available for {symbol1}")
-            logger.error(f"Available symbol details: {list(self.symbol_details.keys())}")
-            return None
-        
-        if not details2:
-            logger.error(f"No symbol details available for {symbol2}")
-            logger.error(f"Available symbol details: {list(self.symbol_details.keys())}")
-            return None
-        
-        # Ensure required fields are available with proper fallbacks
-        required_fields = ['digits', 'min_volume', 'step_volume', 'lot_size']
-        
-        for symbol, details in [(symbol1, details1), (symbol2, details2)]:
-            for field in required_fields:
-                if field not in details or details[field] is None:
-                    logger.warning(f"Missing or null field '{field}' for symbol {symbol}")
-        
-        logger.info(f"Volume calculation for {symbol1}-{symbol2}:")
-        logger.info(f"  {symbol1}: price={price1:.5f}, min_volume={details1.get('min_volume', 'MISSING')}, step_volume={details1.get('step_volume', 'MISSING')}")
-        logger.info(f"  {symbol2}: price={price2:.5f}, min_volume={details2.get('min_volume', 'MISSING')}, step_volume={details2.get('step_volume', 'MISSING')}")
-        
-        # Log lot sizes for debugging
-        lot_size1_raw = details1.get('lot_size', 'MISSING')
-        lot_size2_raw = details2.get('lot_size', 'MISSING')
-        logger.info(f"  Lot sizes: {symbol1}={lot_size1_raw}, {symbol2}={lot_size2_raw}")
-        
-        # Calculate target monetary value per leg (half of max position size for each leg)
-        target_monetary_value = self.config.max_position_size / 2
-        
-        logger.info(f"  Target monetary value per leg: ${target_monetary_value:.2f}")
-        
-        # Get lot sizes from symbol details (this is the contract size in cTrader)
-        # According to cTrader API documentation, lotSize is in centilots initially
-        # After conversion, it represents the actual contract size
-        lot_size1 = details1.get('lot_size')
-        lot_size2 = details2.get('lot_size')
-        
-        if lot_size1 is None:
-            logger.error(f"No lot size information available for {symbol1}")
-            logger.error(f"Available details for {symbol1}: {list(details1.keys())}")
-            return None
-            
-        if lot_size2 is None:
-            logger.error(f"No lot size information available for {symbol2}")
-            logger.error(f"Available details for {symbol2}: {list(details2.keys())}")
-            return None
-        
-        # Use lot sizes directly - they have been converted from centilots to standard units
-        # For Forex pairs, this should be around 100000 (1 standard lot)
-        # For CFDs and other instruments, this varies by instrument
-        contract_size1 = lot_size1
-        contract_size2 = lot_size2
-        
-        logger.info(f"  Contract sizes: {symbol1}={contract_size1}, {symbol2}={contract_size2}")
-        
-        # Calculate required volumes for target monetary value
-        # Formula: volume = target_value / (price * contract_size)
-        volume1_raw = target_monetary_value / (price1 * contract_size1)
-        volume2_raw = target_monetary_value / (price2 * contract_size2)
-        
-        logger.info(f"  Raw volumes: {symbol1}={volume1_raw:.6f}, {symbol2}={volume2_raw:.6f}")
-        
-        # Apply volume constraints
-        volume1 = self._normalize_ctrader_volume(symbol1, volume1_raw, details1)
-        volume2 = self._normalize_ctrader_volume(symbol2, volume2_raw, details2)
-        
-        if volume1 is None or volume2 is None:
-            logger.error(f"Failed to normalize volumes for {symbol1}-{symbol2}")
-            return None
-        
-        logger.info(f"  Normalized volumes: {symbol1}={volume1:.6f}, {symbol2}={volume2:.6f}")
-        
-        # Calculate actual monetary values with normalized volumes and contract sizes
-        monetary_value1 = volume1 * price1 * contract_size1
-        monetary_value2 = volume2 * price2 * contract_size2
-        
-        logger.info(f"  Initial monetary values: {symbol1}=${monetary_value1:.2f}, {symbol2}=${monetary_value2:.2f}")
-        
-        # Try iterative adjustment for better balance (similar to MT5 implementation)
-        best_volume1, best_volume2 = volume1, volume2
-        best_monetary1, best_monetary2 = monetary_value1, monetary_value2
-        best_diff = abs(monetary_value1 - monetary_value2) / max(monetary_value1, monetary_value2)
-        
-        # Try small adjustments to improve balance - enhanced logic from MT5
-        for multiplier in [0.95, 0.98, 1.02, 1.05]:
-            try:
-                # Adjust the larger volume down or smaller volume up for better balance
-                if monetary_value1 > monetary_value2:
-                    test_volume1 = self._normalize_ctrader_volume(symbol1, volume1_raw * multiplier, details1)
-                    test_volume2 = volume2
-                else:
-                    test_volume1 = volume1
-                    test_volume2 = self._normalize_ctrader_volume(symbol2, volume2_raw * multiplier, details2)
-                
-                if test_volume1 is not None and test_volume2 is not None:
-                    test_monetary1 = test_volume1 * price1 * contract_size1
-                    test_monetary2 = test_volume2 * price2 * contract_size2
-                    test_diff = abs(test_monetary1 - test_monetary2) / max(test_monetary1, test_monetary2)
-                    
-                    if test_diff < best_diff:
-                        best_volume1, best_volume2 = test_volume1, test_volume2
-                        best_monetary1, best_monetary2 = test_monetary1, test_monetary2
-                        best_diff = test_diff
-                        logger.info(f"  Improved balance with multiplier {multiplier}: diff={test_diff:.4f}")
-            except Exception as e:
-                logger.debug(f"  Adjustment failed for multiplier {multiplier}: {e}")
-                continue
-        
-        volume1, volume2 = best_volume1, best_volume2
-        monetary_value1, monetary_value2 = best_monetary1, best_monetary2
-        
-        # Final validation against monetary value tolerance
-        final_diff_pct = abs(monetary_value1 - monetary_value2) / max(monetary_value1, monetary_value2)
-        
-        logger.info(f"  Final monetary values: {symbol1}=${monetary_value1:.2f}, {symbol2}=${monetary_value2:.2f}")
-        logger.info(f"  Final difference: {final_diff_pct:.4f} vs tolerance: {self.config.monetary_value_tolerance:.4f}")
-        
-        if final_diff_pct > self.config.monetary_value_tolerance:
-            logger.warning(f"Monetary value difference ({final_diff_pct:.4f}) exceeds tolerance ({self.config.monetary_value_tolerance:.4f}) for {symbol1}-{symbol2}")
-            logger.warning(f"  Consider increasing monetary_value_tolerance or adjusting max_position_size")
-            return None
-        
-        logger.info(f"  Successfully calculated balanced volumes with {final_diff_pct:.4f} difference")
-        return volume1, volume2, monetary_value1, monetary_value2
-    
-    def _normalize_ctrader_volume(self, symbol: str, volume_raw: float, symbol_details: Dict) -> Optional[float]:
-        """
-        Normalize volume to valid increments and constraints for cTrader
-        
-        According to cTrader API documentation:
-        - Volume constraints (minVolume, maxVolume, stepVolume) are in centilots initially
-        - After conversion, they represent standard lots (0.01, 0.1, 1.0, etc.)
-        - Volume for trading orders should be in lots (e.g., 0.01 = 0.01 lots)
-        
-        Args:
-            symbol: Symbol name
-            volume_raw: Raw calculated volume in lots
-            symbol_details: Symbol details including volume constraints (already converted)
-            
-        Returns:
-            Normalized volume in lots, or None if normalization fails
-        """
-        
-        # Validate that required volume constraints are available
-        required_volume_fields = ['min_volume', 'step_volume']
-        for field in required_volume_fields:
-            if field not in symbol_details:
-                logger.error(f"Missing required volume field '{field}' for symbol {symbol}")
-                return None
-        
-        min_vol = symbol_details['min_volume']  # Already converted from centilots
-        max_vol = symbol_details.get('max_volume')  # Already converted from centilots
-        step = symbol_details['step_volume']  # Already converted from centilots
-        
-        # These values are now in standard lots (already converted)
-        min_vol_standard = min_vol
-        max_vol_standard = max_vol if max_vol is not None else None
-        step_standard = step
-        
-        # Validate the converted values are reasonable
-        # if min_vol_standard >= 1:
-        #     logger.warning(f"Suspicious min_volume for {symbol}: {min_vol_standard}, using default 0.01")
-        #     min_vol_standard = 0.01
-            
-        # if step_standard >= 1:
-        #     logger.warning(f"Suspicious step_volume for {symbol}: {step_standard}, using default 0.01")
-        #     step_standard = 0.01
-        
-        logger.debug(f"Normalizing volume for {symbol}: raw={volume_raw:.6f}, min={min_vol_standard}, max={max_vol_standard or 'None'}, step={step_standard}")
-        
-        # Handle edge case where raw volume is 0 or negative
-        if volume_raw <= 0:
-            logger.warning(f"Invalid raw volume for {symbol}: {volume_raw}")
-            return None
-        
-        # Round to valid step increments
-        if step_standard > 0:
-            volume = round(volume_raw / step_standard) * step_standard
-        else:
-            volume = volume_raw
-        
-        # Apply minimum constraint
-        volume = max(min_vol_standard, volume)
-        
-        # Apply maximum constraint if available
-        if max_vol_standard is not None:
-            volume = min(max_vol_standard, volume)
-        
-        # Validate minimum volume requirement
-        if volume < min_vol_standard:
-            logger.warning(f"Volume {volume:.6f} below minimum {min_vol_standard} for {symbol}")
-            return None
-        
-        # Validate maximum volume requirement if available
-        if max_vol_standard is not None and volume > max_vol_standard:
-            logger.warning(f"Volume {volume:.6f} exceeds maximum {max_vol_standard} for {symbol}")
-            volume = max_vol_standard
-        
-        # Additional validation: ensure volume is not zero after rounding
-        if volume == 0:
-            logger.warning(f"Volume became zero after normalization for {symbol} (raw: {volume_raw:.6f})")
-            return None
-        
-        logger.debug(f"Normalized volume for {symbol}: {volume:.6f}")
-        return volume
-    
     def _check_drawdown_limits(self, pair_str: str = None) -> bool:
         """Check if trading should be allowed based on drawdown limits"""
-        # Simplified implementation - expand based on requirements
+        # Check global portfolio suspension
         if self.portfolio_trading_suspended:
             return False
         
-        # Check if this specific pair is suspended
-        if pair_str:
-            if not hasattr(self, 'suspended_pairs'):
-                self.suspended_pairs = set()
-            
-            if pair_str in self.suspended_pairs:
-                logger.debug(f"Trading blocked for suspended pair: {pair_str}")
-                return False
+        # Check pair-specific suspension
+        if pair_str and hasattr(self, 'suspended_pairs') and pair_str in self.suspended_pairs:
+            logger.debug(f"Trading blocked for suspended pair: {pair_str}")
+            return False
         
-        return True
+        # Use shared risk manager for drawdown checks
+        current_portfolio_value = self.get_portfolio_value()
+        current_positions = len(self.active_positions)
+        
+        # Calculate current exposure
+        current_exposure = 0.0
+        for position in self.active_positions.values():
+            # Calculate exposure based on position values
+            exposure1 = position.get('volume1', 0) * position.get('entry_price1', 0)
+            exposure2 = position.get('volume2', 0) * position.get('entry_price2', 0)
+            current_exposure += abs(exposure1) + abs(exposure2)
+        
+        return self.risk_manager.check_trading_allowed(
+            current_portfolio_value, current_positions, current_exposure, pair_str=pair_str
+        )
     
     def start_trading(self):
         """Start the real-time trading loop"""
@@ -3266,3 +3195,25 @@ class CTraderRealTimeTrader:
             'instruments_tracked': len(self.pair_states),
             'symbols_subscribed': len(self.subscribed_symbols)
         }
+    
+    def get_portfolio_value(self) -> float:
+        """Get current portfolio value including unrealized P&L"""
+        portfolio_value = self.config.initial_portfolio_value
+        unrealized_pnl = 0.0
+        
+        for pair_str, position in self.active_positions.items():
+            # Calculate position P&L (simplified)
+            current_price1 = self.spot_prices.get(position['symbol1'], position['entry_price1'])
+            current_price2 = self.spot_prices.get(position['symbol2'], position['entry_price2'])
+            
+            # Basic P&L calculation
+            if position['direction'] == 'LONG':
+                pnl = (current_price1 - position['entry_price1']) * position['volume1'] - \
+                      (current_price2 - position['entry_price2']) * position['volume2']
+            else:
+                pnl = (position['entry_price1'] - current_price1) * position['volume1'] - \
+                      (position['entry_price2'] - current_price2) * position['volume2']
+            
+            unrealized_pnl += pnl
+        
+        return portfolio_value + unrealized_pnl
