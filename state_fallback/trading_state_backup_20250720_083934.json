@@ -1,0 +1,24 @@
+{
+  "backup_timestamp": "2025-07-20T08:39:34.793364",
+  "positions": [],
+  "current_state": null,
+  "portfolio_summary": {
+    "exists": true,
+    "active_positions_count": 0,
+    "pair_states_count": 0,
+    "database_type": "influxdb",
+    "last_update": "2025-07-20T08:39:34.793364"
+  },
+  "system_status": {
+    "initialized": true,
+    "database_type": "influxdb",
+    "api_enabled": true,
+    "api_running": false,
+    "cache_enabled": true,
+    "file_fallback_enabled": true,
+    "timestamp": "2025-07-20T08:39:34.793364",
+    "active_positions": 0,
+    "pair_states": 0,
+    "last_update": "2025-07-20T08:39:34.940395"
+  }
+}

@@ -164,10 +164,14 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
             
             # Rolling statistics using pandas optimized functions
             z_period = getattr(self.config, 'z_period', 50)
-            ratio_ma = ratio.rolling(z_period, min_periods=z_period//2).mean()
-            ratio_std = ratio.rolling(z_period, min_periods=z_period//2).std()
+            ratio_ma = ratio.rolling(z_period, min_periods=z_period).mean()
+            ratio_std = ratio.rolling(z_period, min_periods=z_period).std()
             
-            # Z-score calculation
+            # Add safeguard against very small standard deviations that cause artificially high z-scores
+            min_std_threshold = 1e-6  # Minimum standard deviation threshold
+            ratio_std = np.maximum(ratio_std, min_std_threshold)
+            
+            # Z-score calculation with improved stability
             zscore = (ratio - ratio_ma) / ratio_std
             
             # Check for valid z-score

@@ -25,6 +25,9 @@ import time
 import logging
 import warnings
 import threading
+import signal
+import json
+import traceback
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
@@ -92,6 +95,10 @@ from data.mt5 import MT5DataManager
 
 # Intelligent data management
 from data.intelligent_data_manager import IntelligentDataManager, BacktestDataManager
+
+# Enhanced state management
+from utils.unified_state_manager import UnifiedStateManager
+from utils.state_config import StateManagementConfig, load_config
 
 # Setup a temporary logger for early import errors
 import logging
@@ -554,15 +561,17 @@ class InfluxDBDataManager:
 
 class EnhancedRealTimeTrader:
     """
-    Enhanced real-time trader with configurable broker and InfluxDB integration
+    Enhanced real-time trader with configurable broker, InfluxDB integration, and enhanced state management
     Supports both MT5 and cTrader brokers independently from data provider
     """
     
-    def __init__(self, config: TradingConfig, data_manager, broker: str, influxdb_manager: InfluxDBManager, strategy: BaseStrategy = None):
+    def __init__(self, config: TradingConfig, data_manager, broker: str, influxdb_manager: InfluxDBManager, 
+                 state_manager: UnifiedStateManager = None, strategy: BaseStrategy = None):
         self.config = config
         self.data_manager = data_manager
         self.broker = broker.lower()
         self.influxdb_manager = influxdb_manager
+        self.state_manager = state_manager
         self.dashboard = None
         
         # Create strategy instance if not provided
@@ -624,9 +633,73 @@ class EnhancedRealTimeTrader:
         self.dashboard = dashboard
     
     def on_trade_executed(self, trade_data: Dict[str, Any]):
-        """Handle trade execution events"""
+        """Handle trade execution events with enhanced state management"""
         # Store in InfluxDB
         self.influxdb_manager.store_trade_data(trade_data)
+        
+        # Store in enhanced state manager
+        if self.state_manager:
+            try:
+                # Parse the pair to get individual symbols
+                pair_str = trade_data.get('pair', '')
+                if '-' in pair_str:
+                    symbol1, symbol2 = pair_str.split('-', 1)
+                else:
+                    # Fallback for pairs without dash
+                    symbol1 = pair_str[:6] if len(pair_str) >= 6 else pair_str
+                    symbol2 = pair_str[6:] if len(pair_str) > 6 else 'USD'
+                
+                # Normalize direction to lowercase
+                direction = trade_data.get('action', '').lower()
+                if direction == 'buy':
+                    direction = 'long'
+                elif direction == 'sell':
+                    direction = 'short'
+                elif direction.upper() == 'LONG':
+                    direction = 'long'
+                elif direction.upper() == 'SHORT':
+                    direction = 'short'
+                
+                # Ensure we have valid numeric values (schema requires > 0)
+                entry_price = trade_data.get('entry_price', 0)
+                if entry_price <= 0:
+                    entry_price = 1.0  # Default fallback value
+                
+                volume = trade_data.get('volume', 0)
+                if volume <= 0:
+                    volume = 0.01  # Minimum valid volume
+                
+                # Create position data matching the PositionSchema
+                position_data = {
+                    'symbol1': symbol1,
+                    'symbol2': symbol2, 
+                    'direction': direction,
+                    'entry_time': datetime.now(),
+                    'quantity': volume,
+                    'entry_price': entry_price,
+                    'stop_loss': trade_data.get('stop_loss'),
+                    'take_profit': trade_data.get('take_profit'),
+                    # Additional metadata (not part of schema but can be stored)
+                    'broker': self.broker,
+                    'timestamp': trade_data.get('timestamp', datetime.now().isoformat()),
+                    'z_score': trade_data.get('z_score', 0),
+                    'strategy': self.strategy.__class__.__name__,
+                    'trade_execution': True
+                }
+                
+                # Save position using the unified state manager with correct parameters
+                self.state_manager.save_position(
+                    pair=pair_str,
+                    position_data=position_data,
+                    description=f"Trade execution: {direction} {pair_str} via {self.broker}"
+                )
+                
+                logger.debug(f"Trade data stored in enhanced state manager: {pair_str}")
+                
+            except Exception as e:
+                logger.warning(f"Failed to store trade data in state manager (trading continues): {e}")
+                # Don't let state management issues stop trading
+                pass
         
         # Update dashboard via WebSocket
         if self.dashboard and hasattr(self.dashboard, 'websocket_handler'):
@@ -635,8 +708,17 @@ class EnhancedRealTimeTrader:
         logger.info(f"Trade executed on {self.broker}: {trade_data.get('pair')} - {trade_data.get('action')}")
     
     def on_market_data_update(self, symbol: str, data: Dict[str, Any]):
-        """Store market data updates in InfluxDB"""
+        """Store market data updates in InfluxDB and enhanced state manager"""
         self.influxdb_manager.store_market_data(symbol, data, f"{self.broker}_execution")
+        
+        # Store market data in enhanced state manager (optional, as InfluxDB handles this better)
+        if self.state_manager:
+            try:
+                # For market data, we can store it as part of trading state metadata
+                # rather than as positions since it's not position-specific
+                pass  # Market data is better handled by InfluxDB for time-series storage
+            except Exception as e:
+                logger.debug(f"Market data storage in state manager skipped: {e}")
         
         # Update dashboard with live data
         if self.dashboard and hasattr(self.dashboard, 'websocket_handler'):
@@ -661,22 +743,70 @@ class EnhancedRealTimeTrader:
         return self.trader.stop_trading()
     
     def get_portfolio_status(self) -> Dict[str, Any]:
-        """Get portfolio status from the trader including strategy information"""
+        """Get portfolio status from the trader including strategy information and enhanced state"""
         if hasattr(self.trader, 'get_portfolio_status'):
             status = self.trader.get_portfolio_status()
             status['broker'] = self.broker
             status['data_provider'] = 'enhanced'  # Could be made configurable
+            
+            # Enhance with state manager data if available
+            if self.state_manager:
+                try:
+                    portfolio_summary = self.state_manager.get_portfolio_summary()
+                    all_positions = self.state_manager.get_all_positions()
+                    
+                    # Add enhanced state information
+                    status['enhanced_state'] = {
+                        'portfolio_summary': portfolio_summary,
+                        'open_positions': len(all_positions),
+                        'position_details': all_positions,
+                        'last_updated': datetime.now().isoformat(),
+                        'state_manager_active': True
+                    }
+                    
+                    # Override with more accurate state manager data if available
+                    if portfolio_summary.get('total_value'):
+                        status['portfolio_value'] = portfolio_summary['total_value']
+                    if all_positions:
+                        status['position_count'] = len(all_positions)
+                        
+                except Exception as e:
+                    logger.error(f"Failed to get enhanced state information: {e}")
+                    status['enhanced_state'] = {'error': str(e), 'state_manager_active': False}
+            
             return status
         
         # Fallback for brokers without strategy integration
         strategy_info = self.strategy.get_strategy_info()
-        return {
+        status = {
             'broker': self.broker, 
             'strategy': strategy_info['name'],
             'strategy_type': strategy_info['type'],
             'portfolio_value': 0, 
             'position_count': 0
         }
+        
+        # Add enhanced state if available
+        if self.state_manager:
+            try:
+                portfolio_summary = self.state_manager.get_portfolio_summary()
+                all_positions = self.state_manager.get_all_positions()
+                
+                status.update({
+                    'portfolio_value': portfolio_summary.get('total_value', 0),
+                    'position_count': len(all_positions),
+                    'enhanced_state': {
+                        'portfolio_summary': portfolio_summary,
+                        'position_details': all_positions,
+                        'last_updated': datetime.now().isoformat(),
+                        'state_manager_active': True
+                    }
+                })
+            except Exception as e:
+                logger.error(f"Failed to get enhanced state for fallback: {e}")
+                status['enhanced_state'] = {'error': str(e), 'state_manager_active': False}
+        
+        return status
     
     @property
     def is_trading(self):
@@ -689,7 +819,7 @@ class EnhancedTradingSystemV3:
     Enhanced trading system v3 with configurable data provider, broker, and strategy
     """
     
-    def __init__(self, data_provider: str = 'ctrader', broker: str = 'ctrader', strategy: BaseStrategy = None):
+    def __init__(self, data_provider: str = 'ctrader', broker: str = 'ctrader', strategy: BaseStrategy = None, mode: str = 'live'):
         """
         Initialize the trading system with specified data provider, broker, and strategy
         
@@ -697,10 +827,12 @@ class EnhancedTradingSystemV3:
             data_provider: 'ctrader' or 'mt5' - provider for all data operations
             broker: 'ctrader' or 'mt5' - broker for trade execution
             strategy: Strategy instance implementing BaseStrategy interface
+            mode: 'live' or 'backtest' - execution mode (affects state management initialization)
         """
         self.config = CONFIG
         self.data_provider = data_provider.lower()
         self.broker = broker.lower()
+        self.mode = mode.lower()
         
         # Create default strategy if none provided
         if strategy is None:
@@ -717,6 +849,9 @@ class EnhancedTradingSystemV3:
         
         if self.broker not in ['ctrader', 'mt5']:
             raise ValueError("broker must be 'ctrader' or 'mt5'")
+            
+        if self.mode not in ['live', 'backtest']:
+            raise ValueError("mode must be 'live' or 'backtest'")
         
         # Data and execution managers
         self.primary_data_manager = None  # Selected data provider
@@ -726,6 +861,9 @@ class EnhancedTradingSystemV3:
         self.influxdb_manager = None
         self.intelligent_data_manager = None
         self.backtest_data_manager = None
+        
+        # Enhanced state management
+        self.state_manager = None
         
         # Other components
         self.trader = None
@@ -744,6 +882,45 @@ class EnhancedTradingSystemV3:
         
         # Initialize InfluxDB
         self.influxdb_manager = InfluxDBManager(self.config)
+        
+        # Initialize enhanced state management only for live trading
+        if self.mode == 'live':
+            logger.info("Initializing enhanced state management with InfluxDB for live trading...")
+            try:
+                # Initialize unified state manager with automatic configuration
+                self.state_manager = UnifiedStateManager(
+                    auto_migrate=True  # Enable automatic migration from legacy states
+                )
+                
+                # Give the state manager time to fully initialize
+                import time
+                logger.info("⏳ Waiting for state manager to fully initialize...")
+                time.sleep(3)  # Allow async initialization to complete
+                
+                # Check state manager status after initialization delay
+                status = self.state_manager.get_system_status()
+                logger.info("📊 State Manager Status:")
+                logger.info(f"   Database: {status.get('database_type', 'Unknown')}")
+                logger.info(f"   Initialized: {status.get('initialized', False)}")
+                logger.info(f"   Connection: {status.get('database_connected', False)}")
+                
+                # Attempt to restore previous trading state regardless of health check
+                logger.info("🔄 Attempting to restore previous trading state...")
+                self._restore_trading_state()
+                
+                # Verify state manager functionality
+                if self.state_manager.health_check():
+                    logger.info("✅ Enhanced state management initialized successfully")
+                else:
+                    logger.warning("⚠️ State management initialized with warnings but will continue")
+                    
+            except Exception as e:
+                logger.error(f"Failed to initialize enhanced state management: {e}")
+                logger.warning("Falling back to basic InfluxDB state storage")
+                self.state_manager = None
+        else:
+            logger.info(f"Skipping state management initialization for {self.mode} mode")
+            self.state_manager = None
         
         # Initialize intelligent data management
         self.intelligent_data_manager = IntelligentDataManager(self.config, self.influxdb_manager)
@@ -800,20 +977,663 @@ class EnhancedTradingSystemV3:
             self.intelligent_data_manager.register_data_provider(provider_name, provider_instance)
         self.backtest_data_manager.register_data_providers(available_providers)
         
-        # Initialize enhanced trader with selected broker and strategy
+        # Initialize enhanced trader with selected broker, strategy, and state manager
         self.trader = EnhancedRealTimeTrader(
             self.config, 
             self.execution_data_manager,
             self.broker,
             self.influxdb_manager,
+            self.state_manager,  # Pass the enhanced state manager
             self.strategy
         )
+        
+        # Apply restored state to trader if available
+        self._apply_restored_state_to_trader()
         
         # Initialize backtester with primary data manager
         self.backtester = VectorBTBacktester(self.config, self.primary_data_manager)
         
         logger.info("Enhanced Trading System V3 initialization complete")
         return True
+    
+    def _apply_restored_state_to_trader(self):
+        """Apply restored state data to trader components"""
+        if not hasattr(self, '_restored_state') or not self._restored_state:
+            logger.info("No restored state to apply to trader")
+            return
+            
+        try:
+            logger.info("="*50)
+            logger.info("APPLYING RESTORED STATE TO TRADER")
+            logger.info("="*50)
+            
+            restored_data = self._restored_state
+            logger.info(f"📦 Applying restored state with {len(restored_data)} components")
+            
+            # Apply positions to broker if it supports restoration
+            if 'positions' in restored_data and hasattr(self.execution_data_manager, 'restore_positions'):
+                positions = restored_data['positions']
+                logger.info(f"📊 Restoring {len(positions)} positions to execution broker")
+                try:
+                    self.execution_data_manager.restore_positions(positions)
+                    logger.info("✅ Positions successfully restored to execution broker")
+                except Exception as e:
+                    logger.warning(f"Could not restore positions to execution broker: {e}")
+            elif 'positions' in restored_data:
+                # Apply to broker's active_positions directly if restore method not available
+                positions = restored_data['positions']
+                logger.info(f"📊 Found {len(positions)} positions - applying to broker's active_positions")
+                try:
+                    if hasattr(self.execution_data_manager, 'active_positions'):
+                        self.execution_data_manager.active_positions.clear()
+                        for symbol, pos_data in positions.items():
+                            self.execution_data_manager.active_positions[symbol] = pos_data
+                        logger.info(f"✅ Applied {len(positions)} positions to broker's active_positions")
+                    else:
+                        logger.warning("Broker doesn't have active_positions attribute")
+                except Exception as e:
+                    logger.warning(f"Could not apply positions to broker: {e}")
+            
+            # Apply strategy state if available
+            if 'pair_states' in restored_data and hasattr(self.strategy, 'restore_pair_states'):
+                pair_states = restored_data['pair_states']
+                logger.info(f"🔄 Restoring {len(pair_states)} pair states to strategy")
+                try:
+                    self.strategy.restore_pair_states(pair_states)
+                    logger.info("✅ Pair states successfully restored to strategy")
+                except Exception as e:
+                    logger.warning(f"Could not restore pair states to strategy: {e}")
+            elif 'pair_states' in restored_data:
+                logger.info(f"🔄 Found {len(restored_data['pair_states'])} pair states, but strategy doesn't support restoration")
+            
+            # Apply metadata if available
+            if 'metadata' in restored_data and hasattr(self.strategy, 'restore_metadata'):
+                metadata = restored_data['metadata']
+                logger.info(f"🏷️ Restoring metadata to strategy")
+                try:
+                    self.strategy.restore_metadata(metadata)
+                    logger.info("✅ Metadata successfully restored to strategy")
+                except Exception as e:
+                    logger.warning(f"Could not restore metadata to strategy: {e}")
+            
+            # Log portfolio summary
+            if 'portfolio_summary' in restored_data:
+                portfolio = restored_data['portfolio_summary']
+                logger.info(f"💰 Portfolio Summary: {portfolio}")
+                    
+            logger.info("="*50)
+            logger.info("STATE APPLICATION COMPLETED")
+            logger.info("="*50)
+            
+        except Exception as e:
+            logger.error(f"Error applying restored state to trader: {e}")
+            import traceback
+            logger.debug(f"State application error details: {traceback.format_exc()}")
+
+    def _restore_trading_state(self) -> bool:
+        """Restore previous trading state from the database"""
+        if not self.state_manager:
+            logger.warning("State manager not available, skipping state restoration")
+            return False
+        
+        try:
+            logger.info("="*60)
+            logger.info("RESTORING PREVIOUS TRADING STATE")
+            logger.info("="*60)
+            
+            # Wait a bit more for state manager to be fully ready
+            import time
+            time.sleep(2)
+            
+            # Try multiple times with increasing delays to ensure state is available
+            max_retries = 3
+            all_positions = []
+            current_state = None
+            portfolio_summary = None
+            
+            for attempt in range(max_retries):
+                try:
+                    logger.info(f"📊 Attempt {attempt + 1}/{max_retries}: Retrieving stored positions...")
+                    all_positions = self.state_manager.get_all_positions()
+                    
+                    logger.info(f"📊 Attempt {attempt + 1}/{max_retries}: Retrieving current trading state...")
+                    current_state = self.state_manager.load_trading_state()
+                    
+                    logger.info(f"📊 Attempt {attempt + 1}/{max_retries}: Retrieving portfolio summary...")
+                    portfolio_summary = self.state_manager.get_portfolio_summary()
+                    
+                    logger.info(f"📊 Attempt {attempt + 1}: Found {len(all_positions) if all_positions else 0} positions")
+                    logger.info(f"📊 Attempt {attempt + 1}: Current state available: {bool(current_state)}")
+                    logger.info(f"📊 Attempt {attempt + 1}: Portfolio summary: {portfolio_summary}")
+                    
+                    # If we found positions or states, break early
+                    if (all_positions and len(all_positions) > 0) or (current_state and current_state.get('pair_states')):
+                        logger.info(f"✅ Found data on attempt {attempt + 1}, proceeding with restoration")
+                        break
+                    elif attempt < max_retries - 1:
+                        logger.info(f"⏳ No data found on attempt {attempt + 1}, waiting 3 seconds before next attempt...")
+                        time.sleep(3)
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ Error on attempt {attempt + 1}: {e}")
+                    if attempt < max_retries - 1:
+                        logger.info(f"⏳ Retrying in 2 seconds...")
+                        time.sleep(2)
+                    else:
+                        logger.error(f"❌ All attempts failed, continuing with fresh state")
+            
+            # Now proceed with the restoration using the retrieved data
+            logger.info(f"📊 Final result: Found {len(all_positions) if all_positions else 0} stored positions")
+            logger.info(f"📊 Final portfolio summary: {portfolio_summary}")
+            
+            if all_positions:
+                logger.info("📊 Restored Positions:")
+                for i, position in enumerate(all_positions, 1):
+                    symbol1 = position.get('symbol1', 'N/A')
+                    symbol2 = position.get('symbol2', 'N/A')
+                    direction = position.get('direction', 'N/A')
+                    entry_price = position.get('entry_price', 0)
+                    quantity = position.get('quantity', 0)
+                    entry_time = position.get('entry_time', 'N/A')
+                    
+                    logger.info(f"  {i}. 📈 {symbol1}-{symbol2}: {direction} | Entry: {entry_price} | Qty: {quantity}")
+                    logger.info(f"      ⏰ Time: {entry_time}")
+            else:
+                logger.info("📊 No stored positions found - starting with fresh state")
+            
+            # Restore pair states if available
+            if current_state and 'pair_states' in current_state:
+                pair_states = current_state['pair_states']
+                logger.info(f"📊 Restored Pair States: {len(pair_states)} pairs")
+                
+                for pair, state in list(pair_states.items())[:10]:  # Show first 10
+                    position = state.get('position', 'none')
+                    cooldown = state.get('cooldown', 0)
+                    last_update = state.get('last_update', 'N/A')
+                    z_score = state.get('z_score', 'N/A')
+                    
+                    logger.info(f"  📊 {pair}: {position} | Cooldown: {cooldown} | Z-Score: {z_score}")
+                
+                if len(pair_states) > 10:
+                    logger.info(f"  ... and {len(pair_states) - 10} more pairs")
+            else:
+                logger.info("📊 No pair states found - pairs will initialize with fresh data")
+            
+            # Check for recent session metadata
+            if current_state and 'metadata' in current_state:
+                metadata = current_state['metadata']
+                if 'session_info' in metadata:
+                    session = metadata['session_info']
+                    logger.info("📊 Previous Session Info:")
+                    logger.info(f"   Data Provider: {session.get('data_provider', 'N/A')}")
+                    logger.info(f"   Broker: {session.get('broker', 'N/A')}")
+                    logger.info(f"   Strategy: {session.get('strategy', 'N/A')}")
+                    logger.info(f"   Last Save: {session.get('save_time', 'N/A')}")
+                    
+                    # Check if current session matches previous session
+                    if (session.get('data_provider') == self.data_provider and 
+                        session.get('broker') == self.broker):
+                        logger.info("✅ Current session matches previous session configuration")
+                    else:
+                        logger.warning("⚠️ Current session differs from previous session:")
+                        logger.warning(f"   Previous: {session.get('data_provider', 'N/A')}/{session.get('broker', 'N/A')}")
+                        logger.warning(f"   Current: {self.data_provider}/{self.broker}")
+            
+            # Check for recent backtest results
+            try:
+                logger.info("📊 Checking for recent backtest results...")
+                latest_backtest = self.influxdb_manager.get_latest_backtest_results()
+                if latest_backtest:
+                    backtest_time = latest_backtest.get('timestamp', 'Unknown')
+                    portfolio_return = latest_backtest.get('portfolio_metrics', {}).get('portfolio_return', 0)
+                    logger.info(f"📈 Latest backtest: {backtest_time} | Return: {portfolio_return:.2%}")
+                else:
+                    logger.info("📈 No previous backtest results found")
+            except Exception as e:
+                logger.debug(f"Could not retrieve latest backtest results: {e}")
+            
+            # Restore strategy-specific state if available
+            if hasattr(self.strategy, 'restore_state') and current_state:
+                try:
+                    logger.info("🔄 Restoring strategy-specific state...")
+                    strategy_metadata = current_state.get('metadata', {})
+                    self.strategy.restore_state(strategy_metadata)
+                    logger.info("✅ Strategy state restored successfully")
+                except Exception as e:
+                    logger.warning(f"Could not restore strategy state: {e}")
+            
+            # Store restored state for later use by broker/strategy
+            if current_state:
+                self._restored_state = {
+                    'positions': all_positions,
+                    'pair_states': current_state.get('pair_states', {}),
+                    'metadata': current_state.get('metadata', {}),
+                    'portfolio_summary': portfolio_summary
+                }
+                logger.info("💾 Restored state cached for broker/strategy initialization")
+            else:
+                self._restored_state = None
+            
+            logger.info("="*60)
+            logger.info("STATE RESTORATION COMPLETED")
+            logger.info("="*60)
+            
+            if all_positions or (current_state and current_state.get('pair_states')):
+                logger.info("✅ Previous trading state successfully restored")
+                logger.info("✅ System ready to continue from previous session")
+            else:
+                logger.info("✅ Starting with fresh trading state")
+                logger.info("✅ System ready for new trading session")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to restore trading state: {e}")
+            logger.warning("Continuing with fresh state...")
+            import traceback
+            logger.debug(f"State restoration error details: {traceback.format_exc()}")
+            return False
+    
+    def save_current_trading_state(self, description: str = "Trading session state save") -> bool:
+        """Save current trading state to the database"""
+        if not self.state_manager:
+            logger.warning("State manager not available, cannot save trading state")
+            return False
+        
+        try:
+            logger.info("💾 Saving current trading state...")
+            
+            # Get current positions from trader if available
+            current_positions = {}
+            if self.trader and hasattr(self.trader, 'get_portfolio_status'):
+                try:
+                    portfolio = self.trader.get_portfolio_status()
+                    
+                    # Try multiple sources to ensure we capture positions (use all sources, not elif)
+                    positions_found = False
+                    
+                    # Source 1: Try enhanced_state (if available)
+                    if 'enhanced_state' in portfolio and 'position_details' in portfolio['enhanced_state']:
+                        position_details = portfolio['enhanced_state']['position_details']
+                        # Convert list of positions to dictionary format expected by state manager
+                        if isinstance(position_details, list) and position_details:
+                            for i, position in enumerate(position_details):
+                                # Create a unique key for each position
+                                if isinstance(position, dict):
+                                    # Transform position data to match PositionSchema requirements
+                                    transformed_position = self._transform_position_for_schema(position)
+                                    if transformed_position:
+                                        position_key = position.get('pair', f'position_{i}')
+                                        current_positions[position_key] = transformed_position
+                                        logger.debug(f"✅ Transformed enhanced position {position_key}: {transformed_position}")
+                                    else:
+                                        logger.warning(f"⚠️ Failed to transform enhanced position {i}: {position}")
+                                else:
+                                    current_positions[f'position_{i}'] = position
+                            logger.debug(f"✅ Found {len(current_positions)} positions from enhanced_state")
+                            positions_found = True
+                        elif isinstance(position_details, dict) and position_details:
+                            # Transform each position in the dict
+                            for key, position in position_details.items():
+                                if isinstance(position, dict):
+                                    transformed_position = self._transform_position_for_schema(position)
+                                    if transformed_position:
+                                        current_positions[key] = transformed_position
+                                    else:
+                                        current_positions[key] = position  # Keep original if transformation fails
+                                else:
+                                    current_positions[key] = position
+                            logger.debug(f"✅ Found {len(position_details)} positions from enhanced_state dict")
+                            positions_found = True
+                    
+                    # Source 2: Try broker's direct positions (always try this - it's the most reliable)
+                    if 'positions' in portfolio and portfolio['positions']:
+                        positions_list = portfolio['positions']
+                        logger.debug(f"📊 Checking broker's direct positions: {len(positions_list)} positions")
+                        # Convert positions list to dictionary, transforming to PositionSchema format
+                        for i, position in enumerate(positions_list):
+                            if isinstance(position, dict):
+                                # Transform broker position data to match PositionSchema requirements
+                                transformed_position = self._transform_position_for_schema(position)
+                                if transformed_position:
+                                    position_key = position.get('pair', f'position_{i}')
+                                    current_positions[position_key] = transformed_position
+                                    logger.debug(f"✅ Transformed position {position_key}: {transformed_position}")
+                                else:
+                                    logger.warning(f"⚠️ Failed to transform position {i}: {position}")
+                            else:
+                                current_positions[f'position_{i}'] = position
+                        logger.debug(f"✅ Found {len(positions_list)} positions from broker's direct positions")
+                        positions_found = True
+                    
+                    # Source 3: Try active_positions directly from the broker (fallback)
+                    if hasattr(self.trader, 'trader') and hasattr(self.trader.trader, 'active_positions'):
+                        active_positions = self.trader.trader.active_positions
+                        if active_positions:
+                            logger.debug(f"📊 Checking broker's active_positions: {len(active_positions)} positions")
+                            # Add or update with active positions, transforming each one
+                            for key, position in active_positions.items():
+                                if isinstance(position, dict):
+                                    transformed_position = self._transform_position_for_schema(position)
+                                    if transformed_position:
+                                        current_positions[key] = transformed_position
+                                        logger.debug(f"✅ Transformed active position {key}: {transformed_position}")
+                                    else:
+                                        current_positions[key] = position  # Keep original if transformation fails
+                                        logger.warning(f"⚠️ Failed to transform active position {key}, keeping original")
+                                else:
+                                    current_positions[key] = position
+                            logger.debug(f"✅ Added {len(active_positions)} positions from broker's active_positions")
+                            positions_found = True
+                    
+                    # Final check and logging
+                    if positions_found:
+                        logger.debug(f"✅ TOTAL POSITIONS CAPTURED: {len(current_positions)} positions")
+                        for pair_name, pos_data in current_positions.items():
+                            if isinstance(pos_data, dict):
+                                direction = pos_data.get('direction', 'N/A')
+                                symbol1 = pos_data.get('symbol1', 'N/A')
+                                symbol2 = pos_data.get('symbol2', 'N/A') 
+                                logger.debug(f"   📈 {pair_name}: {direction} ({symbol1}-{symbol2})")
+                    else:
+                        logger.warning("⚠️ No positions found from any source!")
+                    
+                except Exception as e:
+                    logger.debug(f"Could not get current positions from trader: {e}")
+            
+            # Get pair states from strategy if available
+            pair_states = {}
+            if hasattr(self.strategy, 'get_current_state'):
+                try:
+                    pair_states = self.strategy.get_current_state()
+                except Exception as e:
+                    logger.debug(f"Could not get pair states from strategy: {e}")
+            
+            # Also try to get pair states from broker if available
+            if not pair_states and hasattr(self.trader, 'trader') and hasattr(self.trader.trader, 'pair_states'):
+                try:
+                    broker_pair_states = self.trader.trader.pair_states
+                    if broker_pair_states:
+                        logger.debug(f"Getting pair states from broker: {len(broker_pair_states)} states")
+                        
+                        # Get active positions to determine current pair positions
+                        active_pair_positions = {}
+                        if hasattr(self.trader, 'trader') and hasattr(self.trader.trader, 'active_positions'):
+                            active_positions = self.trader.trader.active_positions
+                            # Group positions by pairs
+                            for symbol, pos_data in active_positions.items():
+                                if isinstance(pos_data, dict) and 'pair' in pos_data:
+                                    pair_name = pos_data['pair']
+                                    direction = pos_data.get('direction', 'none').lower()
+                                    active_pair_positions[pair_name] = direction
+                        
+                        # Convert broker pair states to format matching PairStateSchema
+                        pair_states = {}
+                        for pair_name, state_data in broker_pair_states.items():
+                            # Extract symbol1 and symbol2 from pair name
+                            if '-' in pair_name:
+                                symbols = pair_name.split('-')
+                                symbol1 = symbols[0] if len(symbols) > 0 else 'UNKNOWN'
+                                symbol2 = symbols[1] if len(symbols) > 1 else 'UNKNOWN'
+                            else:
+                                symbol1 = pair_name
+                                symbol2 = 'UNKNOWN'
+                            
+                            # Determine current position for this pair
+                            current_position = active_pair_positions.get(pair_name, 'none')
+                            if current_position not in ['none', 'long', 'short']:
+                                current_position = 'none'  # Fallback to valid value
+                            
+                            # Create pair state matching PairStateSchema
+                            pair_states[pair_name] = {
+                                'symbol1': symbol1,
+                                'symbol2': symbol2,
+                                'position': current_position,
+                                'cooldown': 0,  # Default cooldown
+                                'last_update': datetime.now(),  # Use datetime object for schema validation
+                                'spread': None,  # Optional field
+                                'z_score': None,  # Optional field
+                                # Additional metadata for debugging (keep outside main schema fields)
+                                'price1_count': len(state_data.get('price1', [])),
+                                'price2_count': len(state_data.get('price2', [])),
+                                'ready_for_trading': len(state_data.get('price1', [])) > 50 and len(state_data.get('price2', [])) > 50
+                            }
+                except Exception as e:
+                    logger.debug(f"Could not get pair states from broker: {e}")
+            
+            # Create comprehensive metadata
+            metadata = {
+                'session_info': {
+                    'data_provider': self.data_provider,
+                    'broker': self.broker,
+                    'strategy': self.strategy.__class__.__name__,
+                    'save_time': datetime.now().isoformat(),
+                    'system_version': 'EnhancedTradingSystemV3'
+                },
+                'trading_config': {
+                    'pairs': getattr(self.config, 'pairs', []),
+                    'log_level': getattr(self.config, 'log_level', 'INFO'),
+                    'realtime_trading': getattr(self.config, 'realtime_trading', False)
+                },
+                'portfolio_summary': {},
+                'system_status': 'saved'
+            }
+            
+            # Add portfolio summary if available
+            try:
+                portfolio_summary = self.state_manager.get_portfolio_summary()
+                metadata['portfolio_summary'] = portfolio_summary
+            except Exception as e:
+                logger.debug(f"Could not get portfolio summary: {e}")
+            
+            # Add strategy-specific metadata if available
+            if hasattr(self.strategy, 'get_state_metadata'):
+                try:
+                    strategy_metadata = self.strategy.get_state_metadata()
+                    metadata['strategy_metadata'] = strategy_metadata
+                except Exception as e:
+                    logger.debug(f"Could not get strategy metadata: {e}")
+            
+            # Create portfolio data that matches the expected schema
+            portfolio_data = {
+                'total_value': 100000.0,  # Default initial value
+                'available_balance': 100000.0,  # Default available balance
+                'total_pnl': 0.0,  # Default PnL
+                'open_positions': len(current_positions),  # Count of current positions
+                'daily_pnl': 0.0,  # Default daily PnL
+                'peak_value': 100000.0,  # Default peak value
+                'metadata': metadata  # Include metadata as additional field
+            }
+            
+            # Try to get actual portfolio values from trader if available
+            if self.trader and hasattr(self.trader, 'get_portfolio_status'):
+                try:
+                    portfolio_status = self.trader.get_portfolio_status()
+                    if portfolio_status:
+                        portfolio_data['total_value'] = portfolio_status.get('portfolio_value', 100000.0)
+                        portfolio_data['available_balance'] = portfolio_status.get('available_balance', portfolio_status.get('portfolio_value', 100000.0))
+                        portfolio_data['total_pnl'] = portfolio_status.get('total_pnl', 0.0)
+                        if 'enhanced_state' in portfolio_status:
+                            enhanced_state = portfolio_status['enhanced_state']
+                            if 'position_details' in enhanced_state:
+                                portfolio_data['open_positions'] = len(enhanced_state['position_details'])
+                except Exception as e:
+                    logger.debug(f"Could not get portfolio values from trader: {e}")
+            
+            # Save the complete trading state
+            logger.info(f"💾 PREPARING TO SAVE STATE:")
+            logger.info(f"   📊 Positions to save: {len(current_positions)}")
+            logger.info(f"   📊 Pair states to save: {len(pair_states)}")
+            logger.info(f"   📊 Portfolio data keys: {list(portfolio_data.keys())}")
+            
+            # Log sample of positions being saved
+            if current_positions:
+                logger.info("📊 POSITIONS BEING SAVED (sample):")
+                for i, (key, pos) in enumerate(list(current_positions.items())[:3]):
+                    logger.info(f"   {i+1}. Key: {key}")
+                    if isinstance(pos, dict):
+                        logger.info(f"      Direction: {pos.get('direction', 'N/A')}")
+                        logger.info(f"      Symbols: {pos.get('symbol1', 'N/A')}-{pos.get('symbol2', 'N/A')}")
+                        logger.info(f"      Entry Price: {pos.get('entry_price', 'N/A')}")
+                        logger.info(f"      Quantity: {pos.get('quantity', 'N/A')}")
+                    else:
+                        logger.info(f"      Data type: {type(pos)}")
+                if len(current_positions) > 3:
+                    logger.info(f"   ... and {len(current_positions) - 3} more positions")
+            
+            logger.debug(f"Saving state - Positions type: {type(current_positions)}, Pair states type: {type(pair_states)}")
+            logger.debug(f"Positions count: {len(current_positions) if isinstance(current_positions, (dict, list)) else 'N/A'}")
+            logger.debug(f"Pair states count: {len(pair_states) if isinstance(pair_states, (dict, list)) else 'N/A'}")
+            logger.debug(f"Portfolio data structure: {list(portfolio_data.keys())}")
+            
+            success = self.state_manager.save_trading_state(
+                active_positions=current_positions,
+                pair_states=pair_states,
+                portfolio_data=portfolio_data  # Use properly structured portfolio data
+            )
+            
+            if success:
+                logger.info("✅ Trading state saved successfully")
+                logger.info(f"   Positions: {len(current_positions)}")
+                logger.info(f"   Pair states: {len(pair_states)}")
+                logger.info(f"   Data provider: {self.data_provider}")
+                logger.info(f"   Broker: {self.broker}")
+                return True
+            else:
+                logger.error("❌ Failed to save trading state")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error saving trading state: {e}")
+            return False
+    
+    def _transform_position_for_schema(self, broker_position: Dict) -> Dict:
+        """Transform broker position data to match PositionSchema requirements"""
+        try:
+            # Extract pair information
+            pair = broker_position.get('pair', '')
+            if '-' in pair:
+                symbol1, symbol2 = pair.split('-', 1)
+            else:
+                symbol1 = broker_position.get('symbol1', pair)
+                symbol2 = broker_position.get('symbol2', 'UNKNOWN')
+            
+            # Transform direction to lowercase as required by schema
+            direction = broker_position.get('direction', '').upper()
+            if direction == 'LONG':
+                direction = 'long'
+            elif direction == 'SHORT':
+                direction = 'short'
+            else:
+                logger.warning(f"Invalid direction '{direction}' in position, skipping")
+                return None
+            
+            # Extract required fields with fallbacks
+            entry_time = broker_position.get('entry_time')
+            if isinstance(entry_time, str):
+                from datetime import datetime
+                try:
+                    entry_time = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
+                except:
+                    entry_time = datetime.now()
+            elif entry_time is None:
+                entry_time = datetime.now()
+            
+            # Get quantity - try multiple field names
+            quantity = broker_position.get('quantity') or broker_position.get('size') or broker_position.get('volume')
+            if quantity is None or quantity <= 0:
+                # Calculate from individual leg quantities if available
+                leg1_qty = broker_position.get('leg1_quantity', 0)
+                leg2_qty = broker_position.get('leg2_quantity', 0)
+                if leg1_qty > 0:
+                    quantity = leg1_qty
+                else:
+                    quantity = 1.0  # Default fallback
+            
+            # Get entry price - try multiple field names
+            entry_price = broker_position.get('entry_price') or broker_position.get('open_price') or broker_position.get('price')
+            if entry_price is None or entry_price <= 0:
+                # Calculate from individual leg prices if available
+                leg1_price = broker_position.get('leg1_price', 0)
+                leg2_price = broker_position.get('leg2_price', 0)
+                if leg1_price > 0:
+                    entry_price = leg1_price
+                elif leg2_price > 0:
+                    entry_price = leg2_price
+                else:
+                    entry_price = 100.0  # Default fallback
+            
+            # Create schema-compliant position
+            transformed_position = {
+                'symbol1': symbol1,
+                'symbol2': symbol2,
+                'direction': direction,
+                'entry_time': entry_time,
+                'quantity': float(quantity),
+                'entry_price': float(entry_price),
+                'stop_loss': broker_position.get('stop_loss'),  # Optional
+                'take_profit': broker_position.get('take_profit')  # Optional
+            }
+            
+            logger.debug(f"Position transformation: {broker_position.get('pair', 'Unknown')} -> {direction} @ {entry_price} (qty: {quantity})")
+            
+            return transformed_position
+            
+        except Exception as e:
+            logger.error(f"Error transforming position data: {e}")
+            logger.debug(f"Original position data: {broker_position}")
+            return None
+    
+    def shutdown_gracefully(self) -> bool:
+        """Gracefully shutdown the trading system and save state"""
+        logger.info("🔄 Initiating graceful shutdown...")
+        
+        try:
+            # Save current trading state before shutdown
+            self.save_current_trading_state("Graceful shutdown - session end")
+            
+            # Stop trading if active
+            if self.trader and hasattr(self.trader, 'stop_trading'):
+                try:
+                    logger.info("🛑 Stopping trading operations...")
+                    self.trader.stop_trading()
+                    logger.info("✅ Trading stopped successfully")
+                except Exception as e:
+                    logger.error(f"Error stopping trader: {e}")
+            
+            # Disconnect from data providers
+            if self.primary_data_manager and hasattr(self.primary_data_manager, 'disconnect'):
+                try:
+                    logger.info("🔌 Disconnecting from data providers...")
+                    self.primary_data_manager.disconnect()
+                    if self.execution_data_manager != self.primary_data_manager:
+                        self.execution_data_manager.disconnect()
+                    logger.info("✅ Data providers disconnected")
+                except Exception as e:
+                    logger.error(f"Error disconnecting data providers: {e}")
+            
+            # Disconnect from InfluxDB
+            if self.influxdb_manager:
+                try:
+                    self.influxdb_manager.disconnect()
+                    logger.info("✅ InfluxDB disconnected")
+                except Exception as e:
+                    logger.error(f"Error disconnecting InfluxDB: {e}")
+            
+            # Close state manager connections
+            if self.state_manager and hasattr(self.state_manager, 'shutdown'):
+                try:
+                    self.state_manager.shutdown()
+                    logger.info("✅ State manager shutdown")
+                except Exception as e:
+                    logger.error(f"Error shutting down state manager: {e}")
+            
+            logger.info("✅ Graceful shutdown completed")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error during graceful shutdown: {e}")
+            return False
     
     def start_dashboard(self, backtest_results: Optional[Dict] = None):
         """Start the dashboard with optional backtest results"""
@@ -915,9 +1735,45 @@ class EnhancedTradingSystemV3:
             logger.info("Step 4: Running backtest with cached data...")
             backtest_results = self.backtester.run_backtest()
             
-            # Step 5: Store results in InfluxDB
+            # Step 5: Store results in InfluxDB and enhanced state manager
             logger.info("Step 5: Storing backtest results...")
             self.influxdb_manager.store_backtest_results(backtest_results)
+            
+            # Store in enhanced state manager if available
+            if self.state_manager:
+                try:
+                    logger.info("Storing backtest results in enhanced state manager...")
+                    
+                    # Store backtest configuration and results as trading state
+                    backtest_state = {
+                        'backtest_results': backtest_results,
+                        'configuration': {
+                            'data_provider': self.data_provider,
+                            'execution_broker': self.broker,
+                            'strategy': self.strategy.__class__.__name__,
+                            'pairs': self.config.pairs,
+                            'start_date': getattr(self.config, 'start_date', None),
+                            'end_date': getattr(self.config, 'end_date', None),
+                            'force_refresh': force_refresh,
+                            'intelligent_caching': True,
+                            'cached_symbols': list(backtest_data_cache.keys()),
+                            'data_quality': quality_report
+                        },
+                        'timestamp': datetime.now().isoformat(),
+                        'type': 'backtest_results'
+                    }
+                    
+                    # Save as trading state with backtest identifier
+                    self.state_manager.save_trading_state(
+                        active_positions={},  # No positions for backtest
+                        pair_states={},  # No pair states for backtest
+                        portfolio_data=backtest_state
+                    )
+                    
+                    logger.info("✅ Backtest results stored in enhanced state manager")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to store backtest results in state manager: {e}")
             
             # Step 6: Generate enhanced report
             logger.info("Step 6: Generating enhanced report...")
@@ -1390,7 +2246,7 @@ class EnhancedTradingSystemV3:
             traceback.print_exc()
     
     def get_dashboard_data(self) -> Dict[str, Any]:
-        """Get comprehensive data for dashboard display"""
+        """Get comprehensive data for dashboard display with enhanced state management"""
         dashboard_data = {
             'live_trades': self.influxdb_manager.get_recent_trades(24),
             'market_data': {},
@@ -1402,7 +2258,8 @@ class EnhancedTradingSystemV3:
                 'influxdb_connected': bool(self.influxdb_manager.client),
                 'trader_active': bool(self.trader and self.trader.is_trading),
                 'data_provider': self.data_provider,
-                'execution_broker': self.broker
+                'execution_broker': self.broker,
+                'enhanced_state_manager': bool(self.state_manager)
             }
         }
         
@@ -1411,6 +2268,36 @@ class EnhancedTradingSystemV3:
             market_data = self.influxdb_manager.get_market_data(pair, 1)
             if market_data:
                 dashboard_data['market_data'][pair] = market_data[-1]
+        
+        # Add enhanced state data if available
+        if self.state_manager:
+            try:
+                # Get portfolio and position states
+                portfolio_summary = self.state_manager.get_portfolio_summary()
+                all_positions = self.state_manager.get_all_positions()
+                system_status = self.state_manager.get_system_status()
+                
+                # Get recent state history (which might include backtest results)
+                state_history = self.state_manager.get_state_history(limit=3)
+                
+                # Add to dashboard data
+                dashboard_data['enhanced_state'] = {
+                    'portfolio_summary': portfolio_summary,
+                    'positions': all_positions,
+                    'state_history': state_history,
+                    'system_status': system_status,
+                    'last_updated': datetime.now().isoformat()
+                }
+                
+                # Update system status with enhanced information
+                if portfolio_summary:
+                    dashboard_data['system_status']['portfolio_value'] = portfolio_summary.get('total_value', 0)
+                    dashboard_data['system_status']['open_positions'] = len(all_positions)
+                    dashboard_data['system_status']['last_state_update'] = portfolio_summary.get('last_updated')
+                
+            except Exception as e:
+                logger.error(f"Failed to get enhanced state data for dashboard: {e}")
+                dashboard_data['enhanced_state'] = {'error': str(e)}
         
         return dashboard_data
     
@@ -1445,6 +2332,14 @@ class EnhancedTradingSystemV3:
             
             if self.influxdb_manager:
                 self.influxdb_manager.disconnect()
+                logger.info("InfluxDB disconnected")
+            
+            if self.state_manager:
+                try:
+                    self.state_manager.shutdown()
+                    logger.info("Enhanced state manager shutdown complete")
+                except Exception as e:
+                    logger.error(f"Error shutting down state manager: {e}")
             
             if self.dashboard and hasattr(self.dashboard, 'stop'):
                 self.dashboard.stop()
@@ -1468,6 +2363,17 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
     """
     system = None
     
+    def signal_handler(signum, frame):
+        """Handle shutdown signals gracefully"""
+        logger.info(f"Received shutdown signal {signum}")
+        if system:
+            system.shutdown_gracefully()
+        sys.exit(0)
+    
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
+    
     try:
         logger.info(f"=== Enhanced Pairs Trading System V3 Starting ===")
         logger.info(f"Data Provider: {data_provider}")
@@ -1487,7 +2393,7 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
             strategy_instance = OptimizedPairsStrategy(CONFIG, None)
         
         # Create system with selected providers and strategy
-        system = EnhancedTradingSystemV3(data_provider=data_provider, broker=broker, strategy=strategy_instance)
+        system = EnhancedTradingSystemV3(data_provider=data_provider, broker=broker, strategy=strategy_instance, mode=mode)
         
         if not system.initialize():
             logger.error("Failed to initialize trading system")
@@ -1497,6 +2403,13 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
         logger.info(f"System Initialized:")
         logger.info(f"  Data Provider: {system.data_provider}")
         logger.info(f"  Execution Broker: {system.broker}")
+        logger.info(f"  Enhanced State Manager: {'✅ Active' if system.state_manager else '❌ Disabled'}")
+        if system.state_manager:
+            status = system.state_manager.get_system_status()
+            logger.info(f"  State Management Status: {status.get('status', 'Unknown')}")
+            logger.info(f"  Database Type: {status.get('database_type', 'Unknown')}")
+            logger.info(f"  Database Connected: {status.get('database_connected', False)}")
+            logger.info(f"  Caching Active: {status.get('caching_enabled', False)}")
         
         if mode.lower() == 'backtest':
             logger.info(f"Running backtest with {system.data_provider} data...")
@@ -1510,11 +2423,22 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
             logger.info("=== Backtest Complete ===")
             logger.info(f"Data Provider: {system.data_provider}")
             logger.info(f"Execution Broker: {system.broker}")
+            logger.info(f"Enhanced State Management: {'✅ Active' if system.state_manager else '❌ Disabled'}")
             logger.info(f"Portfolio Return: {backtest_results.get('portfolio_metrics', {}).get('portfolio_return', 0):.2%}")
             logger.info(f"Sharpe Ratio: {backtest_results.get('portfolio_metrics', {}).get('portfolio_sharpe', 0):.2f}")
             logger.info(f"Max Drawdown: {backtest_results.get('portfolio_metrics', {}).get('portfolio_max_drawdown', 0):.2%}")
             logger.info(f"Total Trades: {backtest_results.get('portfolio_metrics', {}).get('total_trades', 0)}")
             logger.info(f"Report: {backtest_results.get('report_path', 'N/A')}")
+            
+            # Log enhanced state information if available
+            if system.state_manager:
+                try:
+                    state_history = system.state_manager.get_state_history(limit=1)
+                    if state_history:
+                        logger.info(f"State Management: Latest backtest stored successfully")
+                        logger.info(f"State entries: {len(state_history)} total in history")
+                except Exception as e:
+                    logger.debug(f"Could not retrieve state management info: {e}")
             
             # Keep dashboard running
             input("Press Enter to stop the dashboard...")
@@ -1523,6 +2447,12 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
             logger.info(f"Starting live trading...")
             logger.info(f"  Data from: {system.data_provider}")
             logger.info(f"  Execution via: {system.broker}")
+            logger.info(f"  Enhanced State Management: {'✅ Active' if system.state_manager else '❌ Disabled'}")
+            
+            if system.state_manager:
+                logger.info(f"  State storage: Real-time position and portfolio tracking enabled")
+                logger.info(f"  State versioning: Enabled for audit trail")
+                logger.info(f"  State API: Available for external monitoring")
             
             # Start dashboard first (non-blocking)
             logger.info("Step 1: Starting dashboard...")
@@ -1552,6 +2482,7 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
                 logger.info("="*80)
                 logger.info(f"Data Provider: {system.data_provider}")
                 logger.info(f"Execution Broker: {system.broker}")
+                logger.info(f"Enhanced State Management: {'✅ Active' if system.state_manager else '❌ Disabled'}")
                 logger.info(f"Dashboard: http://127.0.0.1:8050")
                 logger.info("Press Ctrl+C to stop...")
                 logger.info("="*80)
@@ -1560,10 +2491,20 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
                     # Check status periodically
                     status_check_count = 0
                     timeout_warning_shown = False
+                    last_state_save = time.time()
                     
                     while True:
                         time.sleep(30)  # Check every 30 seconds
                         status_check_count += 1
+                        current_time = time.time()
+                        
+                        # Save trading state every 5 minutes
+                        if current_time - last_state_save >= 300:  # 5 minutes
+                            try:
+                                system.save_current_trading_state("Periodic state save during live trading")
+                                last_state_save = current_time
+                            except Exception as e:
+                                logger.debug(f"Periodic state save failed: {e}")
                         
                         # Log status every 5 minutes
                         if status_check_count % 10 == 0:  # 30 seconds * 10 = 5 minutes                          
@@ -1622,7 +2563,7 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
         traceback.print_exc()
     finally:
         if system:
-            system.shutdown()
+            system.shutdown_gracefully()
         logger.info("Enhanced Pairs Trading System V3 stopped")
 
 

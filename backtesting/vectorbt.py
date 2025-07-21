@@ -254,7 +254,8 @@ class VectorBTBacktester:
                 'trades': trades,
                 'equity_curve': equity_curve,
                 'metrics': metrics,
-                'data': aligned_data
+                'data': aligned_data,
+                'indicators': indicators  # Include indicators for plotting
             }
             
         except Exception as e:

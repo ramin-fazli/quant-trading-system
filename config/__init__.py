@@ -27,7 +27,7 @@ class TradingConfig:
     end_date: Optional[str] = None
     
     # Strategy parameters
-    z_entry: float = 1.0
+    z_entry: float = 2.0
     z_exit: float = 0.5
     z_period: int = 100
     min_distance: float = 0  # Minimum distance from mean to enter trade (in percentage)
@@ -45,8 +45,8 @@ class TradingConfig:
     dynamic_z: bool = False
     
     # Risk management parameters
-    take_profit_perc: float = 5        # in percentage
-    stop_loss_perc: float = 5          # in percentage
+    take_profit_perc: float = 0.5        # in percentage
+    stop_loss_perc: float = 0.5          # in percentage
     trailing_stop_perc: float = 10     # in percentage
     cooldown_bars: int = 0              # after losing trade, wait for x bars before re-entering the same pair
     max_position_size: float = 10000    # Base currency, both legs combined
@@ -69,7 +69,7 @@ class TradingConfig:
     # System parameters
     use_multiprocessing: bool = True
     max_workers: int = 8
-    log_level: str = "DEBUG"     # Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
+    log_level: str = "WARNING"     # Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
     
     def __post_init__(self):
         """Initialize paths and load configuration"""

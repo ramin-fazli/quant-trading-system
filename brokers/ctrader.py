@@ -49,7 +49,7 @@ try:
             ProtoOASymbolByIdReq, ProtoOASymbolByIdRes,
             ProtoOANewOrderReq, ProtoOASubscribeSpotsReq, ProtoOAUnsubscribeSpotsReq,
             ProtoOASpotEvent, ProtoOAExecutionEvent, ProtoOAGetTrendbarsRes,
-            ProtoOASubscribeSpotsRes
+            ProtoOASubscribeSpotsRes, ProtoOAReconcileReq, ProtoOAReconcileRes
         )
         from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
             ProtoOAOrderType, ProtoOATradeSide
@@ -70,7 +70,8 @@ try:
         'EXECUTION_EVENT': 2126,      # PROTO_OA_EXECUTION_EVENT (critical for order confirmations!)
         'ORDER_ERROR_EVENT': 2132,    # PROTO_OA_ORDER_ERROR_EVENT
         'SUBSCRIBE_SPOTS_RES': 2128,  # PROTO_OA_SUBSCRIBE_SPOTS_RES
-        'TRENDBAR_RES': 2138          # PROTO_OA_GET_TRENDBARS_RES
+        'TRENDBAR_RES': 2138,         # PROTO_OA_GET_TRENDBARS_RES
+        'RECONCILE_RES': 2125         # PROTO_OA_RECONCILE_RES (for position reconciliation)
     }
     
     CTRADER_API_AVAILABLE = True
@@ -337,6 +338,11 @@ class CTraderRealTimeTrader(BaseBroker):
                     request = ProtoOAUnsubscribeSpotsReq()
                     request.ctidTraderAccountId = kwargs.get('account_id')
                     request.symbolId.extend(kwargs.get('symbol_ids', []))
+                    return request
+            elif request_type == 'RECONCILE':
+                if globals().get('ProtoOAReconcileReq'):
+                    request = ProtoOAReconcileReq()
+                    request.ctidTraderAccountId = kwargs.get('account_id')
                     return request
                     
         except Exception as e:
@@ -659,7 +665,7 @@ class CTraderRealTimeTrader(BaseBroker):
             
             # Log message types periodically for debugging
             if sum(self._message_type_counts.values()) % 100 == 0:  # Back to normal frequency
-                logger.info(f"📨 Message stats (last 100): {dict(self._message_type_counts)}")
+                # logger.info(f"📨 Message stats (last 100): {dict(self._message_type_counts)}")
                 # Reset counts to avoid memory buildup
                 if sum(self._message_type_counts.values()) > 500:
                     self._message_type_counts.clear()
@@ -736,6 +742,18 @@ class CTraderRealTimeTrader(BaseBroker):
                     # TODO: Add specific order error handling
                 except Exception as e:
                     logger.error(f"❌ Error extracting order error event: {e}")
+                    
+            elif (message.payloadType == MESSAGE_TYPES.get('RECONCILE_RES', 2125) or
+                  message.payloadType == 2124):
+                # Handle position reconciliation response
+                logger.info(f"📊 RECEIVED RECONCILE RESPONSE - payload type: {message.payloadType}")
+                try:
+                    response = Protobuf.extract(message)
+                    logger.info(f"📊 Processing position reconciliation response")
+                    self._process_reconcile_response(response)
+                except Exception as e:
+                    logger.error(f"❌ Error processing reconcile response: {e}")
+                    traceback.print_exc()
                 
             else:
                 # Log unhandled message types to help debug missing execution events
@@ -1034,6 +1052,10 @@ class CTraderRealTimeTrader(BaseBroker):
         if hasattr(self, '_historical_data_cache'):
             logger.info("Applying cached historical data to initialized pairs...")
             self._initialize_pairs_with_cached_data()
+        
+        # Reconcile existing positions with broker
+        logger.info("📊 Reconciling existing positions with CTrader...")
+        self._reconcile_positions()
         
         # Subscribe to real-time data
         self._subscribe_to_data()
@@ -1532,10 +1554,10 @@ class CTraderRealTimeTrader(BaseBroker):
             self._spot_debug_count = 0
         self._spot_debug_count += 1
         
-        if self._spot_debug_count <= 50:  # Log first 50 spot events for debugging
-            logger.info(f"🔥 SPOT EVENT #{self._spot_debug_count}: {symbol_name} = ${price:.5f} (bid={bid}, ask={ask})")
-            if self._spot_debug_count == 50:
-                logger.info("🔥 Spot event debugging complete - future price updates will be throttled")
+        # if self._spot_debug_count <= 50:  # Log first 50 spot events for debugging
+        #     logger.info(f"🔥 SPOT EVENT #{self._spot_debug_count}: {symbol_name} = ${price:.5f} (bid={bid}, ask={ask})")
+        #     if self._spot_debug_count == 50:
+        #         logger.info("🔥 Spot event debugging complete - future price updates will be throttled")
         
         # Log price updates periodically to prove data flow
         if not hasattr(self, '_price_log_counter'):
@@ -1546,8 +1568,8 @@ class CTraderRealTimeTrader(BaseBroker):
         self._price_log_counter[symbol_name] += 1
         
         # Log every 100th price update to show data flow without spam
-        if self._price_log_counter[symbol_name] % 100 == 0:
-            logger.info(f"📈 PRICE DATA FLOW: {symbol_name} = ${price:.5f} (updates: {self._price_log_counter[symbol_name]})")
+        # if self._price_log_counter[symbol_name] % 100 == 0:
+        #     logger.info(f"📈 PRICE DATA FLOW: {symbol_name} = ${price:.5f} (updates: {self._price_log_counter[symbol_name]})")
         
         # Add to price history with duplicate prevention
         current_time = time.time()
@@ -3217,3 +3239,189 @@ class CTraderRealTimeTrader(BaseBroker):
             unrealized_pnl += pnl
         
         return portfolio_value + unrealized_pnl
+    
+    def _reconcile_positions(self):
+        """Request position reconciliation from CTrader broker"""
+        logger.info("="*60)
+        logger.info("INITIATING POSITION RECONCILIATION WITH CTRADER")
+        logger.info("="*60)
+        
+        try:
+            # Send reconcile request to get current positions from broker
+            logger.info(f"📊 Sending reconcile request for account: {self.account_id}")
+            
+            request = self._create_protobuf_request('RECONCILE', account_id=self.account_id)
+            
+            if request is None:
+                logger.error("Failed to create reconcile request")
+                return
+            
+            # Send the request
+            deferred = self.client.send(request)
+            deferred.addErrback(self._on_error)
+            
+            logger.info("📊 Reconcile request sent - waiting for response...")
+            
+            # Store flag to indicate reconciliation is in progress
+            self._reconciliation_in_progress = True
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to send position reconcile request: {e}")
+            logger.error(f"Will continue with local position tracking only")
+            traceback.print_exc()
+    
+    def _process_reconcile_response(self, response):
+        """Process reconciliation response containing actual broker positions"""
+        logger.info("="*60)
+        logger.info("PROCESSING POSITION RECONCILIATION RESPONSE")
+        logger.info("="*60)
+        
+        try:
+            self._reconciliation_in_progress = False
+            
+            # Extract positions from reconcile response
+            broker_positions = []
+            orders = []
+            
+            # Check for positions in response
+            if hasattr(response, 'position') and response.position:
+                broker_positions = response.position
+                logger.info(f"📊 Found {len(broker_positions)} positions from broker")
+            else:
+                logger.info("📊 No positions found in broker")
+            
+            # Check for orders in response  
+            if hasattr(response, 'order') and response.order:
+                orders = response.order
+                logger.info(f"📊 Found {len(orders)} pending orders from broker")
+            else:
+                logger.info("📊 No pending orders found in broker")
+            
+            # Process and convert broker positions to our format
+            restored_positions = {}
+            for pos in broker_positions:
+                try:
+                    position_info = self._convert_broker_position_to_local(pos)
+                    if position_info:
+                        pair_key = position_info['pair']
+                        restored_positions[pair_key] = position_info
+                        logger.info(f"📊 Restored position: {pair_key} | {position_info['direction']} | Entry: {position_info.get('entry_price', 'N/A')}")
+                except Exception as e:
+                    logger.warning(f"Failed to convert broker position: {e}")
+            
+            # Update our local position tracking
+            if restored_positions:
+                logger.info("="*60)
+                logger.info("UPDATING LOCAL POSITION TRACKING")
+                logger.info("="*60)
+                
+                # Clear existing positions (they should be empty anyway during startup)
+                old_count = len(self.active_positions)
+                self.active_positions.clear()
+                
+                # Add restored positions
+                for pair_key, position_info in restored_positions.items():
+                    self.active_positions[pair_key] = position_info
+                
+                logger.info(f"📊 Position reconciliation complete:")
+                logger.info(f"   Cleared {old_count} local positions")
+                logger.info(f"   Restored {len(restored_positions)} broker positions")
+                logger.info(f"   New total: {len(self.active_positions)} active positions")
+                
+                # Update state manager with restored positions
+                if hasattr(self, 'state_manager') and self.state_manager:
+                    try:
+                        logger.info("💾 Updating state manager with reconciled positions...")
+                        # Convert to state manager format
+                        state_positions = {}
+                        for pair_key, pos in self.active_positions.items():
+                            state_positions[pair_key] = {
+                                'symbol1': pos.get('symbol1', ''),
+                                'symbol2': pos.get('symbol2', ''),
+                                'direction': pos.get('direction', ''),
+                                'entry_price': pos.get('entry_price', 0),
+                                'quantity': pos.get('volume1', 0),  # Use first leg volume
+                                'entry_time': pos.get('entry_time', datetime.now().isoformat()),
+                                'pair': pair_key,
+                                'broker_position_id': pos.get('position_id', None)
+                            }
+                        
+                        # Save reconciled positions to state manager
+                        self.state_manager.save_trading_state(
+                            active_positions=state_positions,
+                            pair_states={},
+                            portfolio_data={'reconciliation_time': datetime.now().isoformat()}
+                        )
+                        logger.info("✅ State manager updated with reconciled positions")
+                    except Exception as e:
+                        logger.warning(f"Failed to update state manager: {e}")
+                
+                logger.info("="*60)
+                logger.info("POSITION RECONCILIATION COMPLETED SUCCESSFULLY")
+                logger.info("="*60)
+                logger.info(f"✅ Trading system will continue with {len(self.active_positions)} existing positions")
+                
+            else:
+                logger.info("="*60)
+                logger.info("NO EXISTING POSITIONS TO RECONCILE")
+                logger.info("="*60)
+                logger.info("✅ Trading system will start with fresh state")
+                
+        except Exception as e:
+            logger.error(f"❌ Error processing reconcile response: {e}")
+            logger.error("Trading system will continue with local tracking only")
+            traceback.print_exc()
+    
+    def _convert_broker_position_to_local(self, broker_position):
+        """Convert a broker position object to our local position format"""
+        try:
+            # Extract basic position information
+            position_id = getattr(broker_position, 'positionId', None)
+            symbol_id = getattr(broker_position, 'symbolId', None)
+            trade_side = getattr(broker_position, 'tradeSide', None)
+            volume = getattr(broker_position, 'volume', 0)
+            entry_price = getattr(broker_position, 'entryPrice', 0)
+            open_timestamp = getattr(broker_position, 'openTimestamp', None)
+            
+            if not symbol_id or not position_id:
+                logger.warning(f"Position missing required fields: symbolId={symbol_id}, positionId={position_id}")
+                return None
+            
+            # Convert symbol ID to symbol name
+            symbol_name = self.symbol_id_to_name_map.get(symbol_id)
+            if not symbol_name:
+                logger.warning(f"Unknown symbol ID: {symbol_id}")
+                return None
+            
+            # For now, we can only handle single-symbol positions
+            # Pairs positions would require additional logic to match pairs
+            logger.info(f"📊 Found broker position: {symbol_name} | {trade_side} | Volume: {volume} | Price: {entry_price}")
+            
+            # Convert to our format (simplified for single symbols)
+            direction = "LONG" if trade_side == 1 else "SHORT"  # 1=BUY, 2=SELL in cTrader
+            
+            # Try to identify if this could be part of a pairs trade
+            # This is a simplified approach - in practice, you'd need better logic
+            # to match individual positions back to pairs
+            
+            position_info = {
+                'position_id': position_id,
+                'symbol1': symbol_name,
+                'symbol2': None,  # Unknown for single positions
+                'direction': direction,
+                'volume1': volume / 100,  # Convert centilots to lots
+                'volume2': 0,
+                'entry_price': entry_price,
+                'entry_price1': entry_price,
+                'entry_price2': 0,
+                'entry_time': datetime.fromtimestamp(open_timestamp / 1000) if open_timestamp else datetime.now(),
+                'pair': symbol_name,  # Use symbol name as pair key for now
+                'status': 'open',
+                'broker_reconciled': True
+            }
+            
+            return position_info
+            
+        except Exception as e:
+            logger.error(f"Error converting broker position: {e}")
+            return None
