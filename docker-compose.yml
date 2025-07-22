@@ -1,0 +1,151 @@
+# Unified Docker Compose for Trading System
+# Works for both local development and production
+
+services:
+  trading-system:
+    build: .
+    container_name: trading-system
+    restart: unless-stopped
+    # Keep container running for script execution
+    entrypoint: ["tail", "-f", "/dev/null"]
+    ports:
+      - "${DASHBOARD_PORT:-8050}:8050"  # Dashboard
+      - "${API_PORT:-8000}:8000"        # API
+      - "${SCRIPT_MANAGER_PORT:-9000}:9000"  # Script Manager API
+    environment:
+      - TRADING_MODE=${TRADING_MODE:-live}
+      - DATA_PROVIDER=${DATA_PROVIDER:-ctrader}
+      - BROKER=${BROKER:-ctrader}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - PYTHONUNBUFFERED=1
+      - WAIT_FOR_INFLUXDB=1
+      # Dashboard configuration
+      - DASHBOARD_HOST=0.0.0.0
+      - DASHBOARD_PORT=${DASHBOARD_PORT:-8050}
+      # Override InfluxDB URLs for container networking (takes precedence over .env)
+      - INFLUXDB_URL=http://influxdb:8086
+      - TRADING_STATE_INFLUXDB_URL=http://influxdb:8086
+      - TRADING_STATE_INFLUXDB_TOKEN=${INFLUXDB_TOKEN}
+      - TRADING_STATE_INFLUXDB_ORG=${INFLUXDB_ORG:-quant-system}
+      - TRADING_STATE_INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-quant-data}
+    env_file:
+      - .env${ENV_SUFFIX}
+    volumes:
+      - ./logs:/app/logs
+      - ./backtest_reports:/app/backtest_reports
+      - ./data:/app/data
+      - ./state_fallback:/app/state_fallback
+      - ./cache:/app/cache
+      - ./config:/app/config  # Mount config directory - allows runtime modification of pairs.json and other config files
+      - ./scripts:/app/scripts  # Mount all scripts for easy access
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8050/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILES:-3}"
+
+  influxdb:
+    image: influxdb:2.7-alpine
+    container_name: influxdb
+    restart: unless-stopped
+    ports:
+      - "${INFLUXDB_PORT:-8086}:8086"
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=${INFLUXDB_ADMIN_USERNAME:-admin}
+      - DOCKER_INFLUXDB_INIT_PASSWORD=${INFLUXDB_ADMIN_PASSWORD:-defaultpassword}
+      - DOCKER_INFLUXDB_INIT_ORG=${INFLUXDB_ORG:-trading_org}
+      - DOCKER_INFLUXDB_INIT_BUCKET=${INFLUXDB_BUCKET:-trading_data}
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUXDB_TOKEN:-defaulttoken}
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+      - influxdb-config:/etc/influxdb2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8086/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILES:-3}"
+
+  # Optional Redis for advanced caching (not required for basic operation)
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    command: >
+      redis-server 
+      --appendonly yes 
+      --maxmemory ${REDIS_MAX_MEMORY:-256mb}
+      --maxmemory-policy allkeys-lru
+      --tcp-keepalive 60
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILES:-3}"
+    profiles:
+      - redis  # Only start if explicitly enabled
+
+  # Optional PostgreSQL for alternative state management
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    restart: unless-stopped
+    ports:
+      - "${TRADING_STATE_POSTGRES_PORT:-5432}:5432"
+    environment:
+      - POSTGRES_DB=${TRADING_STATE_POSTGRES_DB:-trading_states}
+      - POSTGRES_USER=${TRADING_STATE_POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${TRADING_STATE_POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${TRADING_STATE_POSTGRES_USER:-postgres}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "${LOG_MAX_SIZE:-10m}"
+        max-file: "${LOG_MAX_FILES:-3}"
+    profiles:
+      - postgres  # Only start if explicitly enabled
+
+volumes:
+  influxdb-data:
+    driver: local
+  influxdb-config:
+    driver: local
+  redis-data:
+    driver: local
+  postgres-data:
+    driver: local
+
+networks:
+  default:
+    driver: bridge

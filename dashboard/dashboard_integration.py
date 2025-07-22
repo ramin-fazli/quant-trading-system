@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 def create_dashboard(config: Optional[Dict] = None, 
-                    host: str = '127.0.0.1', 
+                    host: str = '0.0.0.0', 
                     port: int = 8050,
                     theme: str = 'dark',
                     auto_refresh: bool = True) -> DashboardManager:
@@ -56,7 +56,7 @@ def create_dashboard(config: Optional[Dict] = None,
     # Initialize dashboard
     dashboard = DashboardManager(config)
     
-    logger.info(f"Dashboard created at http://{host}:{port}")
+    logger.info(f"Dashboard created at http://{config.get('host', '0.0.0.0')}:{port}")
     return dashboard
 
 
@@ -222,7 +222,9 @@ def quick_start_dashboard(port: int = 8050,
         # Start in non-blocking mode for quick start
         dashboard.start(blocking=False)
         
-        logger.info(f"Dashboard started at http://127.0.0.1:{port}")
+        # Log with the actual configured host
+        actual_host = dashboard.config.host if hasattr(dashboard, 'config') and dashboard.config else '0.0.0.0'
+        logger.info(f"Dashboard started at http://{actual_host}:{port}")
         return dashboard
         
     except Exception as e:

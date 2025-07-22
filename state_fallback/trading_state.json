@@ -1,0 +1,84 @@
+{
+    "active_positions": {},
+    "pair_states": {
+        "BTCUSD-ETHUSD": {
+            "symbol1": "BTCUSD",
+            "symbol2": "ETHUSD",
+            "position": "none",
+            "cooldown": 0,
+            "last_update": "2025-07-21T22:12:23.400961",
+            "last_candle_time": null
+        },
+        "BTCUSD-SOLUSD": {
+            "symbol1": "BTCUSD",
+            "symbol2": "SOLUSD",
+            "position": "none",
+            "cooldown": 0,
+            "last_update": "2025-07-21T22:12:23.400961",
+            "last_candle_time": null
+        },
+        "ETHUSD-SOLUSD": {
+            "symbol1": "ETHUSD",
+            "symbol2": "SOLUSD",
+            "position": "none",
+            "cooldown": 0,
+            "last_update": "2025-07-21T22:12:23.400961",
+            "last_candle_time": null
+        },
+        "BTCUSD-XRPUSD": {
+            "symbol1": "BTCUSD",
+            "symbol2": "XRPUSD",
+            "position": "none",
+            "cooldown": 0,
+            "last_update": "2025-07-21T22:12:23.400961",
+            "last_candle_time": null
+        },
+        "ETHUSD-XRPUSD": {
+            "symbol1": "ETHUSD",
+            "symbol2": "XRPUSD",
+            "position": "none",
+            "cooldown": 0,
+            "last_update": "2025-07-21T22:12:23.400961",
+            "last_candle_time": null
+        }
+    },
+    "total_value": 100000.0,
+    "available_balance": 100000.0,
+    "total_pnl": 0.0,
+    "open_positions": 0,
+    "daily_pnl": 0.0,
+    "peak_value": 100000.0,
+    "metadata": {
+        "session_info": {
+            "data_provider": "ctrader",
+            "broker": "ctrader",
+            "strategy": "OptimizedPairsStrategy",
+            "save_time": "2025-07-21T22:12:23.400961",
+            "system_version": "EnhancedTradingSystemV3"
+        },
+        "trading_config": {
+            "pairs": [
+                "BTCUSD-ETHUSD",
+                "BTCUSD-SOLUSD",
+                "ETHUSD-SOLUSD",
+                "BTCUSD-XRPUSD",
+                "ETHUSD-XRPUSD"
+            ],
+            "log_level": "WARNING",
+            "realtime_trading": false
+        },
+        "portfolio_summary": {
+            "exists": true,
+            "active_positions_count": 0,
+            "pair_states_count": 0,
+            "last_save_time": "2025-07-21T20:04:16.625997",
+            "portfolio_peak_value": null,
+            "portfolio_trading_suspended": false,
+            "suspended_pairs": [],
+            "positions_summary": {},
+            "database_type": "file_fallback"
+        },
+        "system_status": "saved"
+    },
+    "last_save_time": "2025-07-21T22:12:23.406155"
+}

@@ -1,0 +1,218 @@
+name: Simple CI/CD to AWS EC2
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Quick Tests
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Run basic tests
+      run: |
+        python -m py_compile $(find . -name "*.py")
+        echo "✅ Python syntax check passed"
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Create deployment package
+      run: |
+        # Create deployment archive
+        tar --exclude='*.git*' --exclude='__pycache__' --exclude='*.pyc' \
+            -czf trading-system.tar.gz .
+    
+    - name: Copy files to EC2
+      uses: appleboy/scp-action@v0.1.4
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USER }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        source: "trading-system.tar.gz"
+        target: "/tmp/"
+
+    - name: Deploy on EC2
+      uses: appleboy/ssh-action@v0.1.10
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USER }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        script: |
+          set -e
+          
+          echo "🚀 Starting deployment..."
+          
+          # Create app directory
+          sudo mkdir -p /opt/trading-system
+          cd /opt/trading-system
+          
+          # Backup current version
+          if [ -d "current" ]; then
+            sudo mv current backup-$(date +%Y%m%d-%H%M%S) || true
+          fi
+          
+          # Extract new version
+          sudo tar -xzf /tmp/trading-system.tar.gz -C .
+          sudo mv trading-system-* current || sudo mkdir -p current && sudo tar -xzf /tmp/trading-system.tar.gz -C current --strip-components=0
+          
+          cd current
+          
+          # Install/update dependencies if needed
+          if ! command -v docker &> /dev/null; then
+            echo "Installing Docker..."
+            curl -fsSL https://get.docker.com -o get-docker.sh
+            sudo sh get-docker.sh
+            sudo usermod -aG docker $USER
+            sudo systemctl enable docker
+            sudo systemctl start docker
+          fi
+          
+          if ! command -v docker-compose &> /dev/null; then
+            echo "Installing Docker Compose..."
+            sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            sudo chmod +x /usr/local/bin/docker-compose
+          fi
+          
+          # Create environment file for production
+          sudo tee .env.production > /dev/null <<EOF
+          # Production Environment Configuration
+          ENVIRONMENT=production
+          TRADING_MODE=live
+          LOG_LEVEL=INFO
+
+          # Port Configuration
+          DASHBOARD_PORT=8050
+          API_PORT=8000
+          INFLUXDB_PORT=8086
+          REDIS_PORT=6379
+
+          # Environment file suffix
+          ENV_SUFFIX=.production
+
+          # No source mounting in production
+          SOURCE_MOUNT=""
+
+          # Resource Configuration
+          REDIS_MAX_MEMORY=256mb
+          LOG_MAX_SIZE=10m
+          LOG_MAX_FILES=3
+
+          # InfluxDB Configuration
+          INFLUXDB_ADMIN_USERNAME=admin
+          INFLUXDB_ADMIN_PASSWORD=${{ secrets.INFLUXDB_ADMIN_PASSWORD }}
+          INFLUXDB_ORG=${{ secrets.INFLUXDB_ORG }}
+          INFLUXDB_BUCKET=${{ secrets.INFLUXDB_BUCKET }}
+          INFLUXDB_TOKEN=${{ secrets.INFLUXDB_TOKEN }}
+          
+          # CTrader Configuration
+          CTRADER_CLIENT_ID=${{ secrets.CTRADER_CLIENT_ID }}
+          CTRADER_SECRET=${{ secrets.CTRADER_SECRET }}
+          CTRADER_ACCESS_TOKEN=${{ secrets.CTRADER_ACCESS_TOKEN }}
+          CTRADER_REFRESH_TOKEN=${{ secrets.CTRADER_REFRESH_TOKEN }}
+          
+          # MT5 Configuration
+          MT5_LOGIN=${{ secrets.MT5_LOGIN }}
+          MT5_PASSWORD=${{ secrets.MT5_PASSWORD }}
+          MT5_SERVER=${{ secrets.MT5_SERVER }}
+
+          # Redis Configuration
+          REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}
+
+          # Application Security
+          SECRET_KEY=${{ secrets.SECRET_KEY }}
+          EOF
+          
+          # Create necessary directories
+          sudo mkdir -p logs backtest_reports data state_fallback cache
+          sudo chown -R $USER:$USER logs backtest_reports data state_fallback cache
+          
+          # Stop existing containers
+          echo "Stopping existing containers..."
+          sudo docker-compose down || true
+          
+          # Build and start new containers using unified docker-compose.yml
+          echo "Building and starting containers..."
+          sudo docker-compose up --build -d
+          
+          # Wait for services to be ready
+          echo "Waiting for services to start..."
+          sleep 60
+          
+          # Check if services are running
+          if sudo docker-compose ps | grep -q "Up"; then
+            echo "✅ Deployment successful!"
+            echo "📊 Dashboard: http://$(curl -s http://checkip.amazonaws.com/):8050"
+            echo "📈 Services status:"
+            sudo docker-compose ps
+          else
+            echo "❌ Deployment failed!"
+            sudo docker-compose logs
+            exit 1
+          fi
+          
+          # Cleanup
+          rm -f /tmp/trading-system.tar.gz
+          
+          echo "🎉 Deployment completed!"
+
+    - name: Health Check
+      uses: appleboy/ssh-action@v0.1.10
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USER }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        script: |
+          # Wait a bit more for services to fully start
+          sleep 10
+          
+          # Check if dashboard is responding
+          if curl -f http://localhost:8050/health 2>/dev/null; then
+            echo "✅ Dashboard is healthy"
+          else
+            echo "⚠️ Dashboard health check failed (may still be starting)"
+          fi
+          
+          # Show final status
+          cd /opt/trading-system/current
+          echo "📊 Final container status:"
+          sudo docker-compose ps
+          
+          echo "📝 Recent logs:"
+          sudo docker-compose logs --tail=10 trading-system
+
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always()
+    
+    steps:
+    - name: Deployment Status
+      run: |
+        if [ "${{ needs.deploy.result }}" == "success" ]; then
+          echo "✅ Deployment successful!"
+          echo "🔗 Dashboard: http://${{ secrets.EC2_HOST }}:8050"
+        else
+          echo "❌ Deployment failed!"
+        fi

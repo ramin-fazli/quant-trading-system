@@ -23,6 +23,11 @@ import os
 import sys
 import time
 import logging
+import traceback
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from config.production_config import TradingConfig
 import warnings
 import threading
 import signal
@@ -88,10 +93,15 @@ if project_root not in sys.path:
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 from reporting.report_generator import generate_enhanced_report
-from config import TradingConfig, get_config, force_config_update
+from config import get_config, force_config_update
 
-# Data providers
-from data.mt5 import MT5DataManager
+# Import for type hinting - use TYPE_CHECKING to avoid runtime import issues
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from config.production_config import TradingConfig
+else:
+    # For runtime, get the actual config class
+    from config import TradingConfig
 
 # Intelligent data management
 from data.intelligent_data_manager import IntelligentDataManager, BacktestDataManager
@@ -105,6 +115,15 @@ import logging
 temp_logger = logging.getLogger(__name__)
 
 try:
+    # Data providers
+    from data.mt5 import MT5DataManager
+    # Brokers
+    from brokers.mt5 import MT5RealTimeTrader
+except ImportError:
+    mt5 = None
+    temp_logger.warning("MT5 module not available")
+
+try:
     from data.ctrader import CTraderDataManager
     CTRADER_DATA_AVAILABLE = True
     temp_logger.info("CTrader data manager available")
@@ -113,8 +132,6 @@ except ImportError:
         CTRADER_DATA_AVAILABLE = False
         temp_logger.warning("CTrader data manager not available")
 
-# Brokers
-from brokers.mt5 import MT5RealTimeTrader
 
 try:
     from brokers.ctrader import CTraderRealTimeTrader

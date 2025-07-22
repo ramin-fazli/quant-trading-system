@@ -36,9 +36,9 @@ class DashboardConfig:
     def __init__(self, config_dict: Optional[Dict] = None):
         config = config_dict or {}
         
-        # Server configuration
-        self.host = config.get('host', '127.0.0.1')
-        self.port = config.get('port', 8050)
+        # Server configuration with environment variable support
+        self.host = os.getenv('DASHBOARD_HOST', config.get('host', '0.0.0.0'))
+        self.port = int(os.getenv('DASHBOARD_PORT', config.get('port', 8050)))
         self.debug = config.get('debug', False)
         self.threaded = config.get('threaded', True)
         

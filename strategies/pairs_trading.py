@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import numpy as np
 import pandas as pd
@@ -6,10 +7,15 @@ from statsmodels.tsa.vector_ar.vecm import coint_johansen
 import warnings
 import logging
 from typing import Dict, Tuple, Any
-from config import TradingConfig
 from strategies.base_strategy import PairsStrategyInterface
-import MetaTrader5 as mt5
 import datetime
+
+# Import TradingConfig - this needs to be a runtime import to avoid type checking issues
+try:
+    from config.production_config import TradingConfig
+except ImportError:
+    # Fallback to general config import
+    from config import TradingConfig
 
 def get_config():
     """Get TradingConfig from config module, ensuring .env is loaded first."""
@@ -20,27 +26,44 @@ def get_config():
 # Only load config if run as script, not on import
 if __name__ == "__main__":
     CONFIG = get_config()
+    log_file_path = os.path.join(CONFIG.logs_dir, "pairs_trading.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file_path, encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+else:
+    CONFIG = None
+    # Setup basic logging for imported module
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler()]
+    )
 
-# Setup optimized logging with proper log file path
-CONFIG = get_config()
-log_file_path = os.path.join(CONFIG.logs_dir, "pairs_trading.log")
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_file_path, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore")
 
+# Linux-compatible MT5 import with graceful fallback
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+    print("✅ MetaTrader5 module loaded successfully")
+except ImportError:
+    mt5 = None
+    MT5_AVAILABLE = False
+    import platform
+    system_info = platform.system()
+    print(f"⚠️  MetaTrader5 not available on {system_info} - continuing without it")
 
 # === OPTIMIZED STRATEGY ENGINE ===
 class OptimizedPairsStrategy(PairsStrategyInterface):
     """Vectorized and optimized pairs trading strategy"""
     
-    def __init__(self, config: TradingConfig, data_manager = None):
+    def __init__(self, config: Any, data_manager = None):
         super().__init__(config, data_manager)
 
     def get_minimum_data_points(self) -> int:
