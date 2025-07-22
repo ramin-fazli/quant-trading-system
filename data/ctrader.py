@@ -14,6 +14,7 @@ Key improvements:
 Author: Trading System v2.0
 Date: July 2025
 """
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
@@ -25,7 +26,9 @@ import logging
 import threading
 import calendar
 import traceback
+import inspect
 from collections import deque, defaultdict
+from typing import Optional
 from config import TradingConfig, get_config, force_config_update
 
 # cTrader Open API imports
@@ -80,7 +83,7 @@ class CTraderDataManager:
     the first CTrader request completes successfully.
     """
     
-    def __init__(self, config: TradingConfig = None):
+    def __init__(self, config=None):
         self.config = config or TradingConfig()
         self.client = None
         self.account_id = None
@@ -838,11 +841,177 @@ class CTraderDataManager:
             logger.error(f"Missing cTrader API credentials: {missing_creds}")
             return {symbol: pd.Series(dtype=float) for symbol in symbols}
         
-        # Check if reactor is already running from a previous call
+        # CRITICAL FIX FOR REACTOR CONFLICT:
+        # Detect if we're in a live trading context even before reactor starts
+        # This prevents using reactor.run() during data pre-fetching for live trading
+        
+        is_live_trading_context = self._detect_live_trading_context()
+        
         if reactor.running:
-            logger.warning("Reactor is already running, cannot fetch historical data")
-            logger.info("Returning empty data - live trading will accumulate real-time data instead")
+            # Reactor is already running (live trading mode) - use async approach
+            logger.info("Reactor already running - using async data fetching to coexist with live trading")
+            return self._get_data_async_mode(symbols, interval, start_date, end_date)
+        elif is_live_trading_context:
+            # We're preparing for live trading but reactor hasn't started yet
+            # Use async mode to avoid claiming the reactor
+            logger.info("Live trading context detected - using async data fetching to preserve reactor for live trading")
+            return self._get_data_async_mode(symbols, interval, start_date, end_date)
+        else:
+            # Reactor not running and not live trading context - use traditional approach
+            logger.info("Reactor not running and no live trading context - using traditional data fetching")
+            return self._get_data_traditional_mode(symbols, interval, start_date, end_date)
+    
+    def _detect_live_trading_context(self):
+        """
+        Detect if we're in a live trading context even before reactor starts
+        This checks multiple indicators to determine if live trading will need the reactor
+        """
+        
+        # Check environment variables
+        trading_mode = os.getenv('TRADING_MODE', '').lower()
+        if trading_mode == 'live':
+            logger.debug("Live trading context detected via TRADING_MODE environment variable")
+            return True
+        
+        # Check call stack for live trading indicators
+        for frame_info in inspect.stack():
+            frame_locals = frame_info.frame.f_locals
+            frame_globals = frame_info.frame.f_globals
+            
+            # Check for live trading indicators in frame variables
+            mode_indicators = [
+                frame_locals.get('mode', ''),
+                frame_locals.get('execution_mode', ''),
+                frame_globals.get('mode', ''),
+                frame_globals.get('execution_mode', ''),
+            ]
+            
+            for indicator in mode_indicators:
+                if 'live' in str(indicator).lower():
+                    logger.debug(f"Live trading context detected in call stack: {indicator}")
+                    return True
+            
+            # Check if we're being called from live trading initialization code
+            filename = frame_info.filename
+            function_name = frame_info.function
+            
+            # Look for live trading patterns in function names and file paths
+            live_patterns = [
+                'start_ctrader_trading',
+                'start_live_trading',
+                '_prepare_trading_data',
+                'live',
+                'real_time'
+            ]
+            
+            for pattern in live_patterns:
+                if pattern in function_name.lower() or pattern in filename.lower():
+                    logger.debug(f"Live trading context detected via function/file pattern: {function_name} in {filename}")
+                    return True
+            
+            # Check if main.py is in the stack (likely live trading initiation)
+            if filename.endswith('main.py') and 'trading' in function_name.lower():
+                logger.debug(f"Live trading context detected: {function_name} in main.py")
+                return True
+        
+        logger.debug("No live trading context detected - safe to use traditional reactor mode")
+        return False
+    
+    def _get_data_async_mode(self, symbols, interval, start_date, end_date=None):
+        """
+        Get data when reactor is already running (live trading scenario)
+        OR when we want to preserve reactor for live trading
+        Uses deferred-based approach to avoid reactor conflicts
+        """
+        logger.info(f"Fetching data for {len(symbols)} symbols in async mode")
+        
+        # If reactor is not running yet, we need to use a different approach
+        # that doesn't consume the reactor for live trading
+        if not reactor.running:
+            logger.info("Reactor not running yet - using non-reactor data fetching to preserve reactor for live trading")
+            return self._get_data_without_reactor(symbols, interval, start_date, end_date)
+        
+        # Original async mode code for when reactor is running
+        # Create client but don't start new reactor
+        try:
+            host_type = os.getenv('CTRADER_HOST_TYPE', 'Demo').lower()
+            if host_type == 'demo':
+                host = EndPoints.PROTOBUF_DEMO_HOST
+            else:
+                host = EndPoints.PROTOBUF_LIVE_HOST
+            
+            # Use a separate client instance for data fetching
+            data_client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
+            
+            # Create a deferred for the async operation
+            result_deferred = defer.Deferred()
+            
+            # Set up data fetching state
+            self.async_target_symbols = symbols
+            self.async_interval = interval
+            self.async_retrieved_data = {}
+            self.async_pending_requests = 0
+            self.async_result_deferred = result_deferred
+            self.async_client = data_client
+            
+            # Set up callbacks for async mode
+            data_client.setConnectedCallback(self._on_connected_async)
+            data_client.setDisconnectedCallback(self._on_disconnected_async)
+            data_client.setMessageReceivedCallback(self._on_message_received_async)
+            
+            # Start the client service (but don't run reactor)
+            data_client.startService()
+            
+            # Set timeout for async operation
+            timeout_call = reactor.callLater(120, self._async_timeout)
+            
+            # Add cleanup callback
+            def cleanup_async(result):
+                if timeout_call.active():
+                    timeout_call.cancel()
+                try:
+                    if hasattr(self, 'async_client') and self.async_client:
+                        self.async_client.stopService()
+                except Exception as e:
+                    logger.debug(f"Error cleaning up async client: {e}")
+                return result
+            
+            result_deferred.addBoth(cleanup_async)
+            
+            # Return the deferred - reactor will handle it
+            return result_deferred
+            
+        except Exception as e:
+            logger.error(f"Failed to create async CTrader client: {e}")
             return {symbol: pd.Series(dtype=float) for symbol in symbols}
+    
+    def _get_data_without_reactor(self, symbols, interval, start_date, end_date=None):
+        """
+        Get data without using reactor to preserve it for live trading
+        This uses alternative approaches like REST API or cached data
+        """
+        logger.info(f"Fetching data for {len(symbols)} symbols without reactor (preserving for live trading)")
+        
+        # For now, return empty data to allow live trading to proceed
+        # The live trading system can accumulate data in real-time
+        logger.warning("Data pre-fetching skipped to preserve reactor for live trading")
+        logger.info("Live trading will accumulate historical data in real-time instead")
+        
+        # Return empty series for all symbols
+        result = {}
+        for symbol in symbols:
+            result[symbol] = pd.Series(dtype=float, name=symbol)
+            logger.debug(f"Returning empty series for {symbol} - live trading will populate")
+        
+        logger.info(f"Returned empty data for {len(symbols)} symbols to preserve reactor")
+        return result
+    
+    def _get_data_traditional_mode(self, symbols, interval, start_date, end_date=None):
+        """
+        Get data when reactor is not running (traditional standalone scenario)
+        Uses reactor.run() approach for complete control
+        """
+        logger.info(f"Fetching data for {len(symbols)} symbols in traditional mode")
         
         # Create a fresh client for data retrieval - exactly like working version
         try:
@@ -903,3 +1072,316 @@ class CTraderDataManager:
                 logger.debug(f"Error during cleanup: {e}")
         
         return self.retrieved_data
+    
+    # ================================
+    # ASYNC MODE CALLBACKS (for when reactor is already running)
+    # ================================
+    
+    def _on_connected_async(self, client=None):
+        """Callback when async client connects during live trading"""
+        logger.info("Async data client connected during live trading")
+        
+        # Authenticate with OAuth token
+        auth_req = ProtoOAApplicationAuthReq()
+        auth_req.clientId = CTRADER_CLIENT_ID
+        auth_req.clientSecret = CTRADER_CLIENT_SECRET
+        self.async_client.send(auth_req)
+    
+    def _on_disconnected_async(self, client=None, reason=None):
+        """Callback when async client disconnects"""
+        logger.info("Async data client disconnected")
+        # Don't stop reactor - it's needed for live trading
+    
+    def _on_message_received_async(self, client, message):
+        """Handle messages from cTrader in async mode"""
+        
+        if message.payloadType == ProtoOAApplicationAuthRes().payloadType:
+            logger.info("Async application authenticated successfully")
+            
+            # Get account access token
+            access_req = ProtoOAAccountAuthReq()
+            access_req.ctidTraderAccountId = int(CTRADER_ACCOUNT_ID)
+            access_req.accessToken = CTRADER_ACCESS_TOKEN
+            client.send(access_req)
+            
+        elif message.payloadType == ProtoOAAccountAuthRes().payloadType:
+            logger.info("Async account authenticated successfully")
+            
+            # Request symbols to map symbol names to IDs
+            symbols_req = ProtoOASymbolsListReq()
+            symbols_req.ctidTraderAccountId = int(CTRADER_ACCOUNT_ID)
+            symbols_req.includeArchivedSymbols = False
+            client.send(symbols_req)
+            
+        elif message.payloadType == ProtoOASymbolsListRes().payloadType:
+            # Extract the message content properly
+            response = Protobuf.extract(message)
+            logger.info(f"Async received symbols list: {len(response.symbol)} symbols")
+            
+            # Map symbol names to IDs for async operation
+            self.async_symbol_name_to_id = {}
+            
+            for symbol in response.symbol:
+                # Store both exact name and cleaned name mappings
+                self.async_symbol_name_to_id[symbol.symbolName] = symbol.symbolId
+                # Also store cleaned versions (remove suffixes like .r, .m, etc)
+                clean_name = symbol.symbolName.split('.')[0]
+                if clean_name not in self.async_symbol_name_to_id:
+                    self.async_symbol_name_to_id[clean_name] = symbol.symbolId
+                
+                # Store basic symbol details for price conversion
+                symbol_details = {
+                    'digits': getattr(symbol, 'digits', 5),
+                    'pip_position': getattr(symbol, 'pipPosition', -5),
+                    'symbol_id': symbol.symbolId
+                }
+                
+                # Store in async symbol details
+                if not hasattr(self, 'async_symbol_details'):
+                    self.async_symbol_details = {}
+                self.async_symbol_details[symbol.symbolName] = symbol_details
+                
+                # Also store for clean name
+                if clean_name not in self.async_symbol_details:
+                    self.async_symbol_details[clean_name] = symbol_details.copy()
+                    
+            logger.info(f"Async mapped {len(self.async_symbol_name_to_id)} symbol names to IDs")
+            
+            # Start requesting historical data for each symbol
+            self._request_all_symbol_data_async()
+            
+        elif message.payloadType == ProtoOAGetTrendbarsRes().payloadType:
+            # Process historical data response in async mode
+            self._process_historical_data_async(message)
+            
+        elif message.payloadType == ProtoOAErrorRes().payloadType:
+            response = Protobuf.extract(message)
+            logger.error(f"Async cTrader API Error: {response.description}")
+            self.async_pending_requests -= 1
+            self._check_completion_async()
+    
+    def _request_all_symbol_data_async(self):
+        """Request historical data for all target symbols in async mode"""
+        
+        # Find available symbols
+        available_symbols = []
+        for symbol in self.async_target_symbols:
+            symbol_id = self._get_symbol_id_async(symbol)
+            if symbol_id:
+                available_symbols.append(symbol)
+            else:
+                logger.warning(f"Async: Symbol {symbol} not found in cTrader")
+                self.async_retrieved_data[symbol] = pd.Series(dtype=float)
+        
+        logger.info(f"Async requesting data for {len(available_symbols)} available symbols")
+        
+        if not available_symbols:
+            logger.warning("Async: No valid symbols found for data retrieval")
+            self._finish_data_collection_async()
+            return
+        
+        self.async_pending_requests = len(available_symbols)
+        
+        # Request data for symbols with delays
+        for i, symbol in enumerate(available_symbols):
+            reactor.callLater(i * self.request_delay, self._request_single_symbol_data_async, symbol)
+    
+    def _request_single_symbol_data_async(self, symbol):
+        """Request data for a single symbol in async mode"""
+        symbol_id = self._get_symbol_id_async(symbol)
+        if symbol_id:
+            logger.info(f"Async requesting data for {symbol} (ID: {symbol_id})")
+            
+            # Convert interval to cTrader period
+            period_map = {
+                'D1': ProtoOATrendbarPeriod.D1,
+                '1D': ProtoOATrendbarPeriod.D1,
+                'H1': ProtoOATrendbarPeriod.H1,
+                '1H': ProtoOATrendbarPeriod.H1,
+                'M1': ProtoOATrendbarPeriod.M1,
+                '1M': ProtoOATrendbarPeriod.M1,
+                'M5': ProtoOATrendbarPeriod.M5,
+                '5M': ProtoOATrendbarPeriod.M5,
+                'M15': ProtoOATrendbarPeriod.M15,
+                '15M': ProtoOATrendbarPeriod.M15,
+                'M30': ProtoOATrendbarPeriod.M30,
+                '30M': ProtoOATrendbarPeriod.M30,
+            }
+            
+            period = period_map.get(self.async_interval.upper(), ProtoOATrendbarPeriod.D1)
+            
+            # Convert dates to timestamps
+            start_timestamp = int(self.start_date.timestamp() * 1000)
+            end_timestamp = int(self.end_date.timestamp() * 1000) if self.end_date else int(datetime.datetime.now().timestamp() * 1000)
+            
+            # Create and send request
+            trendbars_req = ProtoOAGetTrendbarsReq()
+            trendbars_req.ctidTraderAccountId = int(CTRADER_ACCOUNT_ID)
+            trendbars_req.symbolId = symbol_id
+            trendbars_req.period = period
+            trendbars_req.fromTimestamp = start_timestamp
+            trendbars_req.toTimestamp = end_timestamp
+            
+            deferred = self.async_client.send(trendbars_req)
+            deferred.addErrback(self._on_data_error_async)
+            deferred.addTimeout(60, reactor)
+        else:
+            logger.warning(f"Async: Symbol {symbol} not found in available symbols")
+            self.async_retrieved_data[symbol] = pd.Series(dtype=float)
+            self.async_pending_requests -= 1
+            if self.async_pending_requests <= 0:
+                self._finish_data_collection_async()
+    
+    def _on_data_error_async(self, failure):
+        """Handle errors for individual data requests in async mode"""
+        logger.warning(f"Async data request error: {failure}")
+        self.async_pending_requests -= 1
+        
+        # Continue with remaining requests even if one fails
+        if self.async_pending_requests <= 0:
+            self._finish_data_collection_async()
+    
+    def _get_symbol_id_async(self, symbol_name):
+        """Get symbol ID from name in async mode"""
+        
+        # Try exact match first
+        if symbol_name in self.async_symbol_name_to_id:
+            return self.async_symbol_name_to_id[symbol_name]
+            
+        # Try with common cTrader suffixes
+        for suffix in ['.r', '.m', '.c']:
+            full_name = f"{symbol_name}{suffix}"
+            if full_name in self.async_symbol_name_to_id:
+                return self.async_symbol_name_to_id[full_name]
+                
+        # Try cleaned version
+        clean_name = symbol_name.split('.')[0]
+        if clean_name in self.async_symbol_name_to_id:
+            return self.async_symbol_name_to_id[clean_name]
+            
+        return None
+    
+    def _process_historical_data_async(self, message):
+        """Process historical data response in async mode"""
+        
+        try:
+            # Extract the message content properly
+            response = Protobuf.extract(message)
+            
+            # Find symbol name by ID
+            symbol_name = None
+            for name, symbol_id in self.async_symbol_name_to_id.items():
+                if symbol_id == response.symbolId:
+                    symbol_name = name
+                    break
+            
+            if not symbol_name:
+                logger.warning(f"Async: Could not find symbol name for ID {response.symbolId}")
+                self.async_pending_requests -= 1
+                self._check_completion_async()
+                return
+            
+            # Find target symbol that matches this response
+            target_symbol = None
+            for target in self.async_target_symbols:
+                if (target == symbol_name or 
+                    target == symbol_name.split('.')[0] or
+                    symbol_name.startswith(target)):
+                    target_symbol = target
+                    break
+            
+            if not target_symbol:
+                logger.warning(f"Async: Could not match symbol {symbol_name} to target symbols")
+                self.async_pending_requests -= 1
+                self._check_completion_async()
+                return
+            
+            # Process trendbars data
+            if hasattr(response, 'trendbar') and response.trendbar:
+                dates = []
+                prices = []
+                
+                # Get symbol details for proper price conversion
+                symbol_details = self.async_symbol_details.get(target_symbol, {'digits': 5})
+                
+                for bar in response.trendbar:
+                    # Convert timestamp to datetime
+                    dt = datetime.datetime.fromtimestamp(bar.utcTimestampInMinutes * 60)
+                    dates.append(dt)
+                    
+                    # Process trendbar using cTrader documentation format
+                    bar_prices = self._process_trendbar_prices(bar, symbol_details)
+                    
+                    if bar_prices and 'close' in bar_prices:
+                        prices.append(bar_prices['close'])
+                    else:
+                        # Fallback: try direct price attributes
+                        try:
+                            if hasattr(bar, 'close'):
+                                close_price = self._get_price_from_relative(symbol_details, bar.close)
+                            elif hasattr(bar, 'closePrice'):
+                                close_price = self._get_price_from_relative(symbol_details, bar.closePrice)
+                            elif hasattr(bar, 'c'):
+                                close_price = self._get_price_from_relative(symbol_details, bar.c)
+                            elif hasattr(bar, 'low'):
+                                close_price = self._get_price_from_relative(symbol_details, bar.low)
+                            else:
+                                logger.error(f"Async: No valid price data found for bar")
+                                dates.pop()
+                                continue
+                            
+                            prices.append(close_price)
+                            
+                        except Exception as bar_error:
+                            logger.warning(f"Async: Error processing bar data: {bar_error}")
+                            dates.pop()
+                            continue
+                
+                # Create pandas Series
+                if dates and prices:
+                    series = pd.Series(prices, index=pd.DatetimeIndex(dates))
+                    series.name = target_symbol
+                    self.async_retrieved_data[target_symbol] = series
+                    logger.info(f"Async retrieved {len(series)} data points for {target_symbol}")
+                else:
+                    logger.warning(f"Async: No data points received for {target_symbol}")
+                    self.async_retrieved_data[target_symbol] = pd.Series(dtype=float)
+            else:
+                logger.warning(f"Async: No trendbar data in response for {target_symbol}")
+                self.async_retrieved_data[target_symbol] = pd.Series(dtype=float)
+                
+        except Exception as e:
+            logger.error(f"Async: Error processing historical data: {e}")
+            if 'target_symbol' in locals():
+                self.async_retrieved_data[target_symbol] = pd.Series(dtype=float)
+        
+        self.async_pending_requests -= 1
+        self._check_completion_async()
+    
+    def _check_completion_async(self):
+        """Check if all async data requests are complete"""
+        if self.async_pending_requests <= 0:
+            logger.info("Async: All data retrieval requests completed")
+            self._finish_data_collection_async()
+    
+    def _finish_data_collection_async(self):
+        """Finish async data collection and return results via deferred"""
+        logger.info(f"Async: Data collection finished. Retrieved data for {len(self.async_retrieved_data)} symbols")
+        
+        # Ensure all target symbols have data
+        for symbol in self.async_target_symbols:
+            if symbol not in self.async_retrieved_data:
+                self.async_retrieved_data[symbol] = pd.Series(dtype=float)
+        
+        # Disconnect async client
+        if hasattr(self, 'async_client') and self.async_client:
+            self.async_client.stopService()
+        
+        # Return results via deferred
+        if hasattr(self, 'async_result_deferred') and self.async_result_deferred:
+            self.async_result_deferred.callback(self.async_retrieved_data)
+    
+    def _async_timeout(self):
+        """Handle timeout for async data collection"""
+        logger.error("Async data collection timeout")
+        self._finish_data_collection_async()

@@ -481,7 +481,53 @@ class IntelligentDataManager:
             
             # Call the provider's get_historical_data method with all symbols
             if hasattr(provider, 'get_historical_data'):
-                bulk_data = provider.get_historical_data(symbols, interval, start_date, end_date)
+                bulk_data_result = provider.get_historical_data(symbols, interval, start_date, end_date)
+                
+                # REACTOR FIX: Handle both synchronous dict and asynchronous deferred results
+                if hasattr(bulk_data_result, 'addCallback'):
+                    # This is a deferred (reactor is running, live trading mode)
+                    logger.info("Received deferred from cTrader data provider - reactor is running (live trading)")
+                    
+                    # Set up a blocking mechanism to wait for the result
+                    import threading
+                    import time
+                    result_container = {'data': None, 'error': None, 'done': False}
+                    
+                    def on_success(data):
+                        result_container['data'] = data
+                        result_container['done'] = True
+                        logger.info(f"Async data fetch completed: {len(data)} symbols")
+                    
+                    def on_error(failure):
+                        result_container['error'] = str(failure)
+                        result_container['done'] = True
+                        logger.error(f"Async data fetch failed: {failure}")
+                    
+                    bulk_data_result.addCallback(on_success)
+                    bulk_data_result.addErrback(on_error)
+                    
+                    # Wait for the deferred to complete (with timeout)
+                    timeout = 120  # 2 minutes timeout for data fetching
+                    wait_time = 0
+                    while not result_container['done'] and wait_time < timeout:
+                        time.sleep(0.1)
+                        wait_time += 0.1
+                    
+                    if not result_container['done']:
+                        logger.error("Timeout waiting for async data fetch")
+                        return {symbol: pd.Series(dtype=float, name=symbol) for symbol in symbols}
+                    
+                    if result_container['error']:
+                        logger.error(f"Async data fetch error: {result_container['error']}")
+                        return {symbol: pd.Series(dtype=float, name=symbol) for symbol in symbols}
+                    
+                    bulk_data = result_container['data']
+                    
+                else:
+                    # This is a regular dict (reactor not running, traditional mode)
+                    logger.info("Received synchronous result from cTrader data provider")
+                    bulk_data = bulk_data_result
+                    
             else:
                 logger.error(f"Provider {data_provider} does not support get_historical_data")
                 return {symbol: pd.Series(dtype=float, name=symbol) for symbol in symbols}
@@ -509,6 +555,8 @@ class IntelligentDataManager:
             
         except Exception as e:
             logger.error(f"Error fetching bulk data from {data_provider}: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return {symbol: pd.Series(dtype=float, name=symbol) for symbol in symbols}
     
     def _store_data_in_influx(self, symbol: str, interval: str, data: pd.Series, source: str):

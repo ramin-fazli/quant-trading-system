@@ -9,6 +9,12 @@ This engine promotes separation of concerns by delegating all strategy
 decisions to the provided strategy instance while handling broker-specific
 functionality like API communication, order execution, and risk management.
 
+Position Closing Implementation:
+- Uses ProtoOAClosePositionReq for proper position closing when position IDs are available
+- Falls back to market orders when position IDs are not available
+- Tracks position IDs from execution events to enable proper closing
+- Supports both pair trading and individual position management
+
 Author: Trading System v3.0
 Date: July 2025
 """
@@ -47,7 +53,7 @@ try:
             ProtoOAAccountAuthReq, ProtoOAAccountAuthRes,
             ProtoOASymbolsListReq, ProtoOASymbolsListRes,
             ProtoOASymbolByIdReq, ProtoOASymbolByIdRes,
-            ProtoOANewOrderReq, ProtoOASubscribeSpotsReq, ProtoOAUnsubscribeSpotsReq,
+            ProtoOANewOrderReq, ProtoOAClosePositionReq, ProtoOASubscribeSpotsReq, ProtoOAUnsubscribeSpotsReq,
             ProtoOASpotEvent, ProtoOAExecutionEvent, ProtoOAGetTrendbarsRes,
             ProtoOASubscribeSpotsRes, ProtoOAReconcileReq, ProtoOAReconcileRes
         )
@@ -90,7 +96,7 @@ class CTraderRealTimeTrader(BaseBroker):
     strategy that implements the BaseStrategy interface.
     """
     
-    def __init__(self, config: TradingConfig, data_manager, strategy: BaseStrategy = None):
+    def __init__(self, data_manager, config=None, strategy: BaseStrategy = None):
         if not CTRADER_API_AVAILABLE:
             raise ImportError("cTrader Open API not available. Install with: pip install ctrader-open-api")
         
@@ -119,6 +125,7 @@ class CTraderRealTimeTrader(BaseBroker):
         self.subscribed_symbols = set()
         self.execution_requests = {}
         self.pending_pair_trades = {}  # Track pending pair trades awaiting execution confirmation
+        self.pending_close_positions = {}  # Track pending close position requests
         self.next_order_id = 1
         self.symbols_map = {}
         self.symbol_id_to_name_map = {}
@@ -128,6 +135,29 @@ class CTraderRealTimeTrader(BaseBroker):
         self._last_strategy_check = {}  # Track last strategy check time per pair
         self._min_check_interval = 0.5  # Minimum 500ms between strategy checks per pair
         self._price_update_buffer = defaultdict(lambda: deque(maxlen=10))  # Buffer recent updates
+        
+        # CTrader API Rate Limiting (50 req/sec for non-historical, 5 req/sec for historical)
+        self._non_historical_rate_limiter = {
+            'max_requests': 50,  # CTrader limit: 50 req/sec for non-historical
+            'time_window': 1.0,  # 1 second window
+            'requests': deque(maxlen=50),  # Track timestamps of last 50 requests
+            'queue': deque(),  # Queue for pending requests
+            'processing': False
+        }
+        self._historical_rate_limiter = {
+            'max_requests': 5,   # CTrader limit: 5 req/sec for historical
+            'time_window': 1.0,  # 1 second window
+            'requests': deque(maxlen=5),   # Track timestamps of last 5 requests
+            'queue': deque(),   # Queue for pending historical requests
+            'processing': False
+        }
+        
+        # Enhanced subscription management for large-scale deployments
+        self._subscription_batch_size = 8    # Conservative batch size to avoid timeouts
+        self._subscription_delay = 0.25      # 250ms delay between batches (4 batches/sec max)
+        self._subscription_retry_delay = 2.0 # 2 second delay for retries
+        self._max_concurrent_subscriptions = 200  # Limit concurrent subscriptions
+        self._subscription_health_check_interval = 30  # Check subscription health every 30s
         
         # Trading threads
         self.trading_thread = None
@@ -173,15 +203,15 @@ class CTraderRealTimeTrader(BaseBroker):
                 inverse_symbol = f"{to_currency}{from_currency}"
                 
                 for symbol in [direct_symbol, inverse_symbol]:
-                    if symbol in self.trader.spot_prices:
-                        spot_data = self.trader.spot_prices[symbol]
-                        if 'bid' in spot_data and 'ask' in spot_data:
-                            bid = spot_data['bid']
-                            ask = spot_data['ask']
-                            if symbol == direct_symbol:
-                                return (bid + ask) / 2
-                            else:
-                                return 1 / ((bid + ask) / 2)
+                    spot_price = self.trader._get_spot_price(symbol)
+                    spot_data = self.trader._get_spot_price_data(symbol)
+                    if spot_data and 'bid' in spot_data and 'ask' in spot_data:
+                        bid = spot_data['bid']
+                        ask = spot_data['ask']
+                        if symbol == direct_symbol:
+                            return (bid + ask) / 2
+                        else:
+                            return 1 / ((bid + ask) / 2)
                 
                 logger.warning(f"FX rate not found for {from_currency}->{to_currency}, using 1.0")
                 return 1.0
@@ -202,8 +232,8 @@ class CTraderRealTimeTrader(BaseBroker):
         """Get current prices for symbols from spot prices"""
         prices = {}
         for symbol in symbols:
-            if symbol in self.spot_prices:
-                spot_data = self.spot_prices[symbol]
+            spot_data = self._get_spot_price_data(symbol)
+            if spot_data:
                 if 'bid' in spot_data and 'ask' in spot_data:
                     # Use mid price for current price
                     prices[symbol] = (spot_data['bid'] + spot_data['ask']) / 2
@@ -213,8 +243,8 @@ class CTraderRealTimeTrader(BaseBroker):
     
     def get_current_price(self, symbol: str) -> Optional[float]:
         """Get current price for a single symbol"""
-        if symbol in self.spot_prices:
-            spot_data = self.spot_prices[symbol]
+        spot_data = self._get_spot_price_data(symbol)
+        if spot_data:
             if 'bid' in spot_data and 'ask' in spot_data:
                 # Use mid price for current price
                 return (spot_data['bid'] + spot_data['ask']) / 2
@@ -226,10 +256,9 @@ class CTraderRealTimeTrader(BaseBroker):
         """Get bid/ask prices for symbols from spot prices"""
         bid_ask_prices = {}
         for symbol in symbols:
-            if symbol in self.spot_prices:
-                spot_data = self.spot_prices[symbol]
-                if 'bid' in spot_data and 'ask' in spot_data:
-                    bid_ask_prices[symbol] = (spot_data['bid'], spot_data['ask'])
+            spot_data = self._get_spot_price_data(symbol)
+            if spot_data and 'bid' in spot_data and 'ask' in spot_data:
+                bid_ask_prices[symbol] = (spot_data['bid'], spot_data['ask'])
         return bid_ask_prices
     
     def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
@@ -276,8 +305,13 @@ class CTraderRealTimeTrader(BaseBroker):
         return cache
     
     def _execute_trade(self, signal: TradingSignal) -> bool:
-        """Execute a trading signal"""
+        """Execute a trading signal with intelligent readiness checking"""
         try:
+            # Check if we have sufficient price feeds for this trade
+            if not self._is_ready_for_trading(signal.pair_str):
+                logger.warning(f"Trading not ready for {signal.pair_str} - insufficient price feeds")
+                return False
+                
             if signal.signal_type in ['OPEN_LONG', 'OPEN_SHORT']:
                 return self._execute_pair_trade(signal.pair_str, signal.signal_type.replace('OPEN_', ''))
             elif signal.signal_type == 'CLOSE':
@@ -288,6 +322,58 @@ class CTraderRealTimeTrader(BaseBroker):
         except Exception as e:
             logger.error(f"Error executing trade signal: {e}")
             return False
+    
+    def _is_ready_for_trading(self, pair_str: str) -> bool:
+        """Check if system is ready for trading this specific pair"""
+        
+        if '-' not in pair_str:
+            logger.warning(f"Invalid pair format: {pair_str}")
+            return False
+            
+        symbol1, symbol2 = pair_str.split('-', 1)
+        required_symbols = [symbol1, symbol2]
+        
+        # Check if we have real-time prices for both symbols
+        missing_prices = []
+        for symbol in required_symbols:
+            if not self._get_spot_price(symbol):
+                missing_prices.append(symbol)
+        
+        if missing_prices:
+            logger.warning(f"Missing spot prices for {pair_str}")
+            logger.warning(f"  Required: {required_symbols}")
+            logger.warning(f"  Available spot prices ({len(self.spot_prices)}): {list(self.spot_prices.keys())[:10]}{'...' if len(self.spot_prices) > 10 else ''}")
+            logger.warning(f"  Missing: {missing_prices}")
+            logger.warning(f"  Subscribed symbols: {sorted(self.subscribed_symbols)}")
+            
+            # Auto-retry subscription for missing symbols if not too many
+            if len(missing_prices) <= 2:
+                logger.info(f"🔄 Auto-retrying subscription for missing symbols: {missing_prices}")
+                for symbol in missing_prices:
+                    if symbol in self.subscribed_symbols:
+                        # Already subscribed but no price - re-subscribe
+                        self.subscribed_symbols.discard(symbol)
+                    self._subscribe_to_spot_prices_with_retry(symbol)
+            
+            return False
+        
+        # Check if prices are recent (not stale)
+        current_time = time.time()
+        stale_symbols = []
+        
+        for symbol in required_symbols:
+            price_data = self._get_spot_price_data(symbol)
+            if price_data:
+                last_update = price_data.get('timestamp', 0)
+                if current_time - last_update > 30:  # Price older than 30 seconds
+                    stale_symbols.append(symbol)
+        
+        if stale_symbols:
+            logger.warning(f"Stale price data for {pair_str}: {stale_symbols}")
+            return False
+            
+        logger.debug(f"✅ Trading ready for {pair_str} - all price feeds available and current")
+        return True
     
     def _create_protobuf_request(self, request_type: str, **kwargs):
         """Safely create protobuf requests with fallback handling"""
@@ -343,6 +429,13 @@ class CTraderRealTimeTrader(BaseBroker):
                 if globals().get('ProtoOAReconcileReq'):
                     request = ProtoOAReconcileReq()
                     request.ctidTraderAccountId = kwargs.get('account_id')
+                    return request
+            elif request_type == 'CLOSE_POSITION':
+                if globals().get('ProtoOAClosePositionReq'):
+                    request = ProtoOAClosePositionReq()
+                    request.ctidTraderAccountId = kwargs.get('account_id')
+                    request.positionId = kwargs.get('position_id')
+                    request.volume = kwargs.get('volume')
                     return request
                     
         except Exception as e:
@@ -957,7 +1050,7 @@ class CTraderRealTimeTrader(BaseBroker):
                             #     converted_value = 0.01  # Default to 0.01 lots step
                             
                             symbol_details[local_name] = converted_value
-                            logger.info(f"Converted {local_name} from {value} centilots to {converted_value} lots")
+                            # logger.info(f"Converted {local_name} from {value} centilots to {converted_value} lots")
                         # elif local_name == 'lot_size':
                         #     converted_value = value / 100.0
                         #     # lot_size represents contract size and should remain large
@@ -1384,7 +1477,7 @@ class CTraderRealTimeTrader(BaseBroker):
             logger.debug(traceback.format_exc())
     
     def _subscribe_to_data(self):
-        """Subscribe to real-time data for all symbols required by the strategy"""
+        """Subscribe to real-time data with intelligent rate limiting and priority management"""
         # Get required symbols from strategy
         required_symbols = self.strategy.get_required_symbols()
         
@@ -1395,67 +1488,435 @@ class CTraderRealTimeTrader(BaseBroker):
         if unavailable_symbols:
             logger.warning(f"Some required symbols not available: {unavailable_symbols}")
         
-        logger.info(f"🔔 Starting spot price subscriptions for {len(available_symbols)} symbols...")
-        logger.info(f"🔔 Available symbols: {sorted(available_symbols)}")
+        logger.info(f"🔔 Starting intelligent spot price subscriptions for {len(available_symbols)} symbols...")
         
-        # Subscribe to spot prices for available symbols
-        successful_subscriptions = 0
-        for symbol in available_symbols:
-            if self._subscribe_to_spot_prices(symbol):
-                successful_subscriptions += 1
+        # Implement priority-based subscription with rate limiting
+        self._subscribe_with_priority(available_symbols)
         
-        logger.info(f"✅ Real-time data subscriptions: {successful_subscriptions}/{len(available_symbols)} symbols")
-        logger.info(f"✅ Trading system ready with {self.strategy.__class__.__name__}")
+        # Start subscription monitoring
+        self._start_subscription_monitoring()
+        
+        logger.info(f"✅ Subscription system started with {self.strategy.__class__.__name__}")
         if unavailable_symbols:
-            logger.info("📝 Note: Some symbols were unavailable and skipped")
+            logger.info("� Note: Some symbols were unavailable and skipped")
+    
+    def _subscribe_with_priority(self, symbols):
+        """Enhanced priority-based subscription with strict CTrader API rate limiting"""
+        if not symbols:
+            return
         
-        # Add debug info about current spot prices
-        logger.info(f"🔍 Current spot prices count: {len(self.spot_prices)}")
-        if len(self.spot_prices) > 0:
-            logger.info(f"🔍 Available spot prices: {list(self.spot_prices.keys())}")
-        else:
-            logger.warning("⚠️ No spot prices available yet - waiting for cTrader price updates...")
+        logger.info(f"🚀 Starting intelligent subscription for {len(symbols)} symbols")
+        logger.info(f"   CTrader API limits: {self._non_historical_rate_limiter['max_requests']} req/sec")
+        logger.info(f"   Batch size: {self._subscription_batch_size}, Delay: {self._subscription_delay}s")
+        
+        # Get symbol IDs for all symbols
+        available_symbol_ids = {}
+        for symbol in symbols:
+            symbol_id = self.symbols_map.get(symbol)
+            if symbol_id:
+                available_symbol_ids[symbol] = symbol_id
+            else:
+                logger.warning(f"Symbol {symbol} not found in symbols map")
+        
+        if not available_symbol_ids:
+            logger.warning("No valid symbol IDs found for subscription")
+            return
+        
+        # Determine priority groups
+        high_priority_symbols = set(self._get_priority_symbols(symbols))
+        normal_priority_symbols = symbols - high_priority_symbols
+        
+        logger.info(f"   High priority symbols: {len(high_priority_symbols)}")
+        logger.info(f"   Normal priority symbols: {len(normal_priority_symbols)}")
+        
+        # Subscribe with priority and rate limiting
+        if high_priority_symbols:
+            self._batch_subscribe_with_rate_limiting(high_priority_symbols, priority='HIGH')
+        
+        if normal_priority_symbols:
+            # Delay normal priority to let high priority establish first
+            def delayed_normal_subscription():
+                time.sleep(2.0)  # 2 second delay
+                self._batch_subscribe_with_rate_limiting(normal_priority_symbols, priority='NORMAL')
+            
+            threading.Thread(target=delayed_normal_subscription, daemon=True).start()
+    
+    def _get_priority_symbols(self, symbols):
+        """Identify high-priority symbols based on trading activity and major currencies"""
+        priority_symbols = set()
+        
+        # Priority 1: Symbols from active trading pairs
+        if hasattr(self, 'pair_states') and self.pair_states:
+            active_pairs = list(self.pair_states.keys())[:10]  # Top 10 pairs
+            for pair_str in active_pairs:
+                if '-' in pair_str:
+                    s1, s2 = pair_str.split('-', 1)
+                    if s1 in symbols:
+                        priority_symbols.add(s1)
+                    if s2 in symbols:
+                        priority_symbols.add(s2)
+        
+        # Priority 2: Major currency pairs and symbols
+        major_symbols = {
+            'EURUSD', 'GBPUSD', 'USDJPY', 'USDCHF', 'USDCAD', 'AUDUSD', 'NZDUSD',
+            'EURJPY', 'GBPJPY', 'EURGBP', 'XAUUSD', 'XAGUSD', 'US30', 'SPX500', 'NAS100'
+        }
+        priority_symbols.update(major_symbols.intersection(symbols))
+        
+        # Priority 3: Any USD pairs
+        for symbol in symbols:
+            if 'USD' in symbol and len(priority_symbols) < 30:
+                priority_symbols.add(symbol)
+        
+        # Limit priority symbols to reasonable number
+        priority_list = list(priority_symbols)[:25]
+        
+        logger.info(f"🎯 Priority symbols identified: {sorted(priority_list)}")
+        return priority_list
+    
+    def _batch_subscribe_with_rate_limiting(self, symbols, priority="NORMAL"):
+        """Subscribe to symbols in batches with strict CTrader API rate limiting"""
+        if not symbols:
+            return
+        
+        # Convert symbols to IDs
+        symbol_ids = []
+        symbol_names = []
+        for symbol in symbols:
+            symbol_id = self.symbols_map.get(symbol)
+            if symbol_id:
+                symbol_ids.append(symbol_id)
+                symbol_names.append(symbol)
+        
+        if not symbol_ids:
+            logger.warning(f"No valid symbol IDs found for {priority} priority subscription")
+            return
+        
+        # Calculate batching strategy for rate limits
+        # CTrader allows 50 req/sec, use conservative approach
+        batch_size = min(self._subscription_batch_size, len(symbol_ids))
+        batches = [symbol_ids[i:i + batch_size] for i in range(0, len(symbol_ids), batch_size)]
+        
+        # Calculate safe delay: ensure we don't exceed 40 req/sec (80% of limit)
+        max_safe_rate = self._non_historical_rate_limiter['max_requests'] * 0.8  # 40 req/sec
+        min_delay = 1.0 / max_safe_rate  # Minimum delay between requests
+        batch_delay = max(self._subscription_delay, min_delay * batch_size)
+        
+        total_time = len(batches) * batch_delay
+        
+        logger.info(f"📦 {priority} batching strategy:")
+        logger.info(f"   Total symbols: {len(symbol_ids)}")
+        logger.info(f"   Batch size: {batch_size}")
+        logger.info(f"   Number of batches: {len(batches)}")
+        logger.info(f"   Delay between batches: {batch_delay:.2f}s")
+        logger.info(f"   Estimated completion time: {total_time:.1f}s")
+        
+        def process_subscription_batches():
+            successful_subscriptions = 0
+            
+            for batch_num, batch_symbol_ids in enumerate(batches, 1):
+                try:
+                    # Use rate-limited subscription
+                    self._subscribe_to_spot_prices_with_rate_limiting(batch_symbol_ids, priority)
+                    
+                    # Update tracking
+                    for symbol_id in batch_symbol_ids:
+                        symbol_name = self.symbol_id_to_name_map.get(symbol_id)
+                        if symbol_name:
+                            self.subscribed_symbols.add(symbol_name)
+                            successful_subscriptions += 1
+                    
+                    logger.info(f"� {priority} Batch {batch_num}/{len(batches)} queued: {len(batch_symbol_ids)} symbols")
+                    
+                    # Wait before next batch (except for last batch)
+                    if batch_num < len(batches):
+                        time.sleep(batch_delay)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing {priority} batch {batch_num}: {e}")
+                    continue
+            
+            logger.info(f"✅ {priority} batch subscription completed: {successful_subscriptions}/{len(symbol_ids)} symbols queued")
+        
+        # Process in background thread
+        thread = threading.Thread(target=process_subscription_batches, daemon=True)
+        thread.start()
+        
+        return thread
+        
+        logger.info(f"✅ {priority} Batch {batch_num}: {successful}/{len(batch_symbols)} subscriptions sent")
+    
+    def _subscribe_to_spot_prices_with_retry(self, symbol):
+        """Subscribe to spot prices with intelligent retry logic and rate limiting"""
+        
+        if symbol not in self.symbols_map:
+            logger.warning(f"Symbol {symbol} not found in symbols_map")
+            return False
+        
+        if symbol in self.subscribed_symbols:
+            logger.debug(f"Already subscribed to {symbol}")
+            return True
+        
+        symbol_id = self.symbols_map[symbol]
+        
+        def make_subscription_request():
+            try:
+                request = self._create_protobuf_request('SUBSCRIBE_SPOTS',
+                                                       account_id=self.account_id,
+                                                       symbol_ids=[symbol_id])
+                
+                if request is None:
+                    logger.error(f"Failed to create subscription request for {symbol}")
+                    return
+                
+                deferred = self.client.send(request)
+                deferred.addErrback(self._on_subscription_error_enhanced, symbol)
+                deferred.addTimeout(10, reactor)
+                
+                self.subscribed_symbols.add(symbol)
+                logger.debug(f"📡 Subscription request queued for {symbol}")
+                
+            except Exception as e:
+                logger.error(f"Error creating subscription request for {symbol}: {e}")
+        
+        # Use rate limiting queue
+        self._queue_request(make_subscription_request, 'non_historical', 'NORMAL')
+        return True
+    
+    def _on_subscription_error(self, failure):
+        """Handle subscription errors with enhanced context"""
+        logger.error(f"Subscription error: {failure}")
+        
+        # Update subscription stats
+        if hasattr(self, 'subscription_stats'):
+            self.subscription_stats['failed_responses'] += 1
+    
+    def _on_subscription_error_enhanced(self, failure, symbol):
+        """Enhanced subscription error handling with symbol context"""
+        logger.error(f"Subscription error for {symbol}: {failure}")
+        
+        # Remove from subscribed symbols to allow retry
+        if symbol in self.subscribed_symbols:
+            self.subscribed_symbols.discard(symbol)
+        
+        # Update stats
+        if hasattr(self, 'subscription_stats'):
+            self.subscription_stats['failed_responses'] += 1
+        
+        # Schedule retry for important symbols
+        if self._is_high_priority_symbol(symbol):
+            logger.info(f"🔄 Scheduling retry for high-priority symbol {symbol}")
+            reactor.callLater(self._subscription_retry_delay, 
+                            self._subscribe_to_spot_prices_with_retry, symbol)
+    
+    def _is_high_priority_symbol(self, symbol):
+        """Check if symbol is high priority and should be retried"""
+        high_priority_patterns = ['USD', 'EUR', 'GBP', 'JPY', 'XAU', 'SPX', 'NAS', 'US30']
+        return any(pattern in symbol for pattern in high_priority_patterns)
+    
+    def _start_subscription_monitoring(self):
+        """Start comprehensive subscription monitoring with health checks"""
+        
+        # Initialize enhanced subscription tracking
+        if not hasattr(self, 'subscription_stats'):
+            self.subscription_stats = {
+                'total_requested': 0,
+                'successful_responses': 0,
+                'failed_responses': 0,
+                'active_feeds': 0,
+                'last_check': time.time(),
+                'price_update_counts': defaultdict(int),
+                'stale_feeds': set(),
+                'retry_queue': deque(),
+                'health_score': 100.0
+            }
+        
+        logger.info("🔍 Starting enhanced subscription monitoring system")
+        logger.info(f"   Health check interval: {self._subscription_health_check_interval}s")
+        logger.info(f"   Max concurrent subscriptions: {self._max_concurrent_subscriptions}")
+        
+        # Schedule first health check
+        reactor.callLater(10.0, self._monitor_subscriptions)  # Start after 10 seconds
+        logger.info("🔍 Subscription monitoring started")
+    
+    def _monitor_subscriptions(self):
+        """Enhanced subscription monitoring with health scoring and intelligent recovery"""
+        try:
+            current_time = time.time()
+            active_feeds = len(self.spot_prices)
+            subscribed_count = len(self.subscribed_symbols)
+            required_symbols = self.strategy.get_required_symbols()
+            
+            # Update basic stats
+            self.subscription_stats.update({
+                'active_feeds': active_feeds,
+                'last_check': current_time,
+                'subscription_efficiency': (active_feeds / max(subscribed_count, 1)) * 100
+            })
+            
+            # Check for missing price feeds
+            missing_feeds = []
+            stale_feeds = []
+            healthy_feeds = 0
+            
+            for symbol in required_symbols:
+                if symbol not in self.spot_prices:
+                    missing_feeds.append(symbol)
+                else:
+                    # Check if feed is stale
+                    price_data = self._get_spot_price_data(symbol)
+                    if price_data and 'timestamp' in price_data:
+                        feed_age = current_time - price_data['timestamp']
+                        if feed_age > 60:  # Consider stale if no update for 60 seconds
+                            stale_feeds.append(symbol)
+                        else:
+                            healthy_feeds += 1
+                    else:
+                        stale_feeds.append(symbol)
+            
+            # Calculate health score
+            total_required = len(required_symbols)
+            if total_required > 0:
+                health_score = (healthy_feeds / total_required) * 100
+                self.subscription_stats['health_score'] = health_score
+            else:
+                health_score = 100.0
+            
+            # Log comprehensive status
+            if hasattr(self, '_monitor_log_counter'):
+                self._monitor_log_counter += 1
+            else:
+                self._monitor_log_counter = 1
+            
+            # Calculate coverage percentage for logging
+            coverage_percent = (active_feeds / len(required_symbols)) * 100 if required_symbols else 0
+            
+            # Log brief status every 60 seconds (every 2 cycles since we run every 30s)
+            if self._monitor_log_counter % 2 == 0:
+                logger.info(f"📊 Subscription Status: {active_feeds} active price feeds")
+                logger.info(f"📊 Total subscribed symbols: {subscribed_count}")
+                logger.info(f"� Price feed coverage: {coverage_percent:.1f}% ({active_feeds}/{len(required_symbols)})")
+                
+                if stale_feeds:
+                    logger.warning(f"⚠️ {len(stale_feeds)} stale feeds detected - some may need re-subscription")
+            
+            # Log detailed status every 10 cycles (5 minutes with 30s interval)
+            if self._monitor_log_counter % 10 == 0:
+                logger.info("=" * 60)
+                logger.info("📊 SUBSCRIPTION HEALTH REPORT")
+                logger.info("-" * 60)
+                logger.info(f"Required symbols      : {total_required}")
+                logger.info(f"Subscribed symbols    : {subscribed_count}")
+                logger.info(f"Active price feeds    : {active_feeds}")
+                logger.info(f"Healthy feeds         : {healthy_feeds}")
+                logger.info(f"Missing feeds         : {len(missing_feeds)}")
+                logger.info(f"Stale feeds           : {len(stale_feeds)}")
+                logger.info(f"Health score          : {health_score:.1f}%")
+                logger.info(f"Subscription efficiency: {self.subscription_stats['subscription_efficiency']:.1f}%")
+                
+                # Show rate limiter status
+                non_hist_queue_size = len(self._non_historical_rate_limiter['queue'])
+                hist_queue_size = len(self._historical_rate_limiter['queue'])
+                if non_hist_queue_size > 0 or hist_queue_size > 0:
+                    logger.info(f"Rate limiter queues   : Non-hist={non_hist_queue_size}, Hist={hist_queue_size}")
+                
+                logger.info("=" * 60)
+            
+            # Handle missing feeds - retry with rate limiting
+            if missing_feeds and health_score < 90:  # Only if health is below 90%
+                retry_count = min(len(missing_feeds), 10)  # Limit retries per cycle
+                symbols_to_retry = missing_feeds[:retry_count]
+                
+                logger.warning(f"🔄 Health score {health_score:.1f}% - retrying {retry_count} missing feeds")
+                
+                for symbol in symbols_to_retry:
+                    if symbol in self.subscribed_symbols:
+                        # Already subscribed but no data - re-subscribe
+                        self.subscribed_symbols.discard(symbol)
+                    
+                    # Use rate-limited retry
+                    self._subscribe_to_spot_prices_with_retry(symbol)
+            
+            # Handle stale feeds
+            if stale_feeds and len(stale_feeds) > 5:  # Only if many stale feeds
+                logger.warning(f"⚠️ {len(stale_feeds)} stale feeds detected - some may need re-subscription")
+                
+                # Re-subscribe to worst stale feeds
+                stale_retry_count = min(len(stale_feeds), 5)
+                for symbol in stale_feeds[:stale_retry_count]:
+                    # logger.info(f"🔄 Re-subscribing to stale feed: {symbol}")
+                    self.subscribed_symbols.discard(symbol)
+                    self._subscribe_to_spot_prices_with_retry(symbol)
+            
+            # Emergency recovery if health is critically low
+            if health_score < 50 and active_feeds < 10:
+                logger.error("🚨 CRITICAL: Subscription health below 50% - initiating emergency recovery")
+                logger.error(f"   Only {active_feeds} active feeds out of {total_required} required")
+                
+                # Clear subscription tracking and restart core subscriptions
+                priority_symbols = self._get_priority_symbols(set(required_symbols))[:10]
+                logger.error(f"🚨 Emergency re-subscription for {len(priority_symbols)} critical symbols")
+                
+                for symbol in priority_symbols:
+                    self.subscribed_symbols.discard(symbol)
+                    self._subscribe_to_spot_prices_with_retry(symbol)
+            
+            # Schedule next monitoring cycle
+            reactor.callLater(self._subscription_health_check_interval, self._monitor_subscriptions)
+            
+        except Exception as e:
+            logger.error(f"Error in subscription monitoring: {e}")
+            # Still schedule next cycle even if this one failed
+            reactor.callLater(self._subscription_health_check_interval, self._monitor_subscriptions)
+        
+    
+    def _retry_missing_subscriptions(self, missing_symbols):
+        """Retry subscriptions for symbols that should have feeds but don't"""
+        
+        logger.info(f"🔄 Retrying subscriptions for {len(missing_symbols)} symbols")
+        
+        # Remove from subscribed set to allow retry
+        for symbol in missing_symbols:
+            self.subscribed_symbols.discard(symbol)
+        
+        # Retry with conservative batching
+        self._batch_subscribe(missing_symbols, batch_size=3, delay=0.5, priority="RETRY")
     
     def _subscribe_to_spot_prices(self, symbol):
-        """Subscribe to real-time price updates for a symbol"""
-        if symbol in self.symbols_map and symbol not in self.subscribed_symbols:
-            symbol_id = self.symbols_map[symbol]
-            
-            logger.info(f"🔔 Subscribing to spot prices for {symbol} (ID: {symbol_id})")
-            
-            request = self._create_protobuf_request('SUBSCRIBE_SPOTS',
-                                                   account_id=self.account_id,
-                                                   symbol_ids=[symbol_id])
-            
-            if request is None:
-                logger.error(f"Failed to create subscription request for {symbol}")
-                return False
-            
-            try:
-                deferred = self.client.send(request)
-                deferred.addErrback(self._on_subscription_error, symbol)
-                self.subscribed_symbols.add(symbol)
-                logger.debug(f"Subscription request sent for {symbol}")
-                return True
-            except Exception as e:
-                logger.error(f"Error subscribing to {symbol}: {e}")
-                return False
-        else:
-            if symbol not in self.symbols_map:
-                logger.warning(f"Symbol {symbol} not found in symbols_map")
-            elif symbol in self.subscribed_symbols:
-                logger.debug(f"Already subscribed to {symbol}")
-        return False
+        """Subscribe to real-time price updates for a symbol (legacy method)"""
+        return self._subscribe_to_spot_prices_with_retry(symbol)
     
-    def _on_subscription_error(self, failure, symbol=None):
-        """Handle subscription errors"""
-        # Check if this is a timeout error (common with cTrader API when subscribing to many symbols)
-        if hasattr(failure, 'value') and 'TimeoutError' in str(failure.value):
-            # Timeout errors are expected behavior when subscribing to many symbols
-            logger.debug(f"Subscription timeout for {symbol or 'unknown symbol'} (normal cTrader API behavior)")
+    def _on_subscription_error_enhanced(self, failure, symbol=None):
+        """Enhanced subscription error handling with intelligent categorization"""
+        
+        error_type = str(type(failure.value).__name__)
+        error_msg = str(failure.value)
+        
+        # Categorize error types
+        if 'TimeoutError' in error_type:
+            # Timeout is normal with CTrader API under heavy load
+            logger.debug(f"Subscription timeout for {symbol} (normal CTrader behavior)")
+            
+            # Don't treat timeouts as failures - they often succeed anyway
+            if hasattr(self, 'subscription_stats'):
+                self.subscription_stats.setdefault('timeout_count', 0)
+                self.subscription_stats['timeout_count'] += 1
+                
+        elif 'ConnectionLost' in error_type or 'ConnectionRefused' in error_type:
+            # Connection issues - more serious
+            logger.warning(f"Connection issue for {symbol}: {error_type}")
+            
+        elif 'RateLimitExceeded' in error_msg or 'TooManyRequests' in error_msg:
+            # Rate limiting - back off
+            logger.warning(f"Rate limit hit for {symbol} - backing off")
+            
         else:
-            # Log actual errors that aren't timeouts
-            logger.warning(f"Subscription error for {symbol or 'unknown symbol'}: {failure}")
+            # Other errors - log for investigation
+            logger.warning(f"Subscription error for {symbol}: {error_type} - {error_msg}")
+        
+        # Update error stats
+        if hasattr(self, 'subscription_stats'):
+            self.subscription_stats['failed_responses'] = self.subscription_stats.get('failed_responses', 0) + 1
     
     def _process_trendbar_data(self, message):
         """Process trendbar data (not used for real-time trading but needed for handler)"""
@@ -1481,6 +1942,142 @@ class CTraderRealTimeTrader(BaseBroker):
         digits = symbol_details.get('digits', 5)  # Default to 5 digits if not available
         actual_price = relative_price / 100000.0
         return round(actual_price, digits)
+    
+    def _get_spot_price(self, symbol: str) -> Optional[float]:
+        """Get the current spot price for a symbol"""
+        if symbol not in self.spot_prices:
+            return None
+            
+        price_data = self.spot_prices[symbol]
+        
+        # Handle both old format (float) and new format (dict)
+        if isinstance(price_data, dict):
+            return price_data.get('price')
+        else:
+            # Legacy format - just return the float
+            return price_data
+    
+    def _get_spot_price_data(self, symbol: str) -> Optional[dict]:
+        """Get the full spot price data for a symbol"""
+        if symbol not in self.spot_prices:
+            return None
+            
+        price_data = self.spot_prices[symbol]
+        
+        # Handle both old format (float) and new format (dict)
+        if isinstance(price_data, dict):
+            return price_data
+        else:
+            # Legacy format - convert to dict
+            return {
+                'price': price_data,
+                'bid': price_data,
+                'ask': price_data,
+                'timestamp': time.time(),
+                'symbol_id': None,
+                'update_count': 1
+            }
+    
+    def _can_make_request(self, request_type='non_historical'):
+        """Check if we can make a request without exceeding rate limits"""
+        limiter = self._non_historical_rate_limiter if request_type == 'non_historical' else self._historical_rate_limiter
+        current_time = time.time()
+        
+        # Remove old requests outside the time window
+        while limiter['requests'] and current_time - limiter['requests'][0] > limiter['time_window']:
+            limiter['requests'].popleft()
+        
+        # Check if we can make another request
+        return len(limiter['requests']) < limiter['max_requests']
+    
+    def _record_request(self, request_type='non_historical'):
+        """Record that a request was made"""
+        limiter = self._non_historical_rate_limiter if request_type == 'non_historical' else self._historical_rate_limiter
+        limiter['requests'].append(time.time())
+    
+    def _queue_request(self, request_func, request_type='non_historical', priority='NORMAL'):
+        """Queue a request to be processed respecting rate limits"""
+        limiter = self._non_historical_rate_limiter if request_type == 'non_historical' else self._historical_rate_limiter
+        
+        # Add to queue with priority
+        request_item = {
+            'func': request_func,
+            'priority': priority,
+            'timestamp': time.time(),
+            'request_type': request_type
+        }
+        
+        # Insert based on priority (HIGH first, then NORMAL, then LOW)
+        if priority == 'HIGH':
+            limiter['queue'].appendleft(request_item)
+        else:
+            limiter['queue'].append(request_item)
+        
+        # Start processing if not already running
+        if not limiter['processing']:
+            self._start_request_processor(request_type)
+    
+    def _start_request_processor(self, request_type):
+        """Start processing queued requests respecting rate limits"""
+        def process_requests():
+            limiter = self._non_historical_rate_limiter if request_type == 'non_historical' else self._historical_rate_limiter
+            limiter['processing'] = True
+            
+            try:
+                while limiter['queue']:
+                    if self._can_make_request(request_type):
+                        # Process next request
+                        request_item = limiter['queue'].popleft()
+                        try:
+                            request_item['func']()
+                            self._record_request(request_type)
+                            logger.debug(f"Processed {request_type} request (priority: {request_item['priority']})")
+                        except Exception as e:
+                            logger.error(f"Error processing {request_type} request: {e}")
+                    else:
+                        # Wait before checking again
+                        wait_time = 0.1 if request_type == 'non_historical' else 0.5
+                        time.sleep(wait_time)
+                        continue
+                    
+                    # Small delay between requests to be conservative
+                    time.sleep(0.02 if request_type == 'non_historical' else 0.2)
+                        
+            except Exception as e:
+                logger.error(f"Error in request processor for {request_type}: {e}")
+            finally:
+                limiter['processing'] = False
+        
+        # Run processor in background thread
+        threading.Thread(target=process_requests, daemon=True).start()
+    
+    def _subscribe_to_spot_prices_with_rate_limiting(self, symbol_ids, priority='NORMAL'):
+        """Subscribe to spot prices with intelligent rate limiting"""
+        def make_subscription_request():
+            try:
+                if not symbol_ids:
+                    return
+                
+                request = self._create_protobuf_request('SUBSCRIBE_SPOTS',
+                                                       account_id=self.account_id,
+                                                       symbol_ids=symbol_ids)
+                
+                if request is None:
+                    logger.error(f"Failed to create subscription request for symbols: {symbol_ids}")
+                    return
+                
+                deferred = self.client.send(request)
+                deferred.addErrback(self._on_subscription_error)
+                
+                # Log subscription attempt
+                symbol_names = [self.symbol_id_to_name_map.get(sid, f'ID:{sid}') for sid in symbol_ids]
+                logger.info(f"📡 Subscribed to {len(symbol_ids)} symbols with {priority} priority: {symbol_names}")
+                
+            except Exception as e:
+                logger.error(f"Error creating subscription request: {e}")
+        
+        # Queue the subscription request
+        self._queue_request(make_subscription_request, 'non_historical', priority)
     
     def _process_spot_event(self, event):
         """Process real-time price updates according to cTrader documentation"""
@@ -1526,7 +2123,12 @@ class CTraderRealTimeTrader(BaseBroker):
             # Try to use previous price if available
             if symbol_name in self.spot_prices:
                 # Keep existing price if we have partial update
-                existing_price = self.spot_prices[symbol_name]
+                existing_price_data = self.spot_prices[symbol_name]
+                if isinstance(existing_price_data, dict):
+                    existing_price = existing_price_data.get('price', 0)
+                else:
+                    existing_price = existing_price_data
+                    
                 if not hasattr(self, '_incomplete_price_debug_count'):
                     self._incomplete_price_debug_count = {}
                 if symbol_name not in self._incomplete_price_debug_count:
@@ -1545,9 +2147,24 @@ class CTraderRealTimeTrader(BaseBroker):
                     logger.debug(f"Missing or invalid bid/ask for {symbol_name}: bid={bid}, ask={ask}")
                 return
         
-        # Store mid price
+        # Store price with timestamp for freshness checking
+        current_time = time.time()
         price = (bid + ask) / 2
-        self.spot_prices[symbol_name] = price
+        
+        # Enhanced price storage with metadata
+        self.spot_prices[symbol_name] = {
+            'price': price,
+            'bid': bid,
+            'ask': ask,
+            'timestamp': current_time,
+            'symbol_id': symbol_id,
+            'update_count': getattr(self, '_price_update_count', {}).get(symbol_name, 0) + 1
+        }
+        
+        # Update counter
+        if not hasattr(self, '_price_update_count'):
+            self._price_update_count = {}
+        self._price_update_count[symbol_name] = self._price_update_count.get(symbol_name, 0) + 1
         
         # Log first few price updates to confirm data flow
         if not hasattr(self, '_spot_debug_count'):
@@ -1716,7 +2333,7 @@ class CTraderRealTimeTrader(BaseBroker):
             try:
                 if self._strategy_calc_log[pair_str] % 10 == 0:
                     logger.info(f"🔍 STRATEGY CALCULATION: Computing indicators for {pair_str} (calc #{self._strategy_calc_log[pair_str]})")
-                    logger.info(f"   Data points: {len(series1)} x {len(series2)}")
+                    # logger.info(f"   Data points: {len(series1)} x {len(series2)}")
                     logger.info(f"   Latest prices: {state['symbol1']}=${series1.iloc[-1]:.5f}, {state['symbol2']}=${series2.iloc[-1]:.5f}")
                 
                 indicators = self.strategy.calculate_indicators(market_data)
@@ -1728,7 +2345,7 @@ class CTraderRealTimeTrader(BaseBroker):
                 # Log indicator values periodically with enhanced debugging
                 if self._strategy_calc_log[pair_str] % 10 == 0:
                     logger.info(f"✅ STRATEGY CALCULATION: Indicators calculated for {pair_str}")
-                    logger.info(f"   Available indicators: {list(indicators.keys())}")
+                    # logger.info(f"   Available indicators: {list(indicators.keys())}")
                     
                     if 'zscore' in indicators:
                         zscore_val = indicators['zscore'].iloc[-1] if hasattr(indicators['zscore'], 'iloc') else indicators['zscore']
@@ -1804,6 +2421,11 @@ class CTraderRealTimeTrader(BaseBroker):
                         if pending_trade['pair_str'] == pair_str:
                             has_pending_trade = True
                             break
+                
+                # RACE CONDITION FIX: Include pending trades in total position count
+                # This prevents exceeding MAX_OPEN_POSITIONS when multiple signals occur simultaneously
+                pending_count = len(getattr(self, 'pending_pair_trades', {}))
+                total_position_count = current_position_count + pending_count
             
             # Check if trading conditions are suitable
             if not getattr(latest_signal, 'suitable', True):
@@ -1849,16 +2471,27 @@ class CTraderRealTimeTrader(BaseBroker):
                 return
             
             # Check portfolio limits before entry (only for new positions)
-            if current_position_count >= self.config.max_open_positions:
+            # RACE CONDITION FIX: Use total count including pending trades
+            if total_position_count >= self.config.max_open_positions:
+                if not hasattr(self, '_limit_log_throttle'):
+                    self._limit_log_throttle = {}
+                if pair_str not in self._limit_log_throttle:
+                    self._limit_log_throttle[pair_str] = 0
+                self._limit_log_throttle[pair_str] += 1
+                
+                # Log occasionally to avoid spam
+                if self._limit_log_throttle[pair_str] % 10 == 1:
+                    signal_type = "LONG" if getattr(latest_signal, 'long_entry', False) else "SHORT"
+                    logger.info(f"[PORTFOLIO LIMIT] Skipping {signal_type} for {pair_str} - at limit: {current_position_count} active + {pending_count} pending = {total_position_count}/{self.config.max_open_positions}")
                 return
             
             # Process entry signals using strategy output
             # CRITICAL FIX: This section should only be reached if no active/pending positions exist
             if getattr(latest_signal, 'short_entry', False):
-                logger.info(f"[SHORT ENTRY] Signal for {pair_str} - Positions: {current_position_count}/{self.config.max_open_positions}")
+                logger.info(f"[SHORT ENTRY] Signal for {pair_str} - Positions: {current_position_count} active + {pending_count} pending = {total_position_count}/{self.config.max_open_positions}")
                 self._execute_pair_trade(pair_str, 'SHORT')
             elif getattr(latest_signal, 'long_entry', False):
-                logger.info(f"[LONG ENTRY] Signal for {pair_str} - Positions: {current_position_count}/{self.config.max_open_positions}")
+                logger.info(f"[LONG ENTRY] Signal for {pair_str} - Positions: {current_position_count} active + {pending_count} pending = {total_position_count}/{self.config.max_open_positions}")
                 self._execute_pair_trade(pair_str, 'LONG')
                     
         except Exception as e:
@@ -1881,9 +2514,13 @@ class CTraderRealTimeTrader(BaseBroker):
         """Execute a pairs trade"""
         # Use lock to prevent race conditions when checking/updating positions
         with self._update_lock:
-            # Double-check position limits to prevent race conditions
-            if len(self.active_positions) >= self.config.max_open_positions:
-                logger.warning(f"[PORTFOLIO LIMIT] Cannot open {direction} position for {pair_str} - already at max positions: {len(self.active_positions)}/{self.config.max_open_positions}")
+            # Double-check position limits including pending trades to prevent race conditions
+            current_active = len(self.active_positions)
+            current_pending = len(getattr(self, 'pending_pair_trades', {}))
+            total_positions = current_active + current_pending
+            
+            if total_positions >= self.config.max_open_positions:
+                logger.warning(f"[PORTFOLIO LIMIT] Cannot open {direction} position for {pair_str} - at limit: {current_active} active + {current_pending} pending = {total_positions}/{self.config.max_open_positions}")
                 return False
             
             # CRITICAL FIX: Check if pair already has an active position
@@ -1914,8 +2551,12 @@ class CTraderRealTimeTrader(BaseBroker):
             logger.warning(f"  Subscribed symbols: {self.subscribed_symbols}")
             return False
         
-        price1 = self.spot_prices[s1]
-        price2 = self.spot_prices[s2]
+        price1 = self._get_spot_price(s1)
+        price2 = self._get_spot_price(s2)
+        
+        if price1 is None or price2 is None:
+            logger.error(f"Failed to get prices for {pair_str}: {s1}={price1}, {s2}={price2}")
+            return False
         
         # Get symbol details for volume calculation
         details1 = self.symbol_details.get(s1)
@@ -2005,7 +2646,7 @@ class CTraderRealTimeTrader(BaseBroker):
         return False
     
     def _close_pair_position(self, pair_str: str) -> bool:
-        """Close a pair position"""
+        """Close a pair position using ProtoOAClosePositionReq when position IDs are available"""
         if pair_str not in self.active_positions:
             return False
         
@@ -2015,27 +2656,239 @@ class CTraderRealTimeTrader(BaseBroker):
         s1, s2 = position['symbol1'], position['symbol2']
         direction = position['direction']
         volume1, volume2 = position['volume1'], position['volume2']
+        position_id1 = position.get('position_id1')
+        position_id2 = position.get('position_id2')
         
-        # Determine closing sides (opposite of opening)
-        if direction == 'LONG':
-            close_side1 = self._get_trade_side_value("SELL")  # Sell to close long position
-            close_side2 = self._get_trade_side_value("BUY")   # Buy to close short position
+        logger.info(f"🔄 Closing {direction} position for {pair_str}")
+        logger.info(f"   Position IDs: {s1}={position_id1}, {s2}={position_id2}")
+        
+        success_count = 0
+        
+        # Try to close using ProtoOAClosePositionReq if position IDs are available
+        if position_id1:
+            if self._close_position_by_id(s1, position_id1, volume1):
+                success_count += 1
+            else:
+                logger.warning(f"Failed to close position {position_id1} for {s1}, falling back to market order")
+                # Fallback to market order
+                close_side1 = self._get_trade_side_value("SELL") if direction == 'LONG' else self._get_trade_side_value("BUY")
+                if self._send_market_order(s1, close_side1, volume1, is_close=True):
+                    success_count += 1
         else:
-            close_side1 = self._get_trade_side_value("BUY")   # Buy to close short position  
-            close_side2 = self._get_trade_side_value("SELL")  # Sell to close long position
+            logger.info(f"No position ID available for {s1}, using market order to close")
+            close_side1 = self._get_trade_side_value("SELL") if direction == 'LONG' else self._get_trade_side_value("BUY")
+            if self._send_market_order(s1, close_side1, volume1, is_close=True):
+                success_count += 1
         
-        # Close positions with the same volumes as opening
-        self._send_market_order(s1, close_side1, volume1, is_close=True)
-        self._send_market_order(s2, close_side2, volume2, is_close=True)
+        if position_id2:
+            if self._close_position_by_id(s2, position_id2, volume2):
+                success_count += 1
+            else:
+                logger.warning(f"Failed to close position {position_id2} for {s2}, falling back to market order")
+                # Fallback to market order
+                close_side2 = self._get_trade_side_value("BUY") if direction == 'LONG' else self._get_trade_side_value("SELL")
+                if self._send_market_order(s2, close_side2, volume2, is_close=True):
+                    success_count += 1
+        else:
+            logger.info(f"No position ID available for {s2}, using market order to close")
+            close_side2 = self._get_trade_side_value("BUY") if direction == 'LONG' else self._get_trade_side_value("SELL")
+            if self._send_market_order(s2, close_side2, volume2, is_close=True):
+                success_count += 1
         
-        # Clean up position state with thread safety
-        with self._update_lock:
-            if pair_str in self.active_positions:
-                del self.active_positions[pair_str]
-            state['position'] = None
-            state['cooldown'] = self.config.cooldown_bars
+        # Clean up position state with thread safety if at least one close order was sent
+        if success_count > 0:
+            with self._update_lock:
+                if pair_str in self.active_positions:
+                    del self.active_positions[pair_str]
+                state['position'] = None
+                state['cooldown'] = self.config.cooldown_bars
+            
+            logger.info(f"Initiated close for {direction} position on {pair_str} ({success_count}/2 orders sent)")
+            logger.info(f"Portfolio now: {len(self.active_positions)}/{self.config.max_open_positions}")
+            return True
+        else:
+            logger.error(f"Failed to send any close orders for {pair_str}")
+            return False
+    
+    def _close_position_by_id(self, symbol: str, position_id: int, volume: float) -> bool:
+        """Close a position using ProtoOAClosePositionReq"""
+        logger.info(f"🎯 Closing position by ID: {symbol} (Position ID: {position_id}, Volume: {volume:.5f} lots)")
         
-        logger.info(f"Closed {direction} position for {pair_str} - Portfolio now: {len(self.active_positions)}/{self.config.max_open_positions}")
+        if symbol not in self.symbols_map:
+            logger.error(f"Symbol {symbol} not found")
+            return False
+        
+        # Convert volume to cTrader centilots format
+        if symbol == 'XRPUSD':
+            broker_volume = int(round(volume * 10000))
+        else:
+            broker_volume = int(round(volume * 100))
+        
+        # Ensure minimum volume
+        broker_volume = max(broker_volume, 1)
+        
+        request = self._create_protobuf_request('CLOSE_POSITION',
+                                              account_id=self.account_id,
+                                              position_id=position_id,
+                                              volume=broker_volume)
+        
+        if request is None:
+            logger.error(f"Failed to create close position request for {symbol}")
+            return False
+        
+        try:
+            deferred = self.client.send(request)
+            deferred.addErrback(self._on_close_position_error, symbol, position_id)
+            
+            # Track the close position request differently since cTrader generates its own order IDs
+            if not hasattr(self, 'pending_close_positions'):
+                self.pending_close_positions = {}
+            
+            self.pending_close_positions[position_id] = {
+                'symbol': symbol,
+                'position_id': position_id,
+                'volume': volume,
+                'timestamp': datetime.now(),
+                'is_close': True
+            }
+            
+            logger.info(f"📨 CLOSE POSITION REQUEST SENT - Symbol: {symbol}, Position ID: {position_id}, Volume: {volume:.5f} lots ({broker_volume} centilots)")
+            logger.info(f"📨 Tracking close position request for Position ID: {position_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error sending close position request for {symbol}: {e}")
+            return False
+    
+    def _on_close_position_error(self, failure, symbol: str, position_id: int):
+        """Handle close position request errors"""
+        logger.error(f"Close position error for {symbol} (Position ID: {position_id}): {failure}")
+        # You might want to implement retry logic or fallback to market orders here
+    
+    def _handle_close_position_execution(self, position_id: int, event):
+        """Handle execution events for close position requests"""
+        execution_type = getattr(event, 'executionType', None)
+        order_status = getattr(event, 'order', None)
+        if order_status:
+            order_status = getattr(order_status, 'orderStatus', None)
+        
+        close_request = self.pending_close_positions.get(position_id)
+        if not close_request:
+            logger.warning(f"⚠️ Close position execution event for unknown position ID: {position_id}")
+            return
+        
+        symbol = close_request['symbol']
+        volume = close_request['volume']
+        
+        logger.info(f"🎯 CLOSE POSITION EXECUTION EVENT:")
+        logger.info(f"   Position ID: {position_id}")
+        logger.info(f"   Symbol: {symbol}")
+        logger.info(f"   Volume: {volume:.5f} lots")
+        logger.info(f"   Execution Type: {execution_type}")
+        logger.info(f"   Order Status: {order_status} ({self._get_order_status_name(order_status) if order_status else 'None'})")
+        
+        # Handle different execution types
+        if execution_type == 'ORDER_FILLED' or execution_type == 3:  # 3 = ORDER_FILLED
+            logger.info(f"✅ Position {position_id} for {symbol} CLOSED successfully")
+            del self.pending_close_positions[position_id]
+        elif execution_type == 'ORDER_ACCEPTED' or execution_type == 2:  # 2 = ORDER_ACCEPTED
+            logger.info(f"📝 Close position request for {symbol} (Position ID: {position_id}) ACCEPTED")
+        elif execution_type in ['ORDER_REJECTED', 'ORDER_EXPIRED', 'ORDER_CANCELLED'] or execution_type in [4, 5, 6]:
+            logger.error(f"❌ Close position request for {symbol} (Position ID: {position_id}) FAILED: {execution_type}")
+            del self.pending_close_positions[position_id]
+        
+        # Also check order status as secondary indicator
+        if order_status == 2:  # ORDER_STATUS_FILLED
+            logger.info(f"✅ Position {position_id} for {symbol} status: FILLED")
+            if position_id in self.pending_close_positions:
+                del self.pending_close_positions[position_id]
+        elif order_status in [3, 4, 5]:  # REJECTED, EXPIRED, CANCELLED
+            logger.error(f"❌ Position {position_id} for {symbol} status: {self._get_order_status_name(order_status)}")
+            if position_id in self.pending_close_positions:
+                del self.pending_close_positions[position_id]
+    
+    def get_position_ids_status(self) -> dict:
+        """Get status of position ID tracking for debugging"""
+        status = {
+            'total_positions': len(self.active_positions),
+            'positions_with_ids': 0,
+            'positions_without_ids': 0,
+            'pending_close_positions': len(getattr(self, 'pending_close_positions', {})),
+            'position_details': {}
+        }
+        
+        for pair_str, position in self.active_positions.items():
+            pos_id1 = position.get('position_id1')
+            pos_id2 = position.get('position_id2')
+            
+            has_id1 = pos_id1 is not None
+            has_id2 = pos_id2 is not None
+            
+            if has_id1 and has_id2:
+                status['positions_with_ids'] += 1
+            else:
+                status['positions_without_ids'] += 1
+            
+            status['position_details'][pair_str] = {
+                'symbol1': position['symbol1'],
+                'symbol2': position['symbol2'],
+                'position_id1': pos_id1,
+                'position_id2': pos_id2,
+                'has_both_ids': has_id1 and has_id2
+            }
+        
+        # Add information about pending close positions
+        if hasattr(self, 'pending_close_positions'):
+            status['pending_close_details'] = {}
+            for position_id, close_request in self.pending_close_positions.items():
+                status['pending_close_details'][position_id] = {
+                    'symbol': close_request['symbol'],
+                    'volume': close_request['volume'],
+                    'timestamp': close_request['timestamp'].isoformat()
+                }
+        
+        return status
+    
+    def validate_close_position_implementation(self) -> bool:
+        """Validate that ProtoOAClosePositionReq implementation is working"""
+        logger.info("🔍 Validating ProtoOAClosePositionReq implementation...")
+        
+        # Check if protobuf class is available
+        if not globals().get('ProtoOAClosePositionReq'):
+            logger.error("❌ ProtoOAClosePositionReq not available in protobuf imports")
+            return False
+        
+        # Test creating a close position request
+        try:
+            test_request = self._create_protobuf_request('CLOSE_POSITION',
+                                                        account_id=12345,
+                                                        position_id=67890,
+                                                        volume=100)
+            if test_request is None:
+                logger.error("❌ Failed to create test ProtoOAClosePositionReq")
+                return False
+            
+            logger.info("✅ ProtoOAClosePositionReq creation test passed")
+        except Exception as e:
+            logger.error(f"❌ Error creating test ProtoOAClosePositionReq: {e}")
+            return False
+        
+        # Check position ID tracking in active positions
+        position_status = self.get_position_ids_status()
+        logger.info(f"📊 Position ID tracking status:")
+        logger.info(f"   Total positions: {position_status['total_positions']}")
+        logger.info(f"   Positions with IDs: {position_status['positions_with_ids']}")
+        logger.info(f"   Positions without IDs: {position_status['positions_without_ids']}")
+        logger.info(f"   Pending close positions: {position_status['pending_close_positions']}")
+        
+        # Test close position tracking initialization
+        if not hasattr(self, 'pending_close_positions'):
+            logger.error("❌ pending_close_positions not initialized")
+            return False
+        else:
+            logger.info("✅ Close position tracking initialized")
+        
+        logger.info("✅ ProtoOAClosePositionReq implementation validation complete")
         return True
     
     def _send_market_order(self, symbol: str, side, volume: Optional[float] = None, is_close: bool = False) -> Optional[str]:
@@ -2100,10 +2953,9 @@ class CTraderRealTimeTrader(BaseBroker):
             return None
         
         if is_close:
-            # For closing positions, we need to use ProtoOAClosePositionReq instead
-            # For now, we'll create a regular market order in the opposite direction
-            # TODO: Implement proper position ID tracking for ProtoOAClosePositionReq
-            logger.debug(f"Using market order to close position for {symbol} (fallback method)")
+            # Note: This is a fallback method for closing positions when position IDs are not available
+            # The preferred method is to use _close_position_by_id() with ProtoOAClosePositionReq
+            logger.debug(f"Using market order to close position for {symbol} (fallback method - no position ID)")
         
         # Convert side to readable string for logging
         buy_side_value = self._get_trade_side_value("BUY")
@@ -2178,7 +3030,16 @@ class CTraderRealTimeTrader(BaseBroker):
         
         if not client_order_id:
             logger.warning(f"⚠️ No client order ID found in execution event")
-            # Log raw event structure for debugging
+            
+            # Check if this is a close position execution event by looking for position information
+            if position:
+                position_id = getattr(position, 'positionId', None)
+                if position_id and hasattr(self, 'pending_close_positions') and position_id in self.pending_close_positions:
+                    logger.info(f"🎯 Identified close position execution event for Position ID: {position_id}")
+                    self._handle_close_position_execution(position_id, event)
+                    return
+            
+            # Log raw event structure for debugging if it's not a close position event
             logger.info(f"🔍 Raw execution event attributes:")
             for attr in dir(event):
                 if not attr.startswith('_'):
@@ -2253,6 +3114,15 @@ class CTraderRealTimeTrader(BaseBroker):
             logger.warning(f"⚠️ Known pending orders: {list(self.execution_requests.keys())}")
             logger.warning(f"⚠️ Total pending orders: {len(self.execution_requests)}")
             
+            # Check if this is a close position execution event by looking for position information
+            # This handles cases where cTrader generates its own order IDs for close position requests
+            if position:
+                position_id = getattr(position, 'positionId', None)
+                if position_id and hasattr(self, 'pending_close_positions') and position_id in self.pending_close_positions:
+                    logger.info(f"🎯 Identified close position execution event for Position ID: {position_id}")
+                    self._handle_close_position_execution(position_id, event)
+                    return
+            
             # Check if this might be a case sensitivity or format issue
             if client_order_id:
                 similar_orders = [oid for oid in self.execution_requests.keys() if client_order_id.lower() in oid.lower() or oid.lower() in client_order_id.lower()]
@@ -2306,10 +3176,24 @@ class CTraderRealTimeTrader(BaseBroker):
         for trade_key, pending_trade in list(self.pending_pair_trades.items()):
             if pending_trade['order1_id'] == order_id:
                 pending_trade['order1_filled'] = True
+                # Extract position ID from execution event if available
+                position = getattr(event, 'position', None)
+                if position:
+                    position_id = getattr(position, 'positionId', None)
+                    if position_id:
+                        pending_trade['position_id1'] = position_id
+                        logger.info(f"📋 Captured position ID for {pending_trade['symbol1']}: {position_id}")
                 logger.info(f"✅ First leg of pair trade filled: {pending_trade['symbol1']} (Order: {order_id})")
                 logger.info(f"   Pair: {pending_trade['pair_str']}, Direction: {pending_trade['direction']}")
             elif pending_trade['order2_id'] == order_id:
                 pending_trade['order2_filled'] = True
+                # Extract position ID from execution event if available
+                position = getattr(event, 'position', None)
+                if position:
+                    position_id = getattr(position, 'positionId', None)
+                    if position_id:
+                        pending_trade['position_id2'] = position_id
+                        logger.info(f"📋 Captured position ID for {pending_trade['symbol2']}: {position_id}")
                 logger.info(f"✅ Second leg of pair trade filled: {pending_trade['symbol2']} (Order: {order_id})")
                 logger.info(f"   Pair: {pending_trade['pair_str']}, Direction: {pending_trade['direction']}")
             else:
@@ -2691,7 +3575,10 @@ class CTraderRealTimeTrader(BaseBroker):
                 'entry_price1': pending_trade['entry_price1'],
                 'entry_price2': pending_trade['entry_price2'],
                 'entry_time': pending_trade['timestamp'],
-                'order_ids': (pending_trade['order1_id'], pending_trade['order2_id'])
+                'order_ids': (pending_trade['order1_id'], pending_trade['order2_id']),
+                # Position IDs will be populated when we receive execution events with position data
+                'position_id1': pending_trade.get('position_id1', None),
+                'position_id2': pending_trade.get('position_id2', None)
             }
             
             # Update pair state
@@ -2707,6 +3594,19 @@ class CTraderRealTimeTrader(BaseBroker):
         logger.info(f"   Direction: {direction}")
         logger.info(f"   {pending_trade['symbol1']}: {'BUY' if direction == 'LONG' else 'SELL'} {pending_trade['volume1']:.5f} lots")
         logger.info(f"   {pending_trade['symbol2']}: {'SELL' if direction == 'LONG' else 'BUY'} {pending_trade['volume2']:.5f} lots")
+        
+        # Log position ID tracking status
+        pos_id1 = pending_trade.get('position_id1')
+        pos_id2 = pending_trade.get('position_id2')
+        if pos_id1 and pos_id2:
+            logger.info(f"   📋 Position IDs captured: {pending_trade['symbol1']}={pos_id1}, {pending_trade['symbol2']}={pos_id2}")
+            logger.info(f"   ✅ Can use ProtoOAClosePositionReq for closing")
+        elif pos_id1 or pos_id2:
+            logger.warning(f"   ⚠️ Partial position IDs: {pending_trade['symbol1']}={pos_id1}, {pending_trade['symbol2']}={pos_id2}")
+            logger.warning(f"   ⚠️ Will use mixed close methods (ProtoOAClosePositionReq + market orders)")
+        else:
+            logger.warning(f"   ⚠️ No position IDs captured - will use market orders for closing")
+        
         logger.info(f"   Portfolio now: {len(self.active_positions)}/{self.config.max_open_positions} positions")
     
     def _check_drawdown_limits(self, pair_str: str = None) -> bool:
@@ -2983,26 +3883,26 @@ class CTraderRealTimeTrader(BaseBroker):
             logger.info("-" * 80)
             
             # Log signal generation status
-            logger.info("SIGNAL GENERATION STATUS")
-            logger.info("-" * 80)
-            total_price_updates = sum(getattr(self, '_price_log_counter', {}).values())
-            total_signal_checks = getattr(self, '_signal_check_counter', 0)
-            logger.info(f"Total Price Updates : {total_price_updates}")
-            logger.info(f"Total Signal Checks : {total_signal_checks}")
-            logger.info(f"Subscribed Symbols  : {len(self.subscribed_symbols)}")
-            logger.info(f"Live Price Data     : {len(self.spot_prices)} symbols")
+            # logger.info("SIGNAL GENERATION STATUS")
+            # logger.info("-" * 80)
+            # total_price_updates = sum(getattr(self, '_price_log_counter', {}).values())
+            # total_signal_checks = getattr(self, '_signal_check_counter', 0)
+            # logger.info(f"Total Price Updates : {total_price_updates}")
+            # logger.info(f"Total Signal Checks : {total_signal_checks}")
+            # logger.info(f"Subscribed Symbols  : {len(self.subscribed_symbols)}")
+            # logger.info(f"Live Price Data     : {len(self.spot_prices)} symbols")
             
             # Show data accumulation status
-            if hasattr(self, '_data_accumulation_log'):
-                logger.info("-" * 40)
-                logger.info("DATA ACCUMULATION STATUS")
-                logger.info("-" * 40)
-                for pair_str, state in self.pair_states.items():
-                    min_data_points = getattr(self.strategy, 'get_minimum_data_points', lambda: 50)()
-                    p1_count = len(state['price1'])
-                    p2_count = len(state['price2'])
-                    ready = "✅" if p1_count >= min_data_points and p2_count >= min_data_points else "⏳"
-                    logger.info(f"{ready} {pair_str}: {p1_count}/{min_data_points} + {p2_count}/{min_data_points}")
+            # if hasattr(self, '_data_accumulation_log'):
+            #     logger.info("-" * 40)
+            #     logger.info("DATA ACCUMULATION STATUS")
+            #     logger.info("-" * 40)
+            #     for pair_str, state in self.pair_states.items():
+            #         min_data_points = getattr(self.strategy, 'get_minimum_data_points', lambda: 50)()
+            #         p1_count = len(state['price1'])
+            #         p2_count = len(state['price2'])
+                    # ready = "✅" if p1_count >= min_data_points and p2_count >= min_data_points else "⏳"
+                    # logger.info(f"{ready} {pair_str}: {p1_count}/{min_data_points} + {p2_count}/{min_data_points}")
             
             if status['positions']:
                 logger.info("-" * 40)
@@ -3069,8 +3969,8 @@ class CTraderRealTimeTrader(BaseBroker):
             if s1 not in self.spot_prices or s2 not in self.spot_prices:
                 return
             
-            current_price1 = self.spot_prices[s1]
-            current_price2 = self.spot_prices[s2]
+            current_price1 = self._get_spot_price(s1)
+            current_price2 = self._get_spot_price(s2)
             
             # Calculate current P&L percentage
             if direction == 'LONG':
@@ -3164,9 +4064,15 @@ class CTraderRealTimeTrader(BaseBroker):
         
         positions = []
         for pair_str, position in self.active_positions.items():
-            # Calculate position P&L (simplified)
-            current_price1 = self.spot_prices.get(position['symbol1'], position['entry_price1'])
-            current_price2 = self.spot_prices.get(position['symbol2'], position['entry_price2'])
+            # Calculate position P&L (simplified) - use helper methods for price access
+            current_price1 = self._get_spot_price(position['symbol1'])
+            current_price2 = self._get_spot_price(position['symbol2'])
+            
+            # Fallback to entry prices if current prices not available
+            if current_price1 is None:
+                current_price1 = position['entry_price1']
+            if current_price2 is None:
+                current_price2 = position['entry_price2']
             
             # Basic P&L calculation (expand for more accuracy)
             if position['direction'] == 'LONG':
@@ -3224,9 +4130,15 @@ class CTraderRealTimeTrader(BaseBroker):
         unrealized_pnl = 0.0
         
         for pair_str, position in self.active_positions.items():
-            # Calculate position P&L (simplified)
-            current_price1 = self.spot_prices.get(position['symbol1'], position['entry_price1'])
-            current_price2 = self.spot_prices.get(position['symbol2'], position['entry_price2'])
+            # Calculate position P&L (simplified) - use helper methods for price access
+            current_price1 = self._get_spot_price(position['symbol1'])
+            current_price2 = self._get_spot_price(position['symbol2'])
+            
+            # Fallback to entry prices if current prices not available
+            if current_price1 is None:
+                current_price1 = position['entry_price1']
+            if current_price2 is None:
+                current_price2 = position['entry_price2']
             
             # Basic P&L calculation
             if position['direction'] == 'LONG':
@@ -3406,6 +4318,8 @@ class CTraderRealTimeTrader(BaseBroker):
             
             position_info = {
                 'position_id': position_id,
+                'position_id1': position_id,  # For backward compatibility with pairs logic
+                'position_id2': None,  # Unknown for single positions
                 'symbol1': symbol_name,
                 'symbol2': None,  # Unknown for single positions
                 'direction': direction,

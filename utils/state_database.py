@@ -229,13 +229,18 @@ class InfluxDBAdapter(DatabaseAdapter):
     async def get_latest_state(self, state_id: str, state_type: StateType) -> Optional[StateVersion]:
         """Get the latest version of a state from InfluxDB."""
         try:
+            # Use pivoting to get all fields in one record
             query = f'''
             from(bucket: "{self.bucket}")
                 |> range(start: -30d)
                 |> filter(fn: (r) => r._measurement == "trading_state")
                 |> filter(fn: (r) => r.state_id == "{state_id}")
                 |> filter(fn: (r) => r.state_type == "{state_type.value}")
-                |> last()
+                |> pivot(rowKey: ["_time", "state_id", "state_type", "operation", "version_id"], 
+                         columnKey: ["_field"], 
+                         valueColumn: "_value")
+                |> sort(columns: ["_time"], desc: true)
+                |> limit(n: 1)
             '''
             
             result = await asyncio.to_thread(self.query_api.query, query)
@@ -254,12 +259,16 @@ class InfluxDBAdapter(DatabaseAdapter):
     async def get_state_version(self, version_id: str) -> Optional[StateVersion]:
         """Get a specific state version from InfluxDB."""
         try:
+            # Use pivoting to get all fields in one record
             query = f'''
             from(bucket: "{self.bucket}")
                 |> range(start: -90d)
                 |> filter(fn: (r) => r._measurement == "trading_state")
                 |> filter(fn: (r) => r.version_id == "{version_id}")
-                |> last()
+                |> pivot(rowKey: ["_time", "state_id", "state_type", "operation", "version_id"], 
+                         columnKey: ["_field"], 
+                         valueColumn: "_value")
+                |> limit(n: 1)
             '''
             
             result = await asyncio.to_thread(self.query_api.query, query)
@@ -278,8 +287,12 @@ class InfluxDBAdapter(DatabaseAdapter):
     async def get_state_history(self, query: StateQuery) -> List[StateVersion]:
         """Get state history from InfluxDB."""
         try:
-            flux_query = f'from(bucket: "{self.bucket}") |> range(start: -90d)'
-            flux_query += ' |> filter(fn: (r) => r._measurement == "trading_state")'
+            # Use a more comprehensive query that properly selects all fields
+            flux_query = f'''
+            from(bucket: "{self.bucket}")
+                |> range(start: -90d)
+                |> filter(fn: (r) => r._measurement == "trading_state")
+            '''
             
             if query.state_id:
                 flux_query += f' |> filter(fn: (r) => r.state_id == "{query.state_id}")'
@@ -288,7 +301,13 @@ class InfluxDBAdapter(DatabaseAdapter):
             if query.user_id:
                 flux_query += f' |> filter(fn: (r) => r.user_id == "{query.user_id}")'
             
-            flux_query += ' |> sort(columns: ["_time"], desc: true)'
+            # Pivot to get all fields in one record per state version
+            flux_query += '''
+                |> pivot(rowKey: ["_time", "state_id", "state_type", "operation", "version_id"], 
+                         columnKey: ["_field"], 
+                         valueColumn: "_value")
+                |> sort(columns: ["_time"], desc: true)
+            '''
             
             if query.limit:
                 flux_query += f' |> limit(n: {query.limit})'
@@ -362,42 +381,120 @@ class InfluxDBAdapter(DatabaseAdapter):
     def _record_to_state_version(self, record) -> Optional[StateVersion]:
         """Convert InfluxDB record to StateVersion."""
         try:
+            # After pivoting, the fields should now be accessible as direct properties
+            # The pivot operation converts field names to column names
+            
+            # Debug the record structure first
+            logger.debug(f"🔍 Raw InfluxDB record structure:")
+            logger.debug(f"   Record type: {type(record)}")
+            if hasattr(record, 'values') and record.values:
+                logger.debug(f"   Record.values keys: {list(record.values.keys())}")
+                logger.debug(f"   Record.values: {record.values}")
+            
+            # Extract field values - after pivot, these should be direct properties
             data_str = None
             description = None
             user_id = None
             checksum = None
             
-            # Extract field values
             if hasattr(record, 'values') and record.values:
-                data_str = record.values.get('data')
-                description = record.values.get('description')
-                user_id = record.values.get('user_id')
-                checksum = record.values.get('checksum')
+                values = record.values
+                # After pivot, field data should be accessible as direct keys
+                data_str = values.get('data')
+                description = values.get('description', '')
+                user_id = values.get('user_id', '')
+                checksum = values.get('checksum', '')
+                logger.debug(f"✅ Accessed pivoted fields from record.values")
             
-            # Extract tag values
-            tags = getattr(record, 'values', {})
-            state_id = tags.get('state_id')
-            state_type_str = tags.get('state_type')
-            operation_str = tags.get('operation')
-            version_id = tags.get('version_id')
+            # If that doesn't work, try alternative access patterns
+            if not data_str:
+                # Method 1: Try accessing fields directly as record attributes
+                data_str = getattr(record, 'data', None)
+                description = getattr(record, 'description', None)
+                user_id = getattr(record, 'user_id', None)
+                checksum = getattr(record, 'checksum', None)
+                if data_str:
+                    logger.debug(f"✅ Accessed fields via direct attributes")
             
-            if not all([state_id, state_type_str, operation_str, version_id, data_str]):
+            # Extract tag values (these remain as tags and should be accessible)
+            state_id = None
+            state_type_str = None
+            operation_str = None
+            version_id = None
+            
+            if hasattr(record, 'values') and record.values:
+                values = record.values
+                # Tags should still be accessible from values
+                state_id = values.get('state_id')
+                state_type_str = values.get('state_type')
+                operation_str = values.get('operation')
+                version_id = values.get('version_id')
+            
+            # Fallback: try to get tags from record attributes
+            if not state_id:
+                state_id = getattr(record, 'state_id', None)
+                state_type_str = getattr(record, 'state_type', None)
+                operation_str = getattr(record, 'operation', None)
+                version_id = getattr(record, 'version_id', None)
+            
+            # Debug logging for troubleshooting  
+            logger.debug(f"🔍 InfluxDB record parsing results:")
+            logger.debug(f"   state_id: {state_id}")
+            logger.debug(f"   state_type: {state_type_str}")
+            logger.debug(f"   operation: {operation_str}")
+            logger.debug(f"   version_id: {version_id}")
+            logger.debug(f"   data_str length: {len(data_str) if data_str else 0}")
+            if data_str:
+                logger.debug(f"   data_str sample: {data_str[:100]}...")
+            
+            # Validate required fields
+            if not all([state_id, state_type_str, operation_str, version_id]):
+                logger.warning(f"❌ Missing required tag fields in InfluxDB record:")
+                logger.warning(f"   state_id: {state_id}")
+                logger.warning(f"   state_type: {state_type_str}")
+                logger.warning(f"   operation: {operation_str}")
+                logger.warning(f"   version_id: {version_id}")
+                if hasattr(record, 'values'):
+                    logger.warning(f"   Available keys: {list(record.values.keys()) if record.values else 'None'}")
                 return None
             
-            return StateVersion(
+            if not data_str:
+                logger.warning(f"❌ No data field found in InfluxDB record for {state_id}")
+                if hasattr(record, 'values') and record.values:
+                    logger.warning(f"   Available values keys: {list(record.values.keys())}")
+                return None
+            
+            # Parse the data JSON
+            try:
+                parsed_data = json.loads(data_str) if data_str else {}
+            except json.JSONDecodeError as e:
+                logger.error(f"❌ Failed to parse JSON data for {state_id}: {e}")
+                logger.error(f"   Raw data: {data_str[:100]}..." if len(data_str) > 100 else f"   Raw data: {data_str}")
+                return None
+            
+            # Create StateVersion object
+            version = StateVersion(
                 version_id=version_id,
                 state_id=state_id,
                 state_type=StateType(state_type_str),
                 operation=StateOperationType(operation_str),
-                data=json.loads(data_str) if data_str else {},
+                data=parsed_data,
                 timestamp=record.get_time(),
                 user_id=user_id,
                 description=description,
                 checksum=checksum
             )
             
+            logger.debug(f"✅ Successfully parsed InfluxDB record for {state_id}")
+            return version
+            
         except Exception as e:
             logger.error(f"Failed to convert record to StateVersion: {e}")
+            logger.error(f"Record type: {type(record)}")
+            if hasattr(record, 'values'):
+                logger.error(f"Record values: {record.values}")
+            if hasattr(record, '__dict__'):
+                logger.error(f"Record dict: {record.__dict__}")
             return None
 
 

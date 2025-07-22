@@ -836,7 +836,7 @@ class EnhancedTradingSystemV3:
     Enhanced trading system v3 with configurable data provider, broker, and strategy
     """
     
-    def __init__(self, data_provider: str = 'ctrader', broker: str = 'ctrader', strategy: BaseStrategy = None, mode: str = 'live'):
+    def __init__(self, data_provider: str = 'ctrader', broker: str = 'ctrader', strategy: BaseStrategy = None, mode: str = 'live', fresh_state: bool = False):
         """
         Initialize the trading system with specified data provider, broker, and strategy
         
@@ -845,11 +845,13 @@ class EnhancedTradingSystemV3:
             broker: 'ctrader' or 'mt5' - broker for trade execution
             strategy: Strategy instance implementing BaseStrategy interface
             mode: 'live' or 'backtest' - execution mode (affects state management initialization)
+            fresh_state: bool - if True, clear all previous positions and pair states
         """
         self.config = CONFIG
         self.data_provider = data_provider.lower()
         self.broker = broker.lower()
         self.mode = mode.lower()
+        self.fresh_state = fresh_state
         
         # Create default strategy if none provided
         if strategy is None:
@@ -910,9 +912,26 @@ class EnhancedTradingSystemV3:
                 )
                 
                 # Give the state manager time to fully initialize
-                import time
                 logger.info("⏳ Waiting for state manager to fully initialize...")
-                time.sleep(3)  # Allow async initialization to complete
+                time.sleep(5)  # Increased from 3 to 5 seconds
+                
+                # Force connection if not already connected
+                logger.info("🔧 Ensuring state manager database connection...")
+                try:
+                    # Trigger initialization if needed
+                    if hasattr(self.state_manager, '_initialize'):
+                        self.state_manager._initialize()
+                    
+                    # Wait for async operations to complete
+                    time.sleep(2)
+                    
+                    # Test basic functionality
+                    test_summary = self.state_manager.get_portfolio_summary()
+                    logger.info(f"✅ State manager test successful: {test_summary}")
+                    
+                except Exception as init_error:
+                    logger.warning(f"State manager initialization warning: {init_error}")
+                    # Continue anyway, as the manager might still work
                 
                 # Check state manager status after initialization delay
                 status = self.state_manager.get_system_status()
@@ -1027,56 +1046,142 @@ class EnhancedTradingSystemV3:
             restored_data = self._restored_state
             logger.info(f"📦 Applying restored state with {len(restored_data)} components")
             
-            # Apply positions to broker if it supports restoration
-            if 'positions' in restored_data and hasattr(self.execution_data_manager, 'restore_positions'):
+            # Apply positions to broker using multiple methods for better compatibility
+            if 'positions' in restored_data:
                 positions = restored_data['positions']
                 logger.info(f"📊 Restoring {len(positions)} positions to execution broker")
-                try:
-                    self.execution_data_manager.restore_positions(positions)
-                    logger.info("✅ Positions successfully restored to execution broker")
-                except Exception as e:
-                    logger.warning(f"Could not restore positions to execution broker: {e}")
-            elif 'positions' in restored_data:
-                # Apply to broker's active_positions directly if restore method not available
-                positions = restored_data['positions']
-                logger.info(f"📊 Found {len(positions)} positions - applying to broker's active_positions")
-                try:
-                    if hasattr(self.execution_data_manager, 'active_positions'):
+                
+                # First, normalize the positions data to ensure datetime fields are properly converted
+                normalized_positions = self._normalize_restored_positions(positions)
+                
+                # Method 1: Try broker's restore_positions method
+                if hasattr(self.execution_data_manager, 'restore_positions'):
+                    try:
+                        self.execution_data_manager.restore_positions(normalized_positions)
+                        logger.info("✅ Positions successfully restored via restore_positions method")
+                    except Exception as e:
+                        logger.warning(f"Could not restore via restore_positions: {e}")
+                
+                # Method 2: Try broker's active_positions directly
+                if hasattr(self.execution_data_manager, 'active_positions'):
+                    try:
                         self.execution_data_manager.active_positions.clear()
-                        for symbol, pos_data in positions.items():
-                            self.execution_data_manager.active_positions[symbol] = pos_data
-                        logger.info(f"✅ Applied {len(positions)} positions to broker's active_positions")
-                    else:
-                        logger.warning("Broker doesn't have active_positions attribute")
-                except Exception as e:
-                    logger.warning(f"Could not apply positions to broker: {e}")
+                        # Convert list of positions to dictionary format expected by broker
+                        if isinstance(normalized_positions, list):
+                            for i, pos_data in enumerate(normalized_positions):
+                                if isinstance(pos_data, dict):
+                                    pair_key = pos_data.get('pair', pos_data.get('symbol1', 'UNKNOWN') + '-' + pos_data.get('symbol2', 'USD'))
+                                    self.execution_data_manager.active_positions[pair_key] = pos_data
+                        elif isinstance(normalized_positions, dict):
+                            for pair_key, pos_data in normalized_positions.items():
+                                self.execution_data_manager.active_positions[pair_key] = pos_data
+                        
+                        logger.info(f"✅ Applied {len(normalized_positions)} positions to broker's active_positions")
+                    except Exception as e:
+                        logger.warning(f"Could not apply positions to active_positions: {e}")
+                
+                # Method 3: Try trader's nested broker
+                if hasattr(self.trader, 'trader') and hasattr(self.trader.trader, 'active_positions'):
+                    try:
+                        self.trader.trader.active_positions.clear()
+                        # Convert list of positions to dictionary format expected by broker
+                        if isinstance(normalized_positions, list):
+                            for i, pos_data in enumerate(normalized_positions):
+                                if isinstance(pos_data, dict):
+                                    pair_key = pos_data.get('pair', pos_data.get('symbol1', 'UNKNOWN') + '-' + pos_data.get('symbol2', 'USD'))
+                                    self.trader.trader.active_positions[pair_key] = pos_data
+                        elif isinstance(normalized_positions, dict):
+                            for pair_key, pos_data in normalized_positions.items():
+                                self.trader.trader.active_positions[pair_key] = pos_data
+                        
+                        logger.info(f"✅ Applied {len(normalized_positions)} positions to trader's broker active_positions")
+                    except Exception as e:
+                        logger.warning(f"Could not apply positions to trader's broker: {e}")
             
             # Apply strategy state if available
-            if 'pair_states' in restored_data and hasattr(self.strategy, 'restore_pair_states'):
+            if 'pair_states' in restored_data:
                 pair_states = restored_data['pair_states']
                 logger.info(f"🔄 Restoring {len(pair_states)} pair states to strategy")
-                try:
-                    self.strategy.restore_pair_states(pair_states)
-                    logger.info("✅ Pair states successfully restored to strategy")
-                except Exception as e:
-                    logger.warning(f"Could not restore pair states to strategy: {e}")
-            elif 'pair_states' in restored_data:
-                logger.info(f"🔄 Found {len(restored_data['pair_states'])} pair states, but strategy doesn't support restoration")
+                
+                # Filter pair states to only include pairs in current configuration
+                current_pairs = set(self.config.pairs)
+                filtered_pair_states = {}
+                excluded_pairs = []
+                
+                for pair, state in pair_states.items():
+                    if pair in current_pairs:
+                        filtered_pair_states[pair] = state
+                    else:
+                        excluded_pairs.append(pair)
+                
+                if excluded_pairs:
+                    logger.info(f"🚫 EXCLUDING {len(excluded_pairs)} pairs not in current configuration:")
+                    for excluded_pair in excluded_pairs[:10]:  # Show first 10
+                        logger.info(f"   ❌ {excluded_pair}")
+                    if len(excluded_pairs) > 10:
+                        logger.info(f"   ... and {len(excluded_pairs) - 10} more excluded pairs")
+                
+                logger.info(f"✅ FILTERED: Using {len(filtered_pair_states)}/{len(pair_states)} pair states")
+                
+                # Use filtered pair states for restoration
+                pair_states = filtered_pair_states
+                
+                # Method 1: Try strategy's restore_pair_states method
+                if hasattr(self.strategy, 'restore_pair_states'):
+                    try:
+                        self.strategy.restore_pair_states(pair_states)
+                        logger.info("✅ Pair states successfully restored via restore_pair_states method")
+                    except Exception as e:
+                        logger.warning(f"Could not restore via restore_pair_states: {e}")
+                
+                # Method 2: Try applying to broker's pair_states
+                if hasattr(self.trader, 'trader') and hasattr(self.trader.trader, 'pair_states'):
+                    try:
+                        self.trader.trader.pair_states.update(pair_states)
+                        logger.info(f"✅ Applied {len(pair_states)} pair states to broker's pair_states")
+                    except Exception as e:
+                        logger.warning(f"Could not apply pair states to broker: {e}")
+                
+                # Method 3: Log that pair states were found but couldn't be applied
+                if not hasattr(self.strategy, 'restore_pair_states') and not (hasattr(self.trader, 'trader') and hasattr(self.trader.trader, 'pair_states')):
+                    logger.info(f"🔄 Found {len(pair_states)} pair states, but no restoration method available")
             
             # Apply metadata if available
-            if 'metadata' in restored_data and hasattr(self.strategy, 'restore_metadata'):
+            if 'metadata' in restored_data:
                 metadata = restored_data['metadata']
                 logger.info(f"🏷️ Restoring metadata to strategy")
-                try:
-                    self.strategy.restore_metadata(metadata)
-                    logger.info("✅ Metadata successfully restored to strategy")
-                except Exception as e:
-                    logger.warning(f"Could not restore metadata to strategy: {e}")
+                
+                if hasattr(self.strategy, 'restore_metadata'):
+                    try:
+                        self.strategy.restore_metadata(metadata)
+                        logger.info("✅ Metadata successfully restored to strategy")
+                    except Exception as e:
+                        logger.warning(f"Could not restore metadata to strategy: {e}")
+                else:
+                    logger.info("🏷️ Found metadata, but strategy doesn't support metadata restoration")
             
             # Log portfolio summary
             if 'portfolio_summary' in restored_data:
                 portfolio = restored_data['portfolio_summary']
-                logger.info(f"💰 Portfolio Summary: {portfolio}")
+                logger.info(f"💰 Portfolio Summary from restored state: {portfolio}")
+            
+            # Verify the restoration worked
+            try:
+                if hasattr(self.trader, 'get_portfolio_status'):
+                    current_status = self.trader.get_portfolio_status()
+                    position_count = current_status.get('position_count', 0)
+                    logger.info(f"✅ Verification: Trader now shows {position_count} positions")
+                    
+                    # Log some key details if positions were restored
+                    if 'positions' in current_status and current_status['positions']:
+                        logger.info(f"✅ Position verification: Found {len(current_status['positions'])} positions in trader")
+                    
+                    if hasattr(self.trader, 'trader') and hasattr(self.trader.trader, 'active_positions'):
+                        active_pos_count = len(self.trader.trader.active_positions)
+                        logger.info(f"✅ Active positions verification: Found {active_pos_count} active positions in broker")
+                
+            except Exception as e:
+                logger.warning(f"Could not verify restoration: {e}")
                     
             logger.info("="*50)
             logger.info("STATE APPLICATION COMPLETED")
@@ -1084,7 +1189,6 @@ class EnhancedTradingSystemV3:
             
         except Exception as e:
             logger.error(f"Error applying restored state to trader: {e}")
-            import traceback
             logger.debug(f"State application error details: {traceback.format_exc()}")
 
     def _restore_trading_state(self) -> bool:
@@ -1093,17 +1197,76 @@ class EnhancedTradingSystemV3:
             logger.warning("State manager not available, skipping state restoration")
             return False
         
+        # Check if fresh state is requested
+        if self.fresh_state:
+            logger.info("="*60)
+            logger.info("FRESH STATE REQUESTED - CLEARING ALL PREVIOUS STATE")
+            logger.info("="*60)
+            logger.info("🧹 Clearing all positions and pair states...")
+            
+            # Reset portfolio to initial state
+            fresh_portfolio_data = {
+                'total_value': 100000.0,
+                'available_balance': 100000.0,
+                'total_pnl': 0.0,
+                'open_positions': 0,
+                'daily_pnl': 0.0,
+                'peak_value': 100000.0,
+                'metadata': {
+                    'session_info': {
+                        'data_provider': self.data_provider,
+                        'broker': self.broker,
+                        'strategy': self.strategy.__class__.__name__,
+                        'save_time': datetime.now().isoformat(),
+                        'system_version': 'EnhancedTradingSystemV3',
+                        'fresh_start': True
+                    }
+                }
+            }
+            
+            try:
+                # Clear all positions and states from the database using the save method with empty data
+                success = self.state_manager.save_trading_state(
+                    active_positions={},  # Empty positions
+                    pair_states={},       # Empty pair states
+                    portfolio_data=fresh_portfolio_data
+                )
+                
+                if success:
+                    logger.info("✅ Fresh state initialized successfully")
+                    logger.info("✅ All previous positions and pair states cleared")
+                    logger.info("✅ Portfolio reset to initial values")
+                    logger.info("="*60)
+                    return True
+                else:
+                    logger.error("❌ Failed to save fresh state")
+                    logger.warning("Continuing with normal state restoration...")
+                    # Fall through to normal restoration process
+                
+            except Exception as e:
+                logger.error(f"Error clearing state for fresh start: {e}")
+                logger.warning("Continuing with normal state restoration...")
+                # Fall through to normal restoration process
+        
         try:
             logger.info("="*60)
             logger.info("RESTORING PREVIOUS TRADING STATE")
             logger.info("="*60)
             
-            # Wait a bit more for state manager to be fully ready
-            import time
-            time.sleep(2)
+            # Wait longer for state manager to be fully ready
+            logger.info("⏳ Ensuring state manager is fully initialized...")
+            
+            # Force state manager initialization if not already done
+            if not hasattr(self.state_manager, '_initialized') or not self.state_manager._initialized:
+                logger.info("🔧 Forcing state manager initialization...")
+                try:
+                    self.state_manager._initialize()
+                    time.sleep(2)
+                except Exception as e:
+                    logger.warning(f"State manager initialization issue: {e}")
             
             # Try multiple times with increasing delays to ensure state is available
-            max_retries = 3
+            max_retries = 5  # Increased from 3
             all_positions = []
             current_state = None
             portfolio_summary = None
@@ -1120,22 +1283,31 @@ class EnhancedTradingSystemV3:
                     portfolio_summary = self.state_manager.get_portfolio_summary()
                     
                     logger.info(f"📊 Attempt {attempt + 1}: Found {len(all_positions) if all_positions else 0} positions")
-                    logger.info(f"📊 Attempt {attempt + 1}: Current state available: {bool(current_state)}")
-                    logger.info(f"📊 Attempt {attempt + 1}: Portfolio summary: {portfolio_summary}")
+                    logger.info(f"📊 Attempt {attempt + 1}: Current state available: {bool(current_state and current_state.get('pair_states'))}")
+                    logger.info(f"📊 Attempt {attempt + 1}: Portfolio summary active positions: {portfolio_summary.get('active_positions_count', 0) if portfolio_summary else 0}")
                     
-                    # If we found positions or states, break early
-                    if (all_positions and len(all_positions) > 0) or (current_state and current_state.get('pair_states')):
-                        logger.info(f"✅ Found data on attempt {attempt + 1}, proceeding with restoration")
+                    # Check for any meaningful data (positions, states, or active position count > 0)
+                    has_positions = all_positions and len(all_positions) > 0
+                    has_pair_states = current_state and current_state.get('pair_states')
+                    has_active_count = portfolio_summary and portfolio_summary.get('active_positions_count', 0) > 0
+                    
+                    if has_positions or has_pair_states or has_active_count:
+                        logger.info(f"✅ Found meaningful data on attempt {attempt + 1}, proceeding with restoration")
+                        logger.info(f"   Positions: {len(all_positions) if all_positions else 0}")
+                        logger.info(f"   Pair states: {len(current_state.get('pair_states', {})) if current_state else 0}")
+                        logger.info(f"   Active position count: {portfolio_summary.get('active_positions_count', 0) if portfolio_summary else 0}")
                         break
                     elif attempt < max_retries - 1:
-                        logger.info(f"⏳ No data found on attempt {attempt + 1}, waiting 3 seconds before next attempt...")
-                        time.sleep(3)
+                        wait_time = (attempt + 1) * 2  # Increasing wait time: 2, 4, 6, 8 seconds
+                        logger.info(f"⏳ No data found on attempt {attempt + 1}, waiting {wait_time} seconds before next attempt...")
+                        time.sleep(wait_time)
                     
                 except Exception as e:
                     logger.warning(f"⚠️ Error on attempt {attempt + 1}: {e}")
                     if attempt < max_retries - 1:
-                        logger.info(f"⏳ Retrying in 2 seconds...")
-                        time.sleep(2)
+                        wait_time = 3
+                        logger.info(f"⏳ Retrying in {wait_time} seconds...")
+                        time.sleep(wait_time)
                     else:
                         logger.error(f"❌ All attempts failed, continuing with fresh state")
             
@@ -1149,11 +1321,14 @@ class EnhancedTradingSystemV3:
                     symbol1 = position.get('symbol1', 'N/A')
                     symbol2 = position.get('symbol2', 'N/A')
                     direction = position.get('direction', 'N/A')
-                    entry_price = position.get('entry_price', 0)
+                    # Show the actual entry prices for each asset, not the generic fallback
+                    entry_price1 = position.get('entry_price1', 0)
+                    entry_price2 = position.get('entry_price2', 0)
+                    generic_entry_price = position.get('entry_price', 0)
                     quantity = position.get('quantity', 0)
                     entry_time = position.get('entry_time', 'N/A')
                     
-                    logger.info(f"  {i}. 📈 {symbol1}-{symbol2}: {direction} | Entry: {entry_price} | Qty: {quantity}")
+                    logger.info(f"  {i}. 📈 {symbol1}-{symbol2}: {direction} | Entry1: {entry_price1} | Entry2: {entry_price2} | Generic: {generic_entry_price} | Qty: {quantity}")
                     logger.info(f"      ⏰ Time: {entry_time}")
             else:
                 logger.info("📊 No stored positions found - starting with fresh state")
@@ -1251,6 +1426,416 @@ class EnhancedTradingSystemV3:
             logger.debug(f"State restoration error details: {traceback.format_exc()}")
             return False
     
+    def _transform_position_for_schema(self, position: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Transform position data to match PositionSchema requirements"""
+        try:
+            # Extract required fields from various position formats
+            symbol1 = None
+            symbol2 = None
+            
+            # Debug the input position data
+            logger.debug(f"🔍 Transforming position data: {position}")
+            
+            # Try to get symbols from different sources
+            if 'symbol1' in position and 'symbol2' in position:
+                symbol1 = position['symbol1']
+                symbol2 = position['symbol2']
+                logger.debug(f"📊 Using explicit symbol1/symbol2: {symbol1}/{symbol2}")
+            elif 'pair' in position:
+                pair = position['pair']
+                logger.debug(f"📊 Extracting symbols from pair: {pair}")
+                if '-' in pair:
+                    symbols = pair.split('-')
+                    symbol1 = symbols[0] if len(symbols) > 0 else None
+                    symbol2 = symbols[1] if len(symbols) > 1 else None
+                    logger.debug(f"📊 Split pair {pair} -> {symbol1}/{symbol2}")
+                else:
+                    # Fallback for pairs without dash
+                    symbol1 = pair[:6] if len(pair) >= 6 else pair
+                    symbol2 = pair[6:] if len(pair) > 6 else 'USD'
+                    logger.debug(f"📊 Fallback split {pair} -> {symbol1}/{symbol2}")
+            elif 'symbol' in position:
+                # Single symbol position, try to infer pair
+                symbol = position['symbol']
+                if symbol.endswith('USD'):
+                    symbol1 = symbol
+                    symbol2 = 'USD'
+                else:
+                    symbol1 = symbol
+                    symbol2 = 'USD'
+                logger.debug(f"📊 Inferred from single symbol {symbol} -> {symbol1}/{symbol2}")
+            
+            if not symbol1 or not symbol2:
+                logger.warning(f"Could not extract symbols from position: {position}")
+                return None
+            
+            # Clean up symbol names (remove any remaining hyphens or invalid chars)
+            symbol1 = str(symbol1).replace('-', '').strip() if symbol1 else 'UNKNOWN'
+            symbol2 = str(symbol2).replace('-', '').strip() if symbol2 else 'USD'
+            
+            logger.debug(f"📊 Final symbols: {symbol1}/{symbol2}")
+            
+            # Get direction
+            direction = position.get('direction', position.get('side', 'long')).lower()
+            if direction in ['buy', 'long']:
+                direction = 'long'
+            elif direction in ['sell', 'short']:
+                direction = 'short'
+            else:
+                direction = 'long'  # Default fallback
+            
+            # Get numeric values with fallbacks
+            entry_price = float(position.get('entry_price', position.get('price', 0.0)))  # Use 0.0 to detect missing data
+            if entry_price <= 0:
+                logger.warning(f"⚠️ Position has invalid or missing entry_price: {entry_price}")
+                # Don't use 1.0 fallback - this creates corruption!
+                
+            quantity = float(position.get('quantity', position.get('volume', position.get('size', 0.01))))
+            if quantity <= 0:
+                quantity = 0.01  # Schema requires > 0
+            
+            # Get entry time
+            entry_time = position.get('entry_time', position.get('timestamp', datetime.now()))
+            if isinstance(entry_time, str):
+                try:
+                    # Try standard datetime format first
+                    if 'T' in entry_time:
+                        # ISO format
+                        if entry_time.endswith('Z'):
+                            entry_time = entry_time[:-1] + '+00:00'
+                        entry_time = datetime.fromisoformat(entry_time)
+                    else:
+                        # Try to parse standard datetime format like "2025-07-22 12:10:44.175515"
+                        try:
+                            entry_time = datetime.strptime(entry_time, '%Y-%m-%d %H:%M:%S.%f')
+                        except ValueError:
+                            try:
+                                # Try without microseconds
+                                entry_time = datetime.strptime(entry_time, '%Y-%m-%d %H:%M:%S')
+                            except ValueError:
+                                # Fallback to current time
+                                entry_time = datetime.now()
+                                logger.debug(f"Could not parse entry_time '{position.get('entry_time')}', using current time")
+                except Exception as e:
+                    logger.debug(f"Error parsing entry_time: {e}")
+                    entry_time = datetime.now()
+            elif not isinstance(entry_time, datetime):
+                entry_time = datetime.now()
+            
+            # Create transformed position matching PositionSchema
+            # For pairs trading, try to extract actual entry prices from CTrader position data
+            # CTrader positions contain detailed execution information that we need to extract
+            
+            # First, try to get existing entry_price1 and entry_price2 if available
+            entry_price1 = position.get('entry_price1')
+            entry_price2 = position.get('entry_price2')
+            volume1 = position.get('volume1')
+            volume2 = position.get('volume2')
+            
+            # If we don't have the pair-specific prices, try to extract from CTrader position data
+            if entry_price1 is None or entry_price2 is None:
+                # Look for CTrader execution details in different possible fields
+                ctrader_deals = position.get('deals', [])
+                ctrader_executions = position.get('executions', [])
+                ctrader_position_data = position.get('position_data', {})
+                
+                # Extract prices from CTrader deals/executions if available
+                extracted_prices = {}
+                
+                # Method 1: From deals array (most reliable)
+                if ctrader_deals and isinstance(ctrader_deals, list):
+                    logger.debug(f"📊 Extracting prices from {len(ctrader_deals)} CTrader deals")
+                    for deal in ctrader_deals:
+                        if isinstance(deal, dict):
+                            deal_symbol = deal.get('symbol', deal.get('symbolName', ''))
+                            deal_price = deal.get('executionPrice', deal.get('price', deal.get('fill_price')))
+                            deal_volume = deal.get('volume', deal.get('size', deal.get('quantity')))
+                            
+                            if deal_symbol and deal_price:
+                                extracted_prices[deal_symbol] = {
+                                    'price': float(deal_price),
+                                    'volume': float(deal_volume) if deal_volume else quantity
+                                }
+                                logger.debug(f"📊 Deal {deal_symbol}: price={deal_price}, volume={deal_volume}")
+                
+                # Method 2: From executions array (alternative source)
+                if not extracted_prices and ctrader_executions and isinstance(ctrader_executions, list):
+                    logger.debug(f"📊 Extracting prices from {len(ctrader_executions)} CTrader executions")
+                    for execution in ctrader_executions:
+                        if isinstance(execution, dict):
+                            exec_symbol = execution.get('symbol', execution.get('symbolName', ''))
+                            exec_price = execution.get('executionPrice', execution.get('price'))
+                            exec_volume = execution.get('volume', execution.get('size'))
+                            
+                            if exec_symbol and exec_price:
+                                extracted_prices[exec_symbol] = {
+                                    'price': float(exec_price),
+                                    'volume': float(exec_volume) if exec_volume else quantity
+                                }
+                                logger.debug(f"📊 Execution {exec_symbol}: price={exec_price}, volume={exec_volume}")
+                
+                # Method 3: From direct symbol price fields (fallback)
+                if not extracted_prices:
+                    # Look for direct price fields with symbol names
+                    for key, value in position.items():
+                        if 'price' in key.lower() and isinstance(value, (int, float)):
+                            if symbol1.lower() in key.lower():
+                                extracted_prices[symbol1] = {'price': float(value), 'volume': quantity}
+                                logger.debug(f"📊 Direct field {key}: {symbol1}={value}")
+                            elif symbol2.lower() in key.lower():
+                                extracted_prices[symbol2] = {'price': float(value), 'volume': quantity}
+                                logger.debug(f"📊 Direct field {key}: {symbol2}={value}")
+                
+                # Apply extracted prices to entry_price1 and entry_price2
+                if symbol1 in extracted_prices:
+                    entry_price1 = extracted_prices[symbol1]['price']
+                    if volume1 is None:
+                        volume1 = extracted_prices[symbol1]['volume']
+                    logger.debug(f"📊 Extracted {symbol1} price: {entry_price1}")
+                
+                if symbol2 in extracted_prices:
+                    entry_price2 = extracted_prices[symbol2]['price']
+                    if volume2 is None:
+                        volume2 = extracted_prices[symbol2]['volume']
+                    logger.debug(f"📊 Extracted {symbol2} price: {entry_price2}")
+                
+                # Final fallback to entry_price if we still don't have specific prices
+                # BUT: Only use entry_price if it's valid (not 0.0 or 1.0)
+                if entry_price1 is None:
+                    if entry_price > 1.0:  # Only use if it's a realistic price
+                        entry_price1 = entry_price
+                        logger.debug(f"📊 Fallback {symbol1} price: {entry_price1}")
+                    else:
+                        logger.warning(f"🚫 Cannot set valid entry_price1 for {symbol1} - no valid price data available")
+                
+                if entry_price2 is None:
+                    if entry_price > 1.0:  # Only use if it's a realistic price
+                        entry_price2 = entry_price
+                        logger.debug(f"📊 Fallback {symbol2} price: {entry_price2}")
+                    else:
+                        logger.warning(f"🚫 Cannot set valid entry_price2 for {symbol2} - no valid price data available")
+            
+            # CORRUPTION PREVENTION: Reject positions with invalid prices
+            # This prevents saving corrupted positions that would cause astronomical P&L calculations
+            if entry_price1 is None or entry_price2 is None or entry_price1 <= 1.0 or entry_price2 <= 1.0:
+                logger.warning(f"🚫 REJECTING POSITION with invalid entry prices:")
+                logger.warning(f"   Pair: {symbol1}-{symbol2}")
+                logger.warning(f"   entry_price1: {entry_price1}")
+                logger.warning(f"   entry_price2: {entry_price2}")
+                logger.warning(f"   generic entry_price: {entry_price}")
+                logger.warning(f"   This prevents astronomical stop loss calculations")
+                return None  # Reject this position entirely
+            
+            # Ensure we have valid volumes
+            if volume1 is None:
+                volume1 = quantity
+            if volume2 is None:
+                volume2 = quantity
+            
+            logger.debug(f"📊 Final entry prices: {symbol1}={entry_price1}, {symbol2}={entry_price2}")
+            logger.debug(f"📊 Final volumes: {symbol1}={volume1}, {symbol2}={volume2}")
+            
+            transformed = {
+                'symbol1': symbol1,
+                'symbol2': symbol2,
+                'direction': direction,
+                'entry_time': entry_time,
+                'quantity': quantity,
+                'entry_price': entry_price,  # Generic entry price (for schema compatibility)
+                'stop_loss': position.get('stop_loss'),
+                'take_profit': position.get('take_profit'),
+                # Add additional fields for broker compatibility with actual prices
+                'pair': f"{symbol1}-{symbol2}",
+                'entry_price1': entry_price1,  # Actual entry price for symbol1
+                'entry_price2': entry_price2,  # Actual entry price for symbol2
+                'volume1': volume1,  # Actual volume for symbol1
+                'volume2': volume2,  # Actual volume for symbol2
+                'volume': quantity,   # Standard volume field
+            }
+            
+            logger.debug(f"✅ Position transformation successful: {symbol1}-{symbol2} {direction} @ {entry_price} (qty: {quantity})")
+            
+            return transformed
+            
+        except Exception as e:
+            logger.error(f"Failed to transform position {position}: {e}")
+            import traceback
+            logger.debug(f"Transformation error details: {traceback.format_exc()}")
+            return None
+
+    def _normalize_restored_positions(self, positions):
+        """Normalize restored positions to ensure proper data types"""
+        try:
+            if isinstance(positions, list):
+                normalized = []
+                for pos in positions:
+                    normalized_pos = self._normalize_single_position(pos)
+                    if normalized_pos:
+                        normalized.append(normalized_pos)
+                return normalized
+            elif isinstance(positions, dict):
+                normalized = {}
+                for key, pos in positions.items():
+                    normalized_pos = self._normalize_single_position(pos)
+                    if normalized_pos:
+                        normalized[key] = normalized_pos
+                return normalized
+            else:
+                logger.warning(f"Unknown positions format: {type(positions)}")
+                return positions
+        except Exception as e:
+            logger.error(f"Error normalizing restored positions: {e}")
+            return positions
+
+    def _normalize_single_position(self, position):
+        """Normalize a single position to ensure proper data types and detect corrupted positions"""
+        try:
+            if not isinstance(position, dict):
+                return position
+            
+            normalized = position.copy()
+            
+            # CORRUPTION DETECTION: Check for corrupted entry prices that cause astronomical P&L calculations
+            entry_price1 = normalized.get('entry_price1')
+            entry_price2 = normalized.get('entry_price2')
+            generic_entry_price = normalized.get('entry_price')
+            pair = normalized.get('pair', 'UNKNOWN-UNKNOWN')
+            
+            # Flag for excluding this position due to corruption
+            is_corrupted = False
+            corruption_reasons = []
+            
+            # Check for corrupted entry prices (1.0 values that are clearly wrong)
+            if entry_price1 == 1.0:
+                corruption_reasons.append(f"entry_price1=1.0")
+                is_corrupted = True
+            
+            if entry_price2 == 1.0:
+                corruption_reasons.append(f"entry_price2=1.0")
+                is_corrupted = True
+                
+            if generic_entry_price == 1.0 and (entry_price1 is None or entry_price2 is None):
+                corruption_reasons.append(f"generic entry_price=1.0")
+                is_corrupted = True
+            
+            # For crypto pairs, check if prices are realistic
+            if 'BTC' in pair and entry_price1 is not None:
+                if entry_price1 < 1000 or entry_price1 > 1000000:  # BTC should be between $1K-$1M
+                    corruption_reasons.append(f"unrealistic BTC price: {entry_price1}")
+                    is_corrupted = True
+                    
+            if 'ETH' in pair and entry_price2 is not None:
+                if entry_price2 < 100 or entry_price2 > 100000:  # ETH should be between $100-$100K
+                    corruption_reasons.append(f"unrealistic ETH price: {entry_price2}")
+                    is_corrupted = True
+            
+            # If position is corrupted, exclude it from restoration
+            if is_corrupted:
+                logger.warning(f"🚫 EXCLUDING CORRUPTED POSITION: {pair}")
+                logger.warning(f"   Corruption reasons: {', '.join(corruption_reasons)}")
+                logger.warning(f"   This position would cause astronomical stop loss calculations")
+                return None  # Exclude this position entirely
+            
+            # Convert entry_time from string to datetime if needed
+            if 'entry_time' in normalized and isinstance(normalized['entry_time'], str):
+                try:
+                    # Try different datetime formats
+                    entry_time_str = normalized['entry_time']
+                    if 'T' in entry_time_str:
+                        # ISO format
+                        if entry_time_str.endswith('Z'):
+                            entry_time_str = entry_time_str[:-1] + '+00:00'
+                        normalized['entry_time'] = datetime.fromisoformat(entry_time_str)
+                    else:
+                        # Try to parse standard datetime format like "2025-07-22 12:10:44.175515"
+                        try:
+                            normalized['entry_time'] = datetime.strptime(entry_time_str, '%Y-%m-%d %H:%M:%S.%f')
+                        except ValueError:
+                            try:
+                                # Try without microseconds
+                                normalized['entry_time'] = datetime.strptime(entry_time_str, '%Y-%m-%d %H:%M:%S')
+                            except ValueError:
+                                # Try other common formats
+                                try:
+                                    normalized['entry_time'] = datetime.fromisoformat(entry_time_str)
+                                except ValueError:
+                                    # Fallback to current time if all parsing fails
+                                    normalized['entry_time'] = datetime.now()
+                                    logger.warning(f"Could not parse entry_time '{entry_time_str}', using current time")
+                except Exception as e:
+                    logger.warning(f"Error parsing entry_time '{normalized['entry_time']}': {e}")
+                    normalized['entry_time'] = datetime.now()
+            
+            # Ensure all CTrader-required fields are present with proper defaults
+            # For pairs trading, we need to preserve the actual entry prices for each asset
+            # Do NOT use generic fallback values if the position already has proper entry prices
+            
+            # Get existing entry prices if available (preserve historical data)
+            entry_price1 = normalized.get('entry_price1')
+            entry_price2 = normalized.get('entry_price2')
+            
+            # Only use generic entry_price as fallback if specific prices aren't available
+            if entry_price1 is None or entry_price2 is None:
+                generic_entry_price = normalized.get('entry_price', 1.0)
+                if entry_price1 is None:
+                    entry_price1 = generic_entry_price
+                if entry_price2 is None:
+                    entry_price2 = generic_entry_price
+                logger.debug(f"Used fallback entry prices: entry_price1={entry_price1}, entry_price2={entry_price2}")
+            else:
+                logger.debug(f"Preserved actual entry prices: entry_price1={entry_price1}, entry_price2={entry_price2}")
+            
+            # Get quantities
+            volume1 = normalized.get('volume1')
+            volume2 = normalized.get('volume2')
+            
+            # Only use generic quantity as fallback if specific volumes aren't available
+            if volume1 is None or volume2 is None:
+                generic_quantity = normalized.get('quantity', normalized.get('volume', 0.01))
+                if volume1 is None:
+                    volume1 = generic_quantity
+                if volume2 is None:
+                    volume2 = generic_quantity
+                logger.debug(f"Used fallback volumes: volume1={volume1}, volume2={volume2}")
+            else:
+                logger.debug(f"Preserved actual volumes: volume1={volume1}, volume2={volume2}")
+            
+            # Set CTrader broker fields preserving actual data when available
+            ctrader_fields = {
+                'entry_price1': entry_price1,
+                'entry_price2': entry_price2,
+                'volume': max(volume1, volume2),  # Use the larger volume for generic volume field
+                'volume1': volume1,
+                'volume2': volume2,
+            }
+            
+            for field, value in ctrader_fields.items():
+                normalized[field] = value
+                logger.debug(f"Set CTrader field {field} = {value}")
+            
+            # Ensure pair field is present
+            if 'pair' not in normalized:
+                symbol1 = normalized.get('symbol1', 'UNKNOWN')
+                symbol2 = normalized.get('symbol2', 'USD')
+                normalized['pair'] = f"{symbol1}-{symbol2}"
+                logger.debug(f"Added missing pair field: {normalized['pair']}")
+            
+            # Ensure numeric fields are properly typed
+            numeric_fields = ['entry_price', 'entry_price1', 'entry_price2', 'quantity', 'volume', 'volume1', 'volume2', 'stop_loss', 'take_profit']
+            for field in numeric_fields:
+                if field in normalized and normalized[field] is not None:
+                    try:
+                        normalized[field] = float(normalized[field])
+                    except (ValueError, TypeError):
+                        pass  # Keep original value if conversion fails
+            
+            logger.debug(f"✅ Normalized position with all CTrader fields: entry_time type = {type(normalized.get('entry_time'))}")
+            return normalized
+            
+        except Exception as e:
+            logger.error(f"Error normalizing single position: {e}")
+            return position
+
     def save_current_trading_state(self, description: str = "Trading session state save") -> bool:
         """Save current trading state to the database"""
         if not self.state_manager:
@@ -1490,18 +2075,34 @@ class EnhancedTradingSystemV3:
                     logger.info(f"   {i+1}. Key: {key}")
                     if isinstance(pos, dict):
                         logger.info(f"      Direction: {pos.get('direction', 'N/A')}")
-                        logger.info(f"      Symbols: {pos.get('symbol1', 'N/A')}-{pos.get('symbol2', 'N/A')}")
+                        logger.info(f"      Symbol1: {pos.get('symbol1', 'N/A')}")
+                        logger.info(f"      Symbol2: {pos.get('symbol2', 'N/A')}")
                         logger.info(f"      Entry Price: {pos.get('entry_price', 'N/A')}")
                         logger.info(f"      Quantity: {pos.get('quantity', 'N/A')}")
+                        logger.info(f"      Entry Time: {pos.get('entry_time', 'N/A')}")
                     else:
                         logger.info(f"      Data type: {type(pos)}")
                 if len(current_positions) > 3:
                     logger.info(f"   ... and {len(current_positions) - 3} more positions")
             
+            # Debug the exact data being passed to state manager
+            logger.debug(f"🔍 DETAILED STATE MANAGER INPUT:")
+            logger.debug(f"   active_positions type: {type(current_positions)}")
+            logger.debug(f"   active_positions keys: {list(current_positions.keys()) if current_positions else 'None'}")
+            logger.debug(f"   pair_states type: {type(pair_states)}")
+            logger.debug(f"   pair_states keys: {list(pair_states.keys()) if pair_states else 'None'}")
+            logger.debug(f"   portfolio_data type: {type(portfolio_data)}")
+            
             logger.debug(f"Saving state - Positions type: {type(current_positions)}, Pair states type: {type(pair_states)}")
             logger.debug(f"Positions count: {len(current_positions) if isinstance(current_positions, (dict, list)) else 'N/A'}")
             logger.debug(f"Pair states count: {len(pair_states) if isinstance(pair_states, (dict, list)) else 'N/A'}")
             logger.debug(f"Portfolio data structure: {list(portfolio_data.keys())}")
+            
+            # Log detailed position data for debugging
+            if current_positions:
+                logger.debug("🔍 DETAILED POSITION DATA:")
+                for key, position in current_positions.items():
+                    logger.debug(f"   Position '{key}': {position}")
             
             success = self.state_manager.save_trading_state(
                 active_positions=current_positions,
@@ -1510,96 +2111,50 @@ class EnhancedTradingSystemV3:
             )
             
             if success:
+                # IMPORTANT: Force a sync/flush to ensure data is persisted
+                try:
+                    # Give the database time to persist the data
+                    time.sleep(1)
+                    
+                    # Test that the data was actually saved by trying to read it back
+                    logger.info("🔍 Verifying state was actually saved...")
+                    verification_positions = self.state_manager.get_all_positions()
+                    verification_state = self.state_manager.load_trading_state()
+                    
+                    logger.info(f"✅ Verification: Found {len(verification_positions) if verification_positions else 0} positions in database")
+                    logger.info(f"✅ Verification: Found {len(verification_state.get('pair_states', {})) if verification_state else 0} pair states in database")
+                    
+                    # Log verification details
+                    if verification_positions:
+                        logger.info(f"✅ Verification successful: State is persisted and readable")
+                    elif len(current_positions) > 0:
+                        logger.warning(f"⚠️ Verification warning: Saved {len(current_positions)} positions but couldn't read them back")
+                    else:
+                        logger.info("✅ Verification: No positions to save (fresh state)")
+                        
+                except Exception as e:
+                    logger.warning(f"Could not verify saved state: {e}")
+                
                 logger.info("✅ Trading state saved successfully")
                 logger.info(f"   Positions: {len(current_positions)}")
                 logger.info(f"   Pair states: {len(pair_states)}")
                 logger.info(f"   Data provider: {self.data_provider}")
                 logger.info(f"   Broker: {self.broker}")
+                logger.info(f"   Description: {description}")
                 return True
             else:
                 logger.error("❌ Failed to save trading state")
+                # Try to get more details about the failure
+                try:
+                    status = self.state_manager.get_system_status()
+                    logger.error(f"State manager status during save failure: {status}")
+                except Exception as e:
+                    logger.error(f"Could not get state manager status: {e}")
                 return False
                 
         except Exception as e:
             logger.error(f"Error saving trading state: {e}")
             return False
-    
-    def _transform_position_for_schema(self, broker_position: Dict) -> Dict:
-        """Transform broker position data to match PositionSchema requirements"""
-        try:
-            # Extract pair information
-            pair = broker_position.get('pair', '')
-            if '-' in pair:
-                symbol1, symbol2 = pair.split('-', 1)
-            else:
-                symbol1 = broker_position.get('symbol1', pair)
-                symbol2 = broker_position.get('symbol2', 'UNKNOWN')
-            
-            # Transform direction to lowercase as required by schema
-            direction = broker_position.get('direction', '').upper()
-            if direction == 'LONG':
-                direction = 'long'
-            elif direction == 'SHORT':
-                direction = 'short'
-            else:
-                logger.warning(f"Invalid direction '{direction}' in position, skipping")
-                return None
-            
-            # Extract required fields with fallbacks
-            entry_time = broker_position.get('entry_time')
-            if isinstance(entry_time, str):
-                from datetime import datetime
-                try:
-                    entry_time = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
-                except:
-                    entry_time = datetime.now()
-            elif entry_time is None:
-                entry_time = datetime.now()
-            
-            # Get quantity - try multiple field names
-            quantity = broker_position.get('quantity') or broker_position.get('size') or broker_position.get('volume')
-            if quantity is None or quantity <= 0:
-                # Calculate from individual leg quantities if available
-                leg1_qty = broker_position.get('leg1_quantity', 0)
-                leg2_qty = broker_position.get('leg2_quantity', 0)
-                if leg1_qty > 0:
-                    quantity = leg1_qty
-                else:
-                    quantity = 1.0  # Default fallback
-            
-            # Get entry price - try multiple field names
-            entry_price = broker_position.get('entry_price') or broker_position.get('open_price') or broker_position.get('price')
-            if entry_price is None or entry_price <= 0:
-                # Calculate from individual leg prices if available
-                leg1_price = broker_position.get('leg1_price', 0)
-                leg2_price = broker_position.get('leg2_price', 0)
-                if leg1_price > 0:
-                    entry_price = leg1_price
-                elif leg2_price > 0:
-                    entry_price = leg2_price
-                else:
-                    entry_price = 100.0  # Default fallback
-            
-            # Create schema-compliant position
-            transformed_position = {
-                'symbol1': symbol1,
-                'symbol2': symbol2,
-                'direction': direction,
-                'entry_time': entry_time,
-                'quantity': float(quantity),
-                'entry_price': float(entry_price),
-                'stop_loss': broker_position.get('stop_loss'),  # Optional
-                'take_profit': broker_position.get('take_profit')  # Optional
-            }
-            
-            logger.debug(f"Position transformation: {broker_position.get('pair', 'Unknown')} -> {direction} @ {entry_price} (qty: {quantity})")
-            
-            return transformed_position
-            
-        except Exception as e:
-            logger.error(f"Error transforming position data: {e}")
-            logger.debug(f"Original position data: {broker_position}")
-            return None
     
     def shutdown_gracefully(self) -> bool:
         """Gracefully shutdown the trading system and save state"""
@@ -1922,6 +2477,11 @@ class EnhancedTradingSystemV3:
     def start_real_time_trading(self) -> bool:
         """Start real-time trading with selected broker"""
         logger.info(f"Starting real-time trading with {self.broker} broker...")
+        
+        # CRITICAL: Set environment variable to indicate live trading context
+        # This helps data managers detect live trading before reactor starts
+        os.environ['TRADING_MODE'] = 'live'
+        logger.info("🔧 Set TRADING_MODE=live to help prevent reactor conflicts")
         
         try:
             if not self.trader:
@@ -2367,7 +2927,7 @@ class EnhancedTradingSystemV3:
 
 
 def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'backtest', 
-         force_refresh: bool = False, strategy: str = 'pairs'):
+         force_refresh: bool = False, strategy: str = 'pairs', fresh_state: bool = False):
     """
     Main execution function with enhanced features and configurable data provider, broker, and strategy
     
@@ -2377,6 +2937,7 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
         mode: 'backtest' or 'live' - execution mode
         force_refresh: Force re-fetch all data ignoring cache
         strategy: 'pairs' or other strategy types - trading strategy to use
+        fresh_state: Start with fresh state, clearing all previous positions and pair states
     """
     system = None
     
@@ -2398,6 +2959,7 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
         logger.info(f"Strategy: {strategy}")
         logger.info(f"Execution Mode: {mode}")
         logger.info(f"Force Data Refresh: {force_refresh}")
+        logger.info(f"Fresh State: {fresh_state}")
         logger.info(f"Configuration: {CONFIG.pairs[:3]}... ({len(CONFIG.pairs)} total pairs)")
         
         # Create strategy instance based on parameter
@@ -2410,7 +2972,7 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
             strategy_instance = OptimizedPairsStrategy(CONFIG, None)
         
         # Create system with selected providers and strategy
-        system = EnhancedTradingSystemV3(data_provider=data_provider, broker=broker, strategy=strategy_instance, mode=mode)
+        system = EnhancedTradingSystemV3(data_provider=data_provider, broker=broker, strategy=strategy_instance, mode=mode, fresh_state=fresh_state)
         
         if not system.initialize():
             logger.error("Failed to initialize trading system")
@@ -2607,6 +3169,9 @@ if __name__ == "__main__":
     parser.add_argument('--force-refresh', '-f', 
                        action='store_true',
                        help='Force refresh all data ignoring cache')
+    parser.add_argument('--fresh-state', 
+                       action='store_true',
+                       help='Start with fresh state, clearing all previous positions and pair states')
     
     args = parser.parse_args()
     
@@ -2614,4 +3179,4 @@ if __name__ == "__main__":
     os.environ['TRADING_MODE'] = args.mode
     
     main(data_provider=args.data_provider, broker=args.broker, mode=args.mode, 
-         force_refresh=args.force_refresh, strategy=args.strategy)
+         force_refresh=args.force_refresh, strategy=args.strategy, fresh_state=args.fresh_state)
