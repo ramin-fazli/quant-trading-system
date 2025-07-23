@@ -126,19 +126,70 @@ class PortfolioCalculator:
                     bid2, ask2 = bid_ask_prices[symbol2]
                     
                     # Calculate P&L based on position direction and order types
-                    current_market_price1 = bid1 if position['order1_type'] == 'buy' else ask1
-                    current_market_price2 = bid2 if position['order2_type'] == 'buy' else ask2
+                    if 'order1_type' in position and 'order2_type' in position:
+                        # Use explicit order types if available (MT5 style)
+                        current_market_price1 = bid1 if position['order1_type'] == 'buy' else ask1
+                        current_market_price2 = bid2 if position['order2_type'] == 'buy' else ask2
+                    else:
+                        # Infer order types from position direction (CTrader style)
+                        direction = position.get('direction', 'LONG')
+                        if direction == 'LONG':
+                            # LONG: buy symbol1, sell symbol2
+                            current_market_price1 = bid1  # Close buy position at bid
+                            current_market_price2 = ask2  # Close sell position at ask
+                        else:
+                            # SHORT: sell symbol1, buy symbol2
+                            current_market_price1 = ask1  # Close sell position at ask
+                            current_market_price2 = bid2  # Close buy position at bid
                     
-                    # Get contract sizes
-                    contract_size1 = symbol_info_cache[symbol1]['trade_contract_size']
-                    contract_size2 = symbol_info_cache[symbol2]['trade_contract_size']
+                    # Get contract sizes with validation
+                    symbol1_info = symbol_info_cache.get(symbol1, {})
+                    symbol2_info = symbol_info_cache.get(symbol2, {})
                     
-                    # Calculate current and entry values
-                    current_value1 = position['volume1'] * current_market_price1 * contract_size1
-                    current_value2 = position['volume2'] * current_market_price2 * contract_size2
+                    if not symbol1_info:
+                        logger.error(f"Missing symbol info for {symbol1} in cache - skipping position {pair_str}")
+                        continue
+                    if not symbol2_info:
+                        logger.error(f"Missing symbol info for {symbol2} in cache - skipping position {pair_str}")
+                        continue
                     
-                    entry_value1 = position['volume1'] * position['entry_exec_price1'] * contract_size1
-                    entry_value2 = position['volume2'] * position['entry_exec_price2'] * contract_size2
+                    contract_size1 = symbol1_info.get('lot_size')
+                    contract_size2 = symbol2_info.get('lot_size')
+                    
+                    if contract_size1 is None or contract_size1 <= 0:
+                        logger.error(f"Invalid or missing lot_size for {symbol1}: {contract_size1} - skipping position {pair_str}")
+                        continue
+                    if contract_size2 is None or contract_size2 <= 0:
+                        logger.error(f"Invalid or missing lot_size for {symbol2}: {contract_size2} - skipping position {pair_str}")
+                        continue
+                    
+                    # Get entry prices with validation
+                    entry_price1 = position.get('entry_exec_price1') or position.get('entry_price1')
+                    entry_price2 = position.get('entry_exec_price2') or position.get('entry_price2')
+                    
+                    if not entry_price1 or entry_price1 <= 0:
+                        logger.error(f"Invalid or missing entry price for {symbol1}: {entry_price1} - skipping position {pair_str}")
+                        continue
+                    if not entry_price2 or entry_price2 <= 0:
+                        logger.error(f"Invalid or missing entry price for {symbol2}: {entry_price2} - skipping position {pair_str}")
+                        continue
+                    
+                    # Validate position volumes
+                    volume1 = position.get('volume1')
+                    volume2 = position.get('volume2')
+                    if volume1 is None or volume1 <= 0:
+                        logger.error(f"Invalid or missing volume1 for position {pair_str}: {volume1} - skipping")
+                        continue
+                    if volume2 is None or volume2 <= 0:
+                        logger.error(f"Invalid or missing volume2 for position {pair_str}: {volume2} - skipping")
+                        continue
+                    
+                    # Calculate current and entry values using validated volumes
+                    current_value1 = volume1 * current_market_price1 * contract_size1
+                    current_value2 = volume2 * current_market_price2 * contract_size2
+                    
+                    entry_value1 = volume1 * entry_price1 * contract_size1
+                    entry_value2 = volume2 * entry_price2 * contract_size2
                     
                     # Calculate P&L based on direction
                     if position['direction'] == 'LONG':
@@ -173,6 +224,16 @@ class PortfolioCalculator:
         try:
             symbol1, symbol2 = position['symbol1'], position['symbol2']
             
+            # Validate position volumes
+            volume1 = position.get('volume1')
+            volume2 = position.get('volume2')
+            if volume1 is None or volume1 <= 0:
+                logger.error(f"Invalid or missing volume1 for position {symbol1}-{symbol2}: {volume1}")
+                return 0.0
+            if volume2 is None or volume2 <= 0:
+                logger.error(f"Invalid or missing volume2 for position {symbol1}-{symbol2}: {volume2}")
+                return 0.0
+            
             # Get current bid/ask prices
             bid_ask_prices = price_provider.get_bid_ask_prices([symbol1, symbol2])
             if symbol1 not in bid_ask_prices or symbol2 not in bid_ask_prices:
@@ -181,20 +242,64 @@ class PortfolioCalculator:
             bid1, ask1 = bid_ask_prices[symbol1]
             bid2, ask2 = bid_ask_prices[symbol2]
             
-            # Determine close prices based on order types
-            close_price1 = bid1 if position['order1_type'] == 'buy' else ask1
-            close_price2 = bid2 if position['order2_type'] == 'buy' else ask2
+            # Determine close prices based on order types or infer from direction
+            if 'order1_type' in position and 'order2_type' in position:
+                # Use explicit order types if available (MT5 style)
+                close_price1 = bid1 if position['order1_type'] == 'buy' else ask1
+                close_price2 = bid2 if position['order2_type'] == 'buy' else ask2
+            else:
+                # Infer order types from position direction (CTrader style)
+                direction = position.get('direction', 'LONG')
+                if direction == 'LONG':
+                    # LONG: buy symbol1, sell symbol2
+                    close_price1 = bid1  # Close buy position at bid
+                    close_price2 = ask2  # Close sell position at ask
+                else:
+                    # SHORT: sell symbol1, buy symbol2
+                    close_price1 = ask1  # Close sell position at ask
+                    close_price2 = bid2  # Close buy position at bid
             
-            # Calculate values
-            contract_size1 = symbol_info_cache[symbol1]['trade_contract_size']
-            contract_size2 = symbol_info_cache[symbol2]['trade_contract_size']
+            # Get contract sizes with validation
+            symbol1_info = symbol_info_cache.get(symbol1, {})
+            symbol2_info = symbol_info_cache.get(symbol2, {})
             
-            entry_value1 = position['volume1'] * position['entry_exec_price1'] * contract_size1
-            entry_value2 = position['volume2'] * position['entry_exec_price2'] * contract_size2
-            close_value1 = position['volume1'] * close_price1 * contract_size1
-            close_value2 = position['volume2'] * close_price2 * contract_size2
+            if not symbol1_info:
+                logger.error(f"Missing symbol info for {symbol1} in cache")
+                return 0.0
+            if not symbol2_info:
+                logger.error(f"Missing symbol info for {symbol2} in cache")
+                return 0.0
             
-            if position['direction'] == 'LONG':
+            contract_size1 = symbol1_info.get('lot_size')
+            contract_size2 = symbol2_info.get('lot_size')
+            
+            if contract_size1 is None or contract_size1 <= 0:
+                logger.error(f"Invalid or missing lot_size for {symbol1}: {contract_size1}")
+                return 0.0
+            if contract_size2 is None or contract_size2 <= 0:
+                logger.error(f"Invalid or missing lot_size for {symbol2}: {contract_size2}")
+                return 0.0
+            
+            # Get entry prices with validation
+            entry_price1 = position.get('entry_exec_price1') or position.get('entry_price1')
+            entry_price2 = position.get('entry_exec_price2') or position.get('entry_price2')
+            
+            if not entry_price1 or entry_price1 <= 0:
+                logger.error(f"Invalid or missing entry price for {symbol1}: {entry_price1}")
+                return 0.0
+            if not entry_price2 or entry_price2 <= 0:
+                logger.error(f"Invalid or missing entry price for {symbol2}: {entry_price2}")
+                return 0.0
+            
+            # Calculate values using validated volumes
+            entry_value1 = volume1 * entry_price1 * contract_size1
+            entry_value2 = volume2 * entry_price2 * contract_size2
+            close_value1 = volume1 * close_price1 * contract_size1
+            close_value2 = volume2 * close_price2 * contract_size2
+            
+            # Calculate P&L based on direction
+            direction = position.get('direction', 'LONG')
+            if direction == 'LONG':
                 pnl_dollar = (close_value1 - entry_value1) + (entry_value2 - close_value2)
             else:
                 pnl_dollar = (entry_value1 - close_value1) + (close_value2 - entry_value2)
@@ -219,9 +324,24 @@ class PortfolioCalculator:
         
         try:
             for pair_str, position in active_positions.items():
-                # Add both legs of the position to total exposure
-                leg1_exposure = position.get('monetary_value1', 0)
-                leg2_exposure = position.get('monetary_value2', 0)
+                # Validate monetary values exist and are valid
+                leg1_exposure = position.get('monetary_value1')
+                leg2_exposure = position.get('monetary_value2')
+                
+                if leg1_exposure is None:
+                    logger.warning(f"Missing monetary_value1 for position {pair_str} - skipping from exposure calculation")
+                    continue
+                if leg2_exposure is None:
+                    logger.warning(f"Missing monetary_value2 for position {pair_str} - skipping from exposure calculation")
+                    continue
+                
+                if not isinstance(leg1_exposure, (int, float)) or leg1_exposure < 0:
+                    logger.warning(f"Invalid monetary_value1 for position {pair_str}: {leg1_exposure} - skipping from exposure calculation")
+                    continue
+                if not isinstance(leg2_exposure, (int, float)) or leg2_exposure < 0:
+                    logger.warning(f"Invalid monetary_value2 for position {pair_str}: {leg2_exposure} - skipping from exposure calculation")
+                    continue
+                
                 position_exposure = leg1_exposure + leg2_exposure
                 total_exposure += position_exposure
                 
@@ -252,6 +372,51 @@ class PositionMonitor:
         Returns:
             PositionInfo object
         """
+        # Validate essential position data
+        if not position.get('symbol1'):
+            logger.error(f"Missing symbol1 for position {pair_str}")
+            raise ValueError(f"Missing symbol1 for position {pair_str}")
+        if not position.get('symbol2'):
+            logger.error(f"Missing symbol2 for position {pair_str}")
+            raise ValueError(f"Missing symbol2 for position {pair_str}")
+        if not position.get('direction'):
+            logger.error(f"Missing direction for position {pair_str}")
+            raise ValueError(f"Missing direction for position {pair_str}")
+        
+        # Validate volume data
+        volume1 = position.get('volume1')
+        volume2 = position.get('volume2')
+        if volume1 is None or volume1 <= 0:
+            logger.error(f"Invalid or missing volume1 for position {pair_str}: {volume1}")
+            raise ValueError(f"Invalid volume1 for position {pair_str}")
+        if volume2 is None or volume2 <= 0:
+            logger.error(f"Invalid or missing volume2 for position {pair_str}: {volume2}")
+            raise ValueError(f"Invalid volume2 for position {pair_str}")
+        
+        # Validate entry prices
+        entry_price1 = position.get('entry_exec_price1') or position.get('entry_price1')
+        entry_price2 = position.get('entry_exec_price2') or position.get('entry_price2')
+        if not entry_price1 or entry_price1 <= 0:
+            logger.error(f"Invalid or missing entry price1 for position {pair_str}: {entry_price1}")
+            raise ValueError(f"Invalid entry price1 for position {pair_str}")
+        if not entry_price2 or entry_price2 <= 0:
+            logger.error(f"Invalid or missing entry price2 for position {pair_str}: {entry_price2}")
+            raise ValueError(f"Invalid entry price2 for position {pair_str}")
+        
+        # Validate entry time
+        entry_time = position.get('entry_time')
+        if not entry_time:
+            logger.error(f"Missing entry_time for position {pair_str}")
+            raise ValueError(f"Missing entry_time for position {pair_str}")
+        
+        # Validate monetary values
+        monetary_value1 = position.get('monetary_value1')
+        monetary_value2 = position.get('monetary_value2')
+        if monetary_value1 is None:
+            logger.warning(f"Missing monetary_value1 for position {pair_str}")
+        if monetary_value2 is None:
+            logger.warning(f"Missing monetary_value2 for position {pair_str}")
+        
         # Get current prices if provider is available
         current_price1, current_price2 = None, None
         current_pnl = None
@@ -269,15 +434,15 @@ class PositionMonitor:
             symbol1=position['symbol1'],
             symbol2=position['symbol2'],
             direction=position['direction'],
-            volume1=position['volume1'],
-            volume2=position['volume2'],
-            entry_price1=position['entry_exec_price1'],
-            entry_price2=position['entry_exec_price2'],
-            entry_time=position['entry_time'],
-            order1_type=position['order1_type'],
-            order2_type=position['order2_type'],
-            monetary_value1=position.get('monetary_value1', 0),
-            monetary_value2=position.get('monetary_value2', 0),
+            volume1=volume1,
+            volume2=volume2,
+            entry_price1=entry_price1,
+            entry_price2=entry_price2,
+            entry_time=entry_time,
+            order1_type=position.get('order1_type', 'buy' if position.get('direction') == 'LONG' else 'sell'),
+            order2_type=position.get('order2_type', 'sell' if position.get('direction') == 'LONG' else 'buy'),
+            monetary_value1=monetary_value1 or 0.0,
+            monetary_value2=monetary_value2 or 0.0,
             current_pnl=current_pnl,
             current_price1=current_price1,
             current_price2=current_price2
@@ -338,6 +503,18 @@ class PositionMonitor:
         
         for pair_str, position in active_positions.items():
             try:
+                # Validate that position contains required data
+                if not position or not isinstance(position, dict):
+                    logger.error(f"Invalid position data for {pair_str}: {type(position)}")
+                    continue
+                
+                # Validate essential fields exist
+                required_fields = ['symbol1', 'symbol2', 'direction', 'volume1', 'volume2', 'entry_time']
+                missing_fields = [field for field in required_fields if field not in position or position[field] is None]
+                if missing_fields:
+                    logger.error(f"Missing required fields for position {pair_str}: {missing_fields}")
+                    continue
+                
                 position_info = self.create_position_info(pair_str, position, price_provider)
                 
                 # Calculate P&L if possible
@@ -359,8 +536,8 @@ class PositionMonitor:
                     'volume2': position_info.volume2,
                     'entry_price1': position_info.entry_price1,
                     'entry_price2': position_info.entry_price2,
-                    'current_price1': position_info.current_price1 or 0,
-                    'current_price2': position_info.current_price2 or 0,
+                    'current_price1': position_info.current_price1,  # Can be None if unavailable
+                    'current_price2': position_info.current_price2,  # Can be None if unavailable
                     'entry_time': position_info.entry_time,
                     'duration': self.calculate_position_duration(position),
                     'monetary_value1': position_info.monetary_value1,
@@ -418,14 +595,33 @@ class PortfolioManager:
             # Calculate unrealized P&L
             unrealized_pnl = current_value - self.portfolio_calculator.initial_portfolio_value
             
-            # Use account info if available, otherwise use calculated values
-            if account_info:
-                balance = account_info.get('balance', current_value)
-                equity = account_info.get('equity', current_value)
-                free_margin = account_info.get('free_margin', 0)
-                margin_level = account_info.get('margin_level', 0)
-                realized_pnl = account_info.get('profit', 0)
+            # Use account info if available and valid, otherwise use calculated values
+            if account_info and isinstance(account_info, dict):
+                balance = account_info.get('balance')
+                equity = account_info.get('equity')
+                free_margin = account_info.get('free_margin')
+                margin_level = account_info.get('margin_level')
+                realized_pnl = account_info.get('profit')
+                
+                # Validate account info values
+                if balance is None or not isinstance(balance, (int, float)):
+                    logger.warning(f"Invalid balance in account_info: {balance}, using calculated portfolio value")
+                    balance = current_value
+                if equity is None or not isinstance(equity, (int, float)):
+                    logger.warning(f"Invalid equity in account_info: {equity}, using calculated portfolio value")
+                    equity = current_value
+                if free_margin is None or not isinstance(free_margin, (int, float)):
+                    logger.warning(f"Invalid free_margin in account_info: {free_margin}, setting to 0")
+                    free_margin = 0
+                if margin_level is None or not isinstance(margin_level, (int, float)):
+                    logger.warning(f"Invalid margin_level in account_info: {margin_level}, setting to 0")
+                    margin_level = 0
+                if realized_pnl is None or not isinstance(realized_pnl, (int, float)):
+                    logger.warning(f"Invalid profit in account_info: {realized_pnl}, setting to 0")
+                    realized_pnl = 0
             else:
+                if account_info is not None:
+                    logger.warning(f"Invalid account_info provided: {type(account_info)}, using calculated values")
                 balance = current_value
                 equity = current_value
                 free_margin = 0

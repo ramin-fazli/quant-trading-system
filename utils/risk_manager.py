@@ -82,8 +82,29 @@ class CurrencyConverter:
         """
         Get the profit currency for a symbol - to be overridden by broker implementations
         """
-        info = symbol_info_cache.get(symbol, {})
-        return info.get('currency_profit', self.account_currency)
+        if not symbol_info_cache:
+            logger.error("No symbol_info_cache provided for currency lookup")
+            return None
+            
+        if symbol not in symbol_info_cache:
+            logger.error(f"Symbol {symbol} not found in symbol_info_cache")
+            return None
+            
+        info = symbol_info_cache[symbol]
+        if not isinstance(info, dict):
+            logger.error(f"Invalid symbol info format for {symbol}: expected dict, got {type(info)}")
+            return None
+            
+        if 'currency_profit' not in info:
+            logger.error(f"Missing currency_profit field for symbol {symbol}")
+            return None
+            
+        currency = info['currency_profit']
+        if not currency or not isinstance(currency, str):
+            logger.error(f"Invalid currency_profit for symbol {symbol}: {currency}")
+            return None
+            
+        return currency
 
 
 class DrawdownTracker:
@@ -247,33 +268,42 @@ class VolumeBalancer:
                 logger.error(f"No symbol details available for {symbol2}")
                 return None
             
-            # Ensure required fields are available with proper fallbacks
+            # Validate all required fields are available and valid
             required_fields = ['digits', 'min_volume', 'step_volume', 'lot_size']
             
             for symbol, details in [(symbol1, symbol_details1), (symbol2, symbol_details2)]:
                 for field in required_fields:
                     if field not in details or details[field] is None:
-                        logger.warning(f"Missing or null field '{field}' for symbol {symbol}")
+                        logger.error(f"Missing or null required field '{field}' for symbol {symbol}")
+                        return None
             
             logger.debug(f"Volume calculation for {symbol1}-{symbol2}:")
-            logger.debug(f"  {symbol1}: price={price1:.5f}, min_volume={symbol_details1.get('min_volume', 'MISSING')}, step_volume={symbol_details1.get('step_volume', 'MISSING')}")
-            logger.debug(f"  {symbol2}: price={price2:.5f}, min_volume={symbol_details2.get('min_volume', 'MISSING')}, step_volume={symbol_details2.get('step_volume', 'MISSING')}")
+            logger.debug(f"  {symbol1}: price={price1:.5f}, min_volume={symbol_details1.get('min_volume') if 'min_volume' in symbol_details1 else 'NOT_SET'}, step_volume={symbol_details1.get('step_volume') if 'step_volume' in symbol_details1 else 'NOT_SET'}")
+            logger.debug(f"  {symbol2}: price={price2:.5f}, min_volume={symbol_details2.get('min_volume') if 'min_volume' in symbol_details2 else 'NOT_SET'}, step_volume={symbol_details2.get('step_volume') if 'step_volume' in symbol_details2 else 'NOT_SET'}")
             
             # Calculate target monetary value per leg (half of max position size for each leg)
             target_monetary_value = max_position_size / 2
             
             logger.debug(f"  Target monetary value per leg: ${target_monetary_value:.2f}")
             
-            # Get lot sizes from symbol details (contract sizes)
-            lot_size1 = symbol_details1.get('lot_size')
-            lot_size2 = symbol_details2.get('lot_size')
-            
-            if lot_size1 is None:
-                logger.error(f"No lot size information available for {symbol1}")
+            # Extract and validate lot sizes from symbol details (contract sizes)
+            if 'lot_size' not in symbol_details1:
+                logger.error(f"Missing lot_size field for symbol {symbol1}")
                 return None
                 
-            if lot_size2 is None:
-                logger.error(f"No lot size information available for {symbol2}")
+            if 'lot_size' not in symbol_details2:
+                logger.error(f"Missing lot_size field for symbol {symbol2}")
+                return None
+                
+            lot_size1 = symbol_details1['lot_size']
+            lot_size2 = symbol_details2['lot_size']
+            
+            if lot_size1 is None or not isinstance(lot_size1, (int, float)) or lot_size1 <= 0:
+                logger.error(f"Invalid lot_size for symbol {symbol1}: {lot_size1}")
+                return None
+                
+            if lot_size2 is None or not isinstance(lot_size2, (int, float)) or lot_size2 <= 0:
+                logger.error(f"Invalid lot_size for symbol {symbol2}: {lot_size2}")
                 return None
             
             # Use lot sizes as contract sizes
@@ -289,17 +319,39 @@ class VolumeBalancer:
             
             logger.debug(f"  Raw volumes: {symbol1}={volume1_raw:.6f}, {symbol2}={volume2_raw:.6f}")
             
-            # Apply volume constraints
-            volume_constraints1 = {
-                'volume_min': symbol_details1.get('min_volume', 0.01),
-                'volume_max': symbol_details1.get('max_volume', 100.0),
-                'volume_step': symbol_details1.get('step_volume', 0.01)
-            }
-            volume_constraints2 = {
-                'volume_min': symbol_details2.get('min_volume', 0.01),
-                'volume_max': symbol_details2.get('max_volume', 100.0),
-                'volume_step': symbol_details2.get('step_volume', 0.01)
-            }
+            # Validate and extract volume constraints
+            def get_volume_constraints(symbol: str, details: Dict[str, Any]) -> Optional[Dict[str, float]]:
+                """Extract volume constraints with validation"""
+                required_fields = ['min_volume', 'step_volume']
+                constraints = {}
+                
+                for field in required_fields:
+                    if field not in details:
+                        logger.error(f"Missing required volume constraint '{field}' for symbol {symbol}")
+                        return None
+                    
+                    value = details[field]
+                    if value is None or not isinstance(value, (int, float)) or value <= 0:
+                        logger.error(f"Invalid {field} for symbol {symbol}: {value}")
+                        return None
+                    constraints[field.replace('min_volume', 'volume_min').replace('step_volume', 'volume_step')] = float(value)
+                
+                # max_volume is optional but must be valid if present
+                if 'max_volume' in details and details['max_volume'] is not None:
+                    max_vol = details['max_volume']
+                    if isinstance(max_vol, (int, float)) and max_vol > 0:
+                        constraints['volume_max'] = float(max_vol)
+                    else:
+                        logger.warning(f"Invalid max_volume for symbol {symbol}: {max_vol}. Ignoring.")
+                
+                return constraints
+            
+            volume_constraints1 = get_volume_constraints(symbol1, symbol_details1)
+            volume_constraints2 = get_volume_constraints(symbol2, symbol_details2)
+            
+            if volume_constraints1 is None or volume_constraints2 is None:
+                logger.error(f"Failed to extract volume constraints for {symbol1}-{symbol2}")
+                return None
             
             volume1 = self._normalize_volume(volume1_raw, volume_constraints1)
             volume2 = self._normalize_volume(volume2_raw, volume_constraints2)
@@ -386,8 +438,12 @@ class VolumeBalancer:
                     return None
             
             min_vol = constraints['volume_min']
-            max_vol = constraints.get('volume_max')
             step = constraints['volume_step']
+            
+            # Check if max_vol is provided
+            max_vol = None
+            if 'volume_max' in constraints:
+                max_vol = constraints['volume_max']
             
             logger.debug(f"Normalizing volume: raw={volume_raw:.6f}, min={min_vol}, max={max_vol or 'None'}, step={step}")
             

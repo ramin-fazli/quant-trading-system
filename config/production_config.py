@@ -206,7 +206,7 @@ class TradingConfig:
     # === System Parameters ===
     use_multiprocessing: bool = field(default_factory=lambda: _str_to_bool(os.getenv('USE_MULTIPROCESSING', 'true')))
     max_workers: int = field(default_factory=lambda: int(os.getenv('MAX_WORKERS', '8')))
-    log_level: str = field(default_factory=lambda: os.getenv('LOG_LEVEL', 'INFO'))
+    log_level: str = field(default_factory=lambda: os.getenv('LOG_LEVEL', 'WARNING'))
     
     # === Computed Paths (only computed when accessed) ===
     @property

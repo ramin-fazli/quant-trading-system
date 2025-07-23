@@ -24,6 +24,7 @@ import time
 import logging
 import threading
 import traceback
+import numpy as np
 import pandas as pd
 from collections import deque, defaultdict
 from datetime import datetime, timedelta
@@ -96,12 +97,12 @@ class CTraderRealTimeTrader(BaseBroker):
     strategy that implements the BaseStrategy interface.
     """
     
-    def __init__(self, data_manager, config=None, strategy: BaseStrategy = None):
+    def __init__(self, config: TradingConfig, data_manager, strategy: BaseStrategy = None):
         if not CTRADER_API_AVAILABLE:
             raise ImportError("cTrader Open API not available. Install with: pip install ctrader-open-api")
         
-        # Set account currency before calling parent constructor
-        self.account_currency = "USD"  # Default, will be updated from account info
+        # Account currency will be set after account info is received
+        self.account_currency = None  # Will be updated from account info
         
         # Initialize base broker first
         super().__init__(config, data_manager, strategy)
@@ -126,6 +127,11 @@ class CTraderRealTimeTrader(BaseBroker):
         self.execution_requests = {}
         self.pending_pair_trades = {}  # Track pending pair trades awaiting execution confirmation
         self.pending_close_positions = {}  # Track pending close position requests
+        
+        # Manual trade tracking for detecting external position changes
+        self.suspended_pairs = set()  # Track pairs suspended due to issues
+        self._position_reconciliation_scheduled = False  # Flag for reconciliation scheduling
+        self._last_reconciliation_time = None  # Track last reconciliation time
         self.next_order_id = 1
         self.symbols_map = {}
         self.symbol_id_to_name_map = {}
@@ -263,36 +269,79 @@ class CTraderRealTimeTrader(BaseBroker):
     
     def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
         """Get symbol information from symbol details"""
-        if symbol in self.symbol_details:
-            symbol_detail = self.symbol_details[symbol]
-            return {
-                'symbol_id': getattr(symbol_detail, 'symbolId', 0),
-                'symbol_name': getattr(symbol_detail, 'symbolName', symbol),
-                'digits': getattr(symbol_detail, 'digits', 5),
-                'pip_position': getattr(symbol_detail, 'pipPosition', -5),
-                'enable_short_selling': getattr(symbol_detail, 'enableShortSelling', True),
-                'min_volume': getattr(symbol_detail, 'minVolume', 0.01),
-                'max_volume': getattr(symbol_detail, 'maxVolume', 100.0),
-                'volume_step': getattr(symbol_detail, 'stepVolume', 0.01),
-                'base_currency': getattr(symbol_detail, 'baseCurrency', 'USD'),
-                'quote_currency': getattr(symbol_detail, 'quoteCurrency', 'USD'),
-                'trade_contract_size': 1.0  # CTrader typically uses 1.0 for contract size
-            }
-        return {}
+        if symbol not in self.symbol_details:
+            logger.error(f"Symbol {symbol} not found in symbol details cache")
+            return {}
+            
+        symbol_detail = self.symbol_details[symbol]
+        
+        # Validate required fields exist
+        required_fields = ['symbol_id', 'symbol_name', 'digits', 'pip_position']
+        missing_fields = [field for field in required_fields if field not in symbol_detail or symbol_detail[field] is None]
+        if missing_fields:
+            logger.error(f"Missing required symbol info fields for {symbol}: {missing_fields}")
+            return {}
+        
+        # Validate numeric fields
+        digits = symbol_detail.get('digits')
+        pip_position = symbol_detail.get('pip_position')
+        lot_size = symbol_detail.get('lot_size')
+        
+        if not isinstance(digits, int) or digits < 0:
+            logger.error(f"Invalid digits value for {symbol}: {digits}")
+            return {}
+        if not isinstance(pip_position, int):
+            logger.error(f"Invalid pip_position value for {symbol}: {pip_position}")
+            return {}
+        if lot_size is not None and (not isinstance(lot_size, (int, float)) or lot_size <= 0):
+            logger.error(f"Invalid lot_size value for {symbol}: {lot_size}")
+            return {}
+        
+        result = {
+            'symbol_id': symbol_detail['symbol_id'],
+            'symbol_name': symbol_detail['symbol_name'],
+            'digits': symbol_detail['digits'],
+            'pip_position': symbol_detail['pip_position'],
+        }
+        
+        # Add optional fields only if they exist and are valid
+        optional_fields = ['enable_short_selling', 'min_volume', 'max_volume', 'volume_step', 'lot_size', 'base_currency', 'quote_currency', 'spread', 'point']
+        for field in optional_fields:
+            value = symbol_detail.get(field)
+            if value is not None:
+                if field in ['min_volume', 'max_volume', 'volume_step', 'lot_size', 'spread', 'point']:
+                    if isinstance(value, (int, float)) and value > 0:
+                        result[field] = value
+                    else:
+                        logger.warning(f"Invalid {field} value for {symbol}: {value}")
+                elif field == 'enable_short_selling':
+                    if isinstance(value, bool):
+                        result[field] = value
+                    else:
+                        logger.warning(f"Invalid {field} value for {symbol}: {value}")
+                elif field in ['base_currency', 'quote_currency']:
+                    if isinstance(value, str) and value:
+                        result[field] = value
+                    else:
+                        logger.warning(f"Invalid {field} value for {symbol}: {value}")
+        
+        return result
     
     def get_account_info(self) -> Dict[str, Any]:
-        """Get account information from CTrader (placeholder implementation)"""
+        """Get account information from CTrader"""
         # Note: CTrader account info would need to be retrieved via API calls
-        # This is a placeholder implementation
+        # This method returns None values to indicate data is not available
+        # Consuming code should handle None values appropriately
+        logger.warning("CTrader account info not implemented - returning empty structure")
         return {
-            'balance': 0.0,
-            'equity': 0.0,
-            'margin': 0.0,
-            'free_margin': 0.0,
-            'margin_level': 0.0,
-            'profit': 0.0,
-            'currency': self.account_currency,
-            'leverage': 100,
+            'balance': None,
+            'equity': None,
+            'margin': None,
+            'free_margin': None,
+            'margin_level': None,
+            'profit': None,
+            'currency': self.account_currency if hasattr(self, 'account_currency') and self.account_currency else None,
+            'leverage': None,
             'server': 'cTrader',
             'name': 'CTrader Account'
         }
@@ -303,6 +352,474 @@ class CTraderRealTimeTrader(BaseBroker):
         for symbol, details in self.symbol_details.items():
             cache[symbol] = self.get_symbol_info(symbol)
         return cache
+    
+    def get_symbol_spreads(self, symbols: List[str] = None) -> Dict[str, float]:
+        """Get current spreads for symbols in points"""
+        if symbols is None:
+            symbols = list(self.symbol_details.keys())
+        
+        spreads = {}
+        for symbol in symbols:
+            if symbol in self.symbol_details:
+                spread = self.symbol_details[symbol].get('spread')
+                if spread is not None and spread > 0:
+                    spreads[symbol] = spread
+        
+        return spreads
+    
+    def _is_market_open(self, symbol: str) -> bool:
+        """
+        Check if the market is open for trading for a specific symbol using trading sessions.
+        Uses the ProtoOAInterval from trading sessions to determine if current time falls
+        within an active trading session.
+        
+        According to cTrader API documentation:
+        - Each symbol has trading sessions for each day of the week
+        - Each session contains intervals with startSecond and endSecond
+        - Times are specified in seconds from SUNDAY 00:00 in the symbol's timezone
+        
+        SPECIAL HANDLING: For US stocks (.US symbols), cTrader provides extended/CFD hours
+        but we override with standard US market hours (9:30 AM - 4:00 PM EST).
+        
+        Args:
+            symbol: Symbol to check market status for
+            
+        Returns:
+            bool: True if market is open for new trades, False otherwise
+        """
+        if symbol not in self.symbol_details:
+            logger.error(f"❌ Market status check failed - symbol {symbol} not found in symbol details")
+            return False
+        
+        symbol_detail = self.symbol_details[symbol]
+        
+        # First check if trading is enabled at all
+        trading_mode = symbol_detail.get('trading_mode')
+        if trading_mode is not None and trading_mode != 0:  # Not ENABLED
+            mode_desc = {0: "ENABLED", 1: "DISABLED", 2: "CLOSE_ONLY"}.get(trading_mode, f"UNKNOWN({trading_mode})")
+            logger.debug(f"🔒 Trading disabled for {symbol} - trading mode: {mode_desc}")
+            return False
+        
+        # SPECIAL HANDLING FOR US STOCKS
+        # cTrader provides extended/CFD hours for .US symbols, but we want standard market hours
+        if symbol.endswith('.US'):
+            return self._is_us_market_open(symbol)
+        
+        # Get trading sessions from schedule for non-US symbols
+        trading_sessions = symbol_detail.get('trading_sessions', [])
+        if not trading_sessions:
+            logger.debug(f"🔒 No trading sessions available for {symbol} - assuming market closed")
+            return False
+        
+        # Get current time in UTC
+        from datetime import datetime, timezone, timedelta
+        
+        now_utc = datetime.now(timezone.utc)
+        
+        # CRITICAL FIX: cTrader trading session times are in UTC for US stocks
+        # The API documentation is misleading - for .US symbols, times are already in UTC
+        # Calculate seconds since Sunday 00:00 UTC
+        python_weekday = now_utc.weekday()  # 0=Monday, 6=Sunday
+        days_since_sunday = (python_weekday + 1) % 7  # Days since Sunday (0=Sunday)
+        sunday_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_sunday)
+        seconds_since_sunday = int((now_utc - sunday_start).total_seconds())
+        
+        logger.debug(f"Market status check for {symbol}: UTC={now_utc}, seconds_since_sunday={seconds_since_sunday}")
+        
+        # Calculate current day of week for cTrader (1=Sunday, 2=Monday, ..., 7=Saturday)
+        current_day_of_week = (seconds_since_sunday // 86400) + 1  # +1 because Sunday=1 in cTrader
+        current_time_of_day = seconds_since_sunday % 86400
+        
+        logger.debug(f"Current cTrader day: {current_day_of_week}, time_of_day: {current_time_of_day} ({current_time_of_day//3600:02d}:{(current_time_of_day%3600)//60:02d})")
+        
+        # Check if current time falls within any trading session
+        # trading_sessions contains intervals organized by day_of_week
+        for session in trading_sessions:
+            day_of_week = session.get('day_of_week')
+            intervals = session.get('intervals', [])
+            
+            # Only check sessions for the current day
+            if day_of_week != current_day_of_week:
+                continue
+                
+            for interval in intervals:
+                start_second = interval.get('start_second')
+                end_second = interval.get('end_second')
+                
+                if start_second is not None and end_second is not None:
+                    start_time_str = f"{(start_second%86400)//3600:02d}:{((start_second%86400)%3600)//60:02d}"
+                    end_time_str = f"{(end_second%86400)//3600:02d}:{((end_second%86400)%3600)//60:02d}"
+                    current_time_str = f"{current_time_of_day//3600:02d}:{(current_time_of_day%3600)//60:02d}"
+                    
+                    logger.debug(f"  Checking day {day_of_week} interval: {start_time_str}-{end_time_str} UTC, current: {current_time_str}")
+                    
+                    # Check if current time of day is within this interval
+                    if start_second <= current_time_of_day < end_second:
+                        logger.debug(f"✅ Market open for {symbol} - in trading session ({start_time_str}-{end_time_str} UTC)")
+                        return True
+        
+        logger.debug(f"🔒 Market closed for {symbol} - outside all trading sessions")
+        logger.debug(f"   Current time: {now_utc} UTC ({seconds_since_sunday}s since Sunday)")
+        return False
+    
+    def _is_us_market_open(self, symbol: str) -> bool:
+        """
+        Check if US market is open using standard US market hours instead of cTrader's extended hours.
+        
+        Standard US Market Hours:
+        - Monday to Friday: 9:30 AM - 4:00 PM EST
+        - In UTC: 14:30 - 21:00 (during Eastern Daylight Time, March-November)
+        - In UTC: 15:30 - 22:00 (during Eastern Standard Time, November-March)
+        
+        Args:
+            symbol: US stock symbol (should end with .US)
+            
+        Returns:
+            bool: True if during standard US market hours on a trading day
+        """
+        from datetime import datetime, timezone, timedelta
+        
+        now_utc = datetime.now(timezone.utc)
+        
+        # Check if it's a weekday (Monday=0, Sunday=6)
+        weekday = now_utc.weekday()
+        if weekday >= 5:  # Saturday=5, Sunday=6
+            logger.debug(f"🔒 US market closed for {symbol} - weekend (weekday {weekday})")
+            return False
+        
+        # Determine if we're in Eastern Daylight Time (DST) or Eastern Standard Time
+        # DST runs from second Sunday in March to first Sunday in November
+        year = now_utc.year
+        
+        # Calculate second Sunday in March (DST start)
+        march_1 = datetime(year, 3, 1, tzinfo=timezone.utc)
+        days_to_first_sunday = (6 - march_1.weekday()) % 7
+        first_sunday_march = march_1 + timedelta(days=days_to_first_sunday)
+        dst_start = first_sunday_march + timedelta(days=7)  # Second Sunday
+        
+        # Calculate first Sunday in November (DST end)
+        nov_1 = datetime(year, 11, 1, tzinfo=timezone.utc)
+        days_to_first_sunday = (6 - nov_1.weekday()) % 7
+        dst_end = nov_1 + timedelta(days=days_to_first_sunday)
+        
+        # Check if we're in DST period
+        is_dst = dst_start <= now_utc < dst_end
+        
+        if is_dst:
+            # Eastern Daylight Time: UTC-4, so 9:30 AM EST = 13:30 UTC, 4:00 PM EST = 20:00 UTC
+            market_open_utc = 13.5  # 1:30 PM UTC = 9:30 AM EDT
+            market_close_utc = 20.0  # 8:00 PM UTC = 4:00 PM EDT
+            timezone_name = "EDT"
+        else:
+            # Eastern Standard Time: UTC-5, so 9:30 AM EST = 14:30 UTC, 4:00 PM EST = 21:00 UTC
+            market_open_utc = 14.5  # 2:30 PM UTC = 9:30 AM EST
+            market_close_utc = 21.0  # 9:00 PM UTC = 4:00 PM EST
+            timezone_name = "EST"
+        
+        # Convert current time to decimal hours
+        current_hour_utc = now_utc.hour + now_utc.minute / 60.0
+        
+        # Check if within trading hours
+        is_open = market_open_utc <= current_hour_utc < market_close_utc
+        
+        logger.debug(f"US market check for {symbol}:")
+        logger.debug(f"  Current UTC: {now_utc.strftime('%H:%M:%S')} ({current_hour_utc:.2f})")
+        logger.debug(f"  Timezone: {timezone_name} (DST: {is_dst})")
+        logger.debug(f"  Market hours: {market_open_utc:.1f} - {market_close_utc:.1f} UTC")
+        logger.debug(f"  Status: {'✅ OPEN' if is_open else '🔒 CLOSED'}")
+        
+        return is_open
+    
+    def _is_pair_tradeable(self, pair_str: str) -> bool:
+        """
+        Check if both symbols in a pair have open markets for trading.
+        
+        Args:
+            pair_str: Pair string format "SYMBOL1-SYMBOL2"
+            
+        Returns:
+            bool: True if both symbols' markets are open, False otherwise
+        """
+        try:
+            s1, s2 = pair_str.split('-')
+        except ValueError:
+            logger.error(f"❌ Invalid pair format: {pair_str}")
+            return False
+        
+        s1_open = self._is_market_open(s1)
+        s2_open = self._is_market_open(s2)
+        
+        if not s1_open or not s2_open:
+            closed_symbols = []
+            if not s1_open:
+                closed_symbols.append(s1)
+            if not s2_open:
+                closed_symbols.append(s2)
+            
+            # logger.info(f"🚫 Pair {pair_str} not tradeable - market closed for: {', '.join(closed_symbols)}")
+            return False
+        
+        return True
+    
+    def _filter_tradeable_pairs(self, pairs: List[str]) -> List[str]:
+        """
+        Filter a list of pairs to only include those with open markets.
+        
+        Args:
+            pairs: List of pair strings in format "SYMBOL1-SYMBOL2"
+            
+        Returns:
+            List[str]: Filtered list containing only pairs with open markets
+        """
+        if not pairs:
+            return []
+        
+        tradeable_pairs = []
+        filtered_count = 0
+        
+        logger.info(f"🔍 Filtering {len(pairs)} pairs for market status...")
+        
+        for pair_str in pairs:
+            if self._is_pair_tradeable(pair_str):
+                tradeable_pairs.append(pair_str)
+            else:
+                filtered_count += 1
+        
+        logger.info(f"✅ Market status filtering complete:")
+        logger.info(f"   Total pairs checked: {len(pairs)}")
+        logger.info(f"   Tradeable pairs: {len(tradeable_pairs)}")
+        logger.info(f"   Filtered out (closed markets): {filtered_count}")
+        
+        if filtered_count > 0:
+            logger.info(f"📊 Market closure impact: {(filtered_count/len(pairs)*100):.1f}% of pairs filtered out")
+        
+        return tradeable_pairs
+    
+    def get_market_status_summary(self) -> Dict[str, Any]:
+        """
+        Get a comprehensive summary of market status for all symbols.
+        Uses actual trading sessions to determine market status.
+        Useful for dashboard display and debugging.
+        
+        Returns:
+            Dict containing market status summary
+        """
+        if not self.symbol_details:
+            return {
+                'total_symbols': 0,
+                'markets_open': 0,
+                'markets_closed': 0,
+                'trading_disabled': 0,
+                'no_session_data': 0,
+                'open_symbols': [],
+                'closed_symbols': [],
+                'disabled_symbols': [],
+                'no_session_symbols': [],
+                'trading_ready': False
+            }
+        
+        open_symbols = []
+        closed_symbols = []
+        disabled_symbols = []
+        no_session_symbols = []
+        
+        for symbol in self.symbol_details.keys():
+            symbol_detail = self.symbol_details[symbol]
+            
+            # Check trading mode first
+            trading_mode = symbol_detail.get('trading_mode')
+            if trading_mode is not None and trading_mode != 0:  # Not ENABLED
+                disabled_symbols.append(symbol)
+                continue
+            
+            # Check trading sessions
+            trading_sessions = symbol_detail.get('trading_sessions', [])
+            if not trading_sessions:
+                no_session_symbols.append(symbol)
+                continue
+            
+            # Use the actual market status check
+            if self._is_market_open(symbol):
+                open_symbols.append(symbol)
+            else:
+                closed_symbols.append(symbol)
+        
+        total_symbols = len(self.symbol_details)
+        trading_ready = len(open_symbols) > 0
+        
+        return {
+            'total_symbols': total_symbols,
+            'markets_open': len(open_symbols),
+            'markets_closed': len(closed_symbols),
+            'trading_disabled': len(disabled_symbols),
+            'no_session_data': len(no_session_symbols),
+            'open_symbols': sorted(open_symbols),
+            'closed_symbols': sorted(closed_symbols),
+            'disabled_symbols': sorted(disabled_symbols),
+            'no_session_symbols': sorted(no_session_symbols),
+            'trading_ready': trading_ready,
+            'market_open_percentage': (len(open_symbols) / total_symbols * 100) if total_symbols > 0 else 0
+        }
+    
+    def _periodic_market_status_check(self):
+        """
+        Periodically check market status and log warnings when markets close.
+        This helps identify when trading stops due to market closures.
+        """
+        try:
+            market_status = self.get_market_status_summary()
+            
+            # Store previous status if not exists
+            if not hasattr(self, '_last_market_status'):
+                self._last_market_status = market_status
+                return
+            
+            prev_status = self._last_market_status
+            
+            # Check for newly closed markets
+            newly_closed = set(market_status['closed_symbols']) - set(prev_status['closed_symbols'])
+            newly_opened = set(market_status['open_symbols']) - set(prev_status['open_symbols'])
+            
+            if newly_closed:
+                logger.warning(f"🔴 Markets just closed: {', '.join(sorted(newly_closed))}")
+                logger.warning("   These symbols are no longer available for new trades")
+                
+                # Check if any active pairs are affected
+                affected_pairs = []
+                for pair_str in self.pair_states.keys():
+                    s1, s2 = pair_str.split('-')
+                    if s1 in newly_closed or s2 in newly_closed:
+                        affected_pairs.append(pair_str)
+                
+                if affected_pairs:
+                    logger.warning(f"   Affected trading pairs: {', '.join(affected_pairs)}")
+            
+            if newly_opened:
+                logger.info(f"🟢 Markets just opened: {', '.join(sorted(newly_opened))}")
+                logger.info("   These symbols are now available for trading")
+            
+            # Log overall status changes
+            if market_status['markets_open'] != prev_status['markets_open']:
+                logger.info(f"📊 Market status update: {market_status['markets_open']} open markets "
+                          f"(was {prev_status['markets_open']})")
+            
+            # Update stored status
+            self._last_market_status = market_status
+            
+        except Exception as e:
+            logger.error(f"Error in periodic market status check: {e}")
+        finally:
+            # Schedule next check (every 5 minutes)
+            if hasattr(self, 'reactor') and self.reactor:
+                self.reactor.callLater(300, self._periodic_market_status_check)
+        
+        # Also schedule periodic position reconciliation (every 10 minutes)
+        if not hasattr(self, '_position_reconciliation_scheduled'):
+            self._position_reconciliation_scheduled = True
+            if hasattr(self, 'reactor') and self.reactor:
+                self.reactor.callLater(600, self._periodic_position_reconciliation)
+    
+    def _periodic_position_reconciliation(self):
+        """
+        Periodically reconcile positions with broker to catch manual changes.
+        This ensures the system stays synchronized even if execution events are missed.
+        """
+        try:
+            logger.info("🔄 Starting periodic position reconciliation...")
+            
+            # Update last reconciliation time
+            self._last_reconciliation_time = datetime.now()
+            
+            # Only reconcile if we have active positions to check
+            if not self.active_positions:
+                logger.debug("No active positions to reconcile")
+                return
+            
+            # Request fresh position data from broker
+            self._reconcile_positions()
+            
+        except Exception as e:
+            logger.error(f"Error in periodic position reconciliation: {e}")
+        finally:
+            # Schedule next reconciliation (every 10 minutes)
+            if hasattr(self, 'reactor') and self.reactor:
+                self.reactor.callLater(600, self._periodic_position_reconciliation)
+    
+    def get_trading_sessions_info(self, symbol: str) -> Dict[str, Any]:
+        """
+        Get detailed trading sessions information for a symbol.
+        Useful for debugging market hours issues.
+        
+        Args:
+            symbol: Symbol to get session info for
+            
+        Returns:
+            Dict containing detailed session information
+        """
+        if symbol not in self.symbol_details:
+            return {'error': f'Symbol {symbol} not found'}
+        
+        symbol_detail = self.symbol_details[symbol]
+        trading_sessions = symbol_detail.get('trading_sessions', [])
+        
+        if not trading_sessions:
+            return {'error': f'No trading sessions data for {symbol}'}
+        
+        from datetime import datetime, timezone, timedelta
+        
+        # Current time info
+        now_utc = datetime.now(timezone.utc)
+        python_weekday = now_utc.weekday()
+        days_since_sunday = (python_weekday + 1) % 7
+        sunday_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_sunday)
+        seconds_since_sunday = int((now_utc - sunday_start).total_seconds())
+        
+        # Build session info
+        session_info = {
+            'symbol': symbol,
+            'current_time_utc': now_utc.isoformat(),
+            'seconds_since_sunday': seconds_since_sunday,
+            'is_market_open': self._is_market_open(symbol),
+            'sessions': []
+        }
+        
+        day_names = {1: 'Sunday', 2: 'Monday', 3: 'Tuesday', 4: 'Wednesday', 5: 'Thursday', 6: 'Friday', 7: 'Saturday'}
+        
+        for session in trading_sessions:
+            day_of_week = session.get('day_of_week')
+            intervals = session.get('intervals', [])
+            
+            session_data = {
+                'day_of_week': day_of_week,
+                'day_name': day_names.get(day_of_week, f'Unknown({day_of_week})'),
+                'intervals': []
+            }
+            
+            for interval in intervals:
+                start_second = interval.get('start_second')
+                end_second = interval.get('end_second')
+                
+                if start_second is not None and end_second is not None:
+                    # Convert seconds to human readable times
+                    start_hours = start_second // 3600
+                    start_minutes = (start_second % 3600) // 60
+                    end_hours = end_second // 3600
+                    end_minutes = (end_second % 3600) // 60
+                    
+                    # Check if current time is in this interval
+                    is_active = start_second <= seconds_since_sunday < end_second
+                    
+                    session_data['intervals'].append({
+                        'start_second': start_second,
+                        'end_second': end_second,
+                        'start_time': f'{start_hours:02d}:{start_minutes:02d}',
+                        'end_time': f'{end_hours:02d}:{end_minutes:02d}',
+                        'is_active': is_active
+                    })
+            
+            session_info['sessions'].append(session_data)
+        
+        return session_info
     
     def _execute_trade(self, signal: TradingSignal) -> bool:
         """Execute a trading signal with intelligent readiness checking"""
@@ -340,11 +857,11 @@ class CTraderRealTimeTrader(BaseBroker):
                 missing_prices.append(symbol)
         
         if missing_prices:
-            logger.warning(f"Missing spot prices for {pair_str}")
-            logger.warning(f"  Required: {required_symbols}")
-            logger.warning(f"  Available spot prices ({len(self.spot_prices)}): {list(self.spot_prices.keys())[:10]}{'...' if len(self.spot_prices) > 10 else ''}")
-            logger.warning(f"  Missing: {missing_prices}")
-            logger.warning(f"  Subscribed symbols: {sorted(self.subscribed_symbols)}")
+            # logger.warning(f"Missing spot prices for {pair_str}")
+            # logger.warning(f"  Required: {required_symbols}")
+            # logger.warning(f"  Available spot prices ({len(self.spot_prices)}): {list(self.spot_prices.keys())[:10]}{'...' if len(self.spot_prices) > 10 else ''}")
+            # logger.warning(f"  Missing: {missing_prices}")
+            # logger.warning(f"  Subscribed symbols: {sorted(self.subscribed_symbols)}")
             
             # Auto-retry subscription for missing symbols if not too many
             if len(missing_prices) <= 2:
@@ -364,12 +881,23 @@ class CTraderRealTimeTrader(BaseBroker):
         for symbol in required_symbols:
             price_data = self._get_spot_price_data(symbol)
             if price_data:
-                last_update = price_data.get('timestamp', 0)
-                if current_time - last_update > 30:  # Price older than 30 seconds
+                last_update = price_data.get('timestamp')
+                if last_update is None:
+                    logger.warning(f"Missing timestamp for price data of {symbol}")
+                    stale_symbols.append(symbol)
+                elif not isinstance(last_update, (int, float)) or last_update <= 0:
+                    logger.warning(f"Invalid timestamp for price data of {symbol}: {last_update}")
+                    stale_symbols.append(symbol)
+                elif current_time - last_update > 30:  # Price older than 30 seconds
                     stale_symbols.append(symbol)
         
         if stale_symbols:
             logger.warning(f"Stale price data for {pair_str}: {stale_symbols}")
+            return False
+        
+        # Check if markets are open for both symbols (prevents MARKET_CLOSED errors)
+        if not self._is_pair_tradeable(pair_str):
+            logger.debug(f"🔒 Trading not ready for {pair_str} - market closed for one or both symbols")
             return False
             
         logger.debug(f"✅ Trading ready for {pair_str} - all price feeds available and current")
@@ -444,17 +972,20 @@ class CTraderRealTimeTrader(BaseBroker):
         return None
     
     def _get_trade_side_value(self, side_name: str):
-        """Safely get trade side value with fallback"""
+        """Get trade side value with strict validation"""
+        if not side_name or not isinstance(side_name, str):
+            logger.error(f"Invalid side_name: {side_name}")
+            return None
+            
         try:
             if globals().get('ProtoOATradeSide'):
                 return ProtoOATradeSide.Value(side_name)
             else:
-                # Fallback numeric values for trade sides
-                side_values = {'BUY': 1, 'SELL': 2}
-                return side_values.get(side_name, 1)
+                logger.error("ProtoOATradeSide not available in globals")
+                return None
         except Exception as e:
             logger.error(f"Error getting trade side for {side_name}: {e}")
-            return 1 if side_name == 'BUY' else 2
+            return None
     
     def initialize(self) -> bool:
         """Initialize cTrader real-time trading system"""
@@ -822,8 +1353,8 @@ class CTraderRealTimeTrader(BaseBroker):
                   message.payloadType == 2128):
                 # Extract the subscription response to see if it was successful
                 response = Protobuf.extract(message)
-                logger.info(f"📡 Spot subscription response received: {response}")
-                logger.debug("Spot subscription confirmed")
+                # logger.info(f"📡 Spot subscription response received: {response}")
+                # logger.debug("Spot subscription confirmed")
                 
             elif (message.payloadType == MESSAGE_TYPES.get('ORDER_ERROR_EVENT', 2132) or
                   message.payloadType == 2132):
@@ -986,8 +1517,14 @@ class CTraderRealTimeTrader(BaseBroker):
                 # Extract detailed symbol information with proper error handling
                 symbol_details = {}
                 
+                # Store basic symbol identification
+                symbol_details['symbol_id'] = symbol.symbolId
+                symbol_details['symbol_name'] = symbol_name
+                
                 # Required fields - these should always be present according to API docs
                 try:
+                    symbol_details['symbol_id'] = symbol.symbolId
+                    symbol_details['symbol_name'] = symbol_name
                     symbol_details['digits'] = symbol.digits
                     symbol_details['pip_position'] = symbol.pipPosition
                 except AttributeError as e:
@@ -1000,6 +1537,8 @@ class CTraderRealTimeTrader(BaseBroker):
                     'max_volume': 'maxVolume', 
                     'step_volume': 'stepVolume',
                     'lot_size': 'lotSize',
+                    'base_currency': 'baseCurrency',
+                    'quote_currency': 'quoteCurrency',
                     'max_exposure': 'maxExposure',
                     'commission': 'commission',
                     'commission_type': 'commissionType',
@@ -1051,31 +1590,82 @@ class CTraderRealTimeTrader(BaseBroker):
                             
                             symbol_details[local_name] = converted_value
                             # logger.info(f"Converted {local_name} from {value} centilots to {converted_value} lots")
-                        # elif local_name == 'lot_size':
-                        #     converted_value = value / 100.0
-                        #     # lot_size represents contract size and should remain large
-                        #     # Only convert if it seems to be in centilots format
-                        #     if value < 1000:  # If lot_size is suspiciously small, it might be in wrong units
-                        #         converted_value = value * 100.0  # Convert up
-                        #         logger.info(f"Applied contract size conversion for {symbol_name}: {value} -> {converted_value}")
-                        #     else:
-                        #         converted_value = value  # Keep as-is if reasonable
-                            
-                        #     symbol_details[local_name] = converted_value
-                        #     logger.debug(f"Lot size for {symbol_name}: {value} -> {converted_value}")
-                        # else:
-                        #     symbol_details[local_name] = value
+                        else:
+                            # Store all other fields as-is (including trading_mode)
+                            symbol_details[local_name] = value
                     else:
                         logger.debug(f"Optional field {api_name} not available for symbol {symbol_name}")
-                        # Set reasonable defaults for missing volume constraints
-                        # if local_name == 'min_volume':
-                        #     symbol_details[local_name] = 0.01  # 0.01 lots minimum
-                        # elif local_name == 'max_volume':
-                        #     symbol_details[local_name] = 1000.0  # 1000 lots maximum  
-                        # elif local_name == 'step_volume':
-                        #     symbol_details[local_name] = 0.01  # 0.01 lots step
-                        # elif local_name == 'lot_size':
-                        #     symbol_details[local_name] = 100000.0  # Standard forex lot size
+                
+                # CRITICAL: Extract trading schedule (ProtoOAInterval) for proper market hours checking
+                # This is essential for preventing MARKET_CLOSED errors
+                # According to cTrader API docs, trading sessions are in the 'schedule' field
+                trading_sessions = []
+                if hasattr(symbol, 'schedule') and symbol.schedule:
+                    logger.debug(f"Found {len(symbol.schedule)} schedule intervals for {symbol_name}")
+                    for interval in symbol.schedule:
+                        if hasattr(interval, 'startSecond') and hasattr(interval, 'endSecond'):
+                            # Extract day of week from the interval (if available)
+                            # The schedule represents trading intervals in seconds from SUNDAY 00:00
+                            start_second = interval.startSecond
+                            end_second = interval.endSecond
+                            
+                            # Calculate which day this interval belongs to
+                            # Each day has 24*60*60 = 86400 seconds
+                            start_day = (start_second // 86400) + 1  # +1 because Sunday=1 in cTrader
+                            end_day = (end_second // 86400) + 1
+                            
+                            # Handle intervals that span multiple days
+                            if start_day == end_day:
+                                # Single day interval
+                                day_start = start_second % 86400
+                                day_end = end_second % 86400
+                                
+                                trading_sessions.append({
+                                    'day_of_week': start_day,  # 1=Sunday, 2=Monday, ..., 7=Saturday
+                                    'intervals': [{
+                                        'start_second': day_start,
+                                        'end_second': day_end
+                                    }]
+                                })
+                            else:
+                                # Multi-day interval - split into separate days
+                                # First day (from start to end of day)
+                                trading_sessions.append({
+                                    'day_of_week': start_day,
+                                    'intervals': [{
+                                        'start_second': start_second % 86400,
+                                        'end_second': 86400  # End of day
+                                    }]
+                                })
+                                
+                                # Last day (from start of day to end)
+                                trading_sessions.append({
+                                    'day_of_week': end_day,
+                                    'intervals': [{
+                                        'start_second': 0,  # Start of day
+                                        'end_second': end_second % 86400
+                                    }]
+                                })
+                    
+                    logger.debug(f"Processed {len(trading_sessions)} trading sessions for {symbol_name}")
+                else:
+                    logger.debug(f"No schedule found for {symbol_name}")
+                
+                symbol_details['trading_sessions'] = trading_sessions
+                
+                # Also store timezone information if available
+                if hasattr(symbol, 'tradingMode'):
+                    symbol_details['trading_mode'] = symbol.tradingMode
+                
+                # Set reasonable defaults for missing volume constraints
+                # if local_name == 'min_volume':
+                #     symbol_details[local_name] = 0.01  # 0.01 lots minimum
+                # elif local_name == 'max_volume':
+                #     symbol_details[local_name] = 1000.0  # 1000 lots maximum  
+                # elif local_name == 'step_volume':
+                #     symbol_details[local_name] = 0.01  # 0.01 lots step
+                # elif local_name == 'lot_size':
+                #     symbol_details[local_name] = 100000.0  # Standard forex lot size
                 logger.info(f"📊 Raw symbol details for {symbol_name}:")
                 logger.info(f"   digits={symbol.digits if hasattr(symbol, 'digits') else 'N/A'}")
                 logger.info(f"   pipPosition={symbol.pipPosition if hasattr(symbol, 'pipPosition') else 'N/A'}")
@@ -1084,10 +1674,31 @@ class CTraderRealTimeTrader(BaseBroker):
                 logger.info(f"   stepVolume={getattr(symbol, 'stepVolume', 'N/A')} (raw)")
                 logger.info(f"   lotSize={getattr(symbol, 'lotSize', 'N/A')} (raw)")
                 
+                # Log market status information for debugging
+                trading_mode = symbol_details.get('trading_mode')
+                trading_sessions = symbol_details.get('trading_sessions', [])
+                
+                if trading_mode is not None:
+                    mode_desc = {0: "🟢 ENABLED", 1: "🔴 DISABLED", 2: "🟡 CLOSE_ONLY"}.get(trading_mode, f"❓ UNKNOWN({trading_mode})")
+                    logger.info(f"   tradingMode={trading_mode} ({mode_desc})")
+                else:
+                    logger.warning(f"   tradingMode=N/A (⚠️ Trading mode unknown)")
+                
+                if trading_sessions:
+                    logger.info(f"   tradingSessions={len(trading_sessions)} days configured")
+                else:
+                    logger.warning(f"   tradingSessions=NONE (❌ No session data - cannot determine market hours)")
+                
                 logger.info(f"📊 Processed symbol details for {symbol_name}: {symbol_details}")
-                # Store the detailed symbol information
+                # Store the detailed symbol information FIRST
                 self.symbol_details[symbol_name] = symbol_details
                 symbols_processed += 1
+                
+                # NOW we can check market status since symbol details are stored
+                if trading_sessions:
+                    is_open = self._is_market_open(symbol_name)
+                    status_desc = "🟢 OPEN" if is_open else "🔴 CLOSED"
+                    logger.info(f"   currentStatus={status_desc}")
                 
                 logger.info(f"✅ Processed detailed info for {symbol_name}: "
                           f"digits={symbol_details.get('digits')}, "
@@ -1096,6 +1707,32 @@ class CTraderRealTimeTrader(BaseBroker):
                           f"lot_size={symbol_details.get('lot_size')}")
             
             logger.info(f"✅ Successfully processed detailed information for {symbols_processed}/{len(required_symbols)} required symbols")
+            
+            # Log comprehensive market status summary
+            market_status = self.get_market_status_summary()
+            logger.info("="*60)
+            logger.info("📊 MARKET STATUS SUMMARY (Using Trading Sessions)")
+            logger.info("-"*60)
+            logger.info(f"Total symbols: {market_status['total_symbols']}")
+            logger.info(f"Markets open: {market_status['markets_open']} (🟢)")
+            logger.info(f"Markets closed: {market_status['markets_closed']} (🔴)")
+            logger.info(f"Trading disabled: {market_status['trading_disabled']} (⛔)")
+            logger.info(f"No session data: {market_status['no_session_data']} (❓)")
+            logger.info(f"Market open percentage: {market_status['market_open_percentage']:.1f}%")
+            
+            if market_status['closed_symbols']:
+                logger.info(f"Closed markets: {', '.join(market_status['closed_symbols'][:10])}")
+                if len(market_status['closed_symbols']) > 10:
+                    logger.info(f"  ... and {len(market_status['closed_symbols']) - 10} more")
+                    
+            if market_status['disabled_symbols']:
+                logger.info(f"Disabled symbols: {', '.join(market_status['disabled_symbols'])}")
+            
+            if market_status['no_session_symbols']:
+                logger.info(f"No session data: {', '.join(market_status['no_session_symbols'])}")
+            
+            logger.info(f"Trading ready: {'✅ YES' if market_status['trading_ready'] else '❌ NO (all markets closed)'}")
+            logger.info("="*60)
             
             # Check if we have processed all required symbols
             if symbols_processed < len(required_symbols):
@@ -1117,6 +1754,72 @@ class CTraderRealTimeTrader(BaseBroker):
                 logger.warning("Proceeding with basic symbol information due to detailed info processing error")
                 self._finalize_initialization()
     
+    def _update_symbol_spreads(self, symbols: List[str] = None):
+        """Calculate and update spread information for symbols using real-time bid/ask data"""
+        if symbols is None:
+            symbols = list(self.symbol_details.keys())
+        
+        updated_count = 0
+        
+        for symbol in symbols:
+            if symbol not in self.symbol_details:
+                continue
+                
+            # Get current bid/ask prices
+            spot_data = self._get_spot_price_data(symbol)
+            if not spot_data or 'bid' not in spot_data or 'ask' not in spot_data:
+                logger.debug(f"No bid/ask data available for {symbol} to calculate spread")
+                continue
+            
+            bid = spot_data['bid']
+            ask = spot_data['ask']
+            
+            if bid <= 0 or ask <= 0 or ask <= bid:
+                logger.debug(f"Invalid bid/ask data for {symbol}: bid={bid}, ask={ask}")
+                continue
+            
+            # Calculate spread in points (similar to MT5 format)
+            symbol_details = self.symbol_details[symbol]
+            digits = symbol_details.get('digits')
+            pip_position = symbol_details.get('pip_position')
+            
+            # Calculate point value (smallest price movement)
+            point = 10 ** (-digits)
+            
+            # Calculate spread in points
+            spread_points = (ask - bid) / point
+            
+            # Update symbol details with spread information
+            symbol_details['spread'] = spread_points
+            symbol_details['point'] = point
+            symbol_details['bid'] = bid
+            symbol_details['ask'] = ask
+            symbol_details['spread_updated_at'] = time.time()
+            
+            updated_count += 1
+            logger.debug(f"Updated spread for {symbol}: {spread_points:.1f} points (bid={bid:.5f}, ask={ask:.5f})")
+        
+        return updated_count
+    
+    def _update_initial_spreads(self):
+        """Update spreads initially after subscriptions are established"""
+        logger.info("🔄 Updating initial spread information...")
+        required_symbols = self.strategy.get_required_symbols()
+        self._update_symbol_spreads(required_symbols)
+    
+    def _periodic_spread_update(self):
+        """Periodic spread update for cost calculations"""
+        try:
+            required_symbols = self.strategy.get_required_symbols()
+            updated = self._update_symbol_spreads(required_symbols)
+            if updated > 0:
+                logger.debug(f"Periodic spread update: {updated} symbols refreshed")
+        except Exception as e:
+            logger.error(f"Error in periodic spread update: {e}")
+        finally:
+            # Schedule next update in 30 seconds
+            threading.Timer(30.0, self._periodic_spread_update).start()
+
     def _finalize_initialization(self):
         """Finalize initialization after symbol details are processed"""
         logger.info("Finalizing trading system initialization...")
@@ -1158,6 +1861,10 @@ class CTraderRealTimeTrader(BaseBroker):
             logger.info("🚀 Starting real trading loop with live cTrader data")
             threading.Thread(target=self._trading_loop, daemon=True).start()
             self.trading_started = True
+        
+        # Start periodic market status monitoring (every 5 minutes)
+        logger.info("🔍 Starting periodic market status monitoring...")
+        reactor.callLater(300, self._periodic_market_status_check)
     
     def _initialize_pair_states(self):
         """Initialize trading states based on strategy requirements"""
@@ -1208,7 +1915,19 @@ class CTraderRealTimeTrader(BaseBroker):
                 except ValueError:
                     logger.warning(f"Invalid pair format: {pair_str}")
         
-        logger.info(f"Initializing {len(valid_pairs)} valid pairs")
+        logger.info(f"Found {len(valid_pairs)} valid pairs before market status filtering")
+        
+        # CRITICAL: Filter out pairs with closed markets BEFORE processing them
+        # This prevents "MARKET_CLOSED" errors by eliminating problematic pairs early
+        valid_pairs = self._filter_tradeable_pairs(valid_pairs)
+        
+        if not valid_pairs:
+            logger.error("❌ No tradeable pairs found after market status filtering - all markets may be closed")
+            logger.error("   This is expected outside of trading hours or during market holidays")
+            logger.error("   The system will initialize with empty pair states and wait for markets to open")
+            return
+        
+        logger.info(f"Proceeding with {len(valid_pairs)} tradeable pairs")
         
         # Calculate optimal lookback period based on enabled strategy features
         lookback_periods = [self.config.z_period]  # Z-score period is always needed
@@ -1387,7 +2106,11 @@ class CTraderRealTimeTrader(BaseBroker):
             
             # Calculate date range for historical data
             interval_mapping = {'D1': 1, 'H1': 1/24, 'M15': 1/(24*4), 'M5': 1/(24*12), 'M1': 1/(24*60)}
-            days_per_bar = interval_mapping.get(self.config.interval, 1/24)
+            if self.config.interval not in interval_mapping:
+                logger.error(f"Unsupported interval: {self.config.interval}")
+                return pd.DataFrame()
+                
+            days_per_bar = interval_mapping[self.config.interval]
             lookback_days = int(lookback_bars * days_per_bar) + 10
             
             end_date_dt = datetime.now()
@@ -1496,7 +2219,13 @@ class CTraderRealTimeTrader(BaseBroker):
         # Start subscription monitoring
         self._start_subscription_monitoring()
         
-        logger.info(f"✅ Subscription system started with {self.strategy.__class__.__name__}")
+        # Wait a moment for initial subscriptions to be established
+        threading.Timer(2.0, self._update_initial_spreads).start()
+        
+        # Start periodic spread updates for cost calculations
+        threading.Timer(30.0, self._periodic_spread_update).start()
+        
+        # logger.info(f"✅ Subscription system started with {self.strategy.__class__.__name__}")
         if unavailable_symbols:
             logger.info("� Note: Some symbols were unavailable and skipped")
     
@@ -1505,9 +2234,9 @@ class CTraderRealTimeTrader(BaseBroker):
         if not symbols:
             return
         
-        logger.info(f"🚀 Starting intelligent subscription for {len(symbols)} symbols")
-        logger.info(f"   CTrader API limits: {self._non_historical_rate_limiter['max_requests']} req/sec")
-        logger.info(f"   Batch size: {self._subscription_batch_size}, Delay: {self._subscription_delay}s")
+        # logger.info(f"🚀 Starting intelligent subscription for {len(symbols)} symbols")
+        # logger.info(f"   CTrader API limits: {self._non_historical_rate_limiter['max_requests']} req/sec")
+        # logger.info(f"   Batch size: {self._subscription_batch_size}, Delay: {self._subscription_delay}s")
         
         # Get symbol IDs for all symbols
         available_symbol_ids = {}
@@ -1526,8 +2255,8 @@ class CTraderRealTimeTrader(BaseBroker):
         high_priority_symbols = set(self._get_priority_symbols(symbols))
         normal_priority_symbols = symbols - high_priority_symbols
         
-        logger.info(f"   High priority symbols: {len(high_priority_symbols)}")
-        logger.info(f"   Normal priority symbols: {len(normal_priority_symbols)}")
+        # logger.info(f"   High priority symbols: {len(high_priority_symbols)}")
+        # logger.info(f"   Normal priority symbols: {len(normal_priority_symbols)}")
         
         # Subscribe with priority and rate limiting
         if high_priority_symbols:
@@ -1571,7 +2300,7 @@ class CTraderRealTimeTrader(BaseBroker):
         # Limit priority symbols to reasonable number
         priority_list = list(priority_symbols)[:25]
         
-        logger.info(f"🎯 Priority symbols identified: {sorted(priority_list)}")
+        # logger.info(f"🎯 Priority symbols identified: {sorted(priority_list)}")
         return priority_list
     
     def _batch_subscribe_with_rate_limiting(self, symbols, priority="NORMAL"):
@@ -1604,12 +2333,12 @@ class CTraderRealTimeTrader(BaseBroker):
         
         total_time = len(batches) * batch_delay
         
-        logger.info(f"📦 {priority} batching strategy:")
-        logger.info(f"   Total symbols: {len(symbol_ids)}")
-        logger.info(f"   Batch size: {batch_size}")
-        logger.info(f"   Number of batches: {len(batches)}")
-        logger.info(f"   Delay between batches: {batch_delay:.2f}s")
-        logger.info(f"   Estimated completion time: {total_time:.1f}s")
+        # logger.info(f"📦 {priority} batching strategy:")
+        # logger.info(f"   Total symbols: {len(symbol_ids)}")
+        # logger.info(f"   Batch size: {batch_size}")
+        # logger.info(f"   Number of batches: {len(batches)}")
+        # logger.info(f"   Delay between batches: {batch_delay:.2f}s")
+        # logger.info(f"   Estimated completion time: {total_time:.1f}s")
         
         def process_subscription_batches():
             successful_subscriptions = 0
@@ -1939,7 +2668,11 @@ class CTraderRealTimeTrader(BaseBroker):
             Properly formatted price rounded to symbol digits
         """
         # Divide by 100000 and round to symbol digits as per cTrader documentation
-        digits = symbol_details.get('digits', 5)  # Default to 5 digits if not available
+        if not symbol_details or 'digits' not in symbol_details:
+            logger.error(f"Symbol details missing or invalid digits for price conversion: {symbol_details}")
+            return None
+            
+        digits = symbol_details['digits']
         actual_price = relative_price / 100000.0
         return round(actual_price, digits)
     
@@ -2125,9 +2858,15 @@ class CTraderRealTimeTrader(BaseBroker):
                 # Keep existing price if we have partial update
                 existing_price_data = self.spot_prices[symbol_name]
                 if isinstance(existing_price_data, dict):
-                    existing_price = existing_price_data.get('price', 0)
+                    existing_price = existing_price_data.get('price')
+                    if existing_price is None or existing_price <= 0:
+                        logger.error(f"No valid existing price for {symbol_name}")
+                        return None
                 else:
                     existing_price = existing_price_data
+                    if existing_price is None or existing_price <= 0:
+                        logger.error(f"No valid existing price for {symbol_name}")
+                        return None
                     
                 if not hasattr(self, '_incomplete_price_debug_count'):
                     self._incomplete_price_debug_count = {}
@@ -2165,6 +2904,21 @@ class CTraderRealTimeTrader(BaseBroker):
         if not hasattr(self, '_price_update_count'):
             self._price_update_count = {}
         self._price_update_count[symbol_name] = self._price_update_count.get(symbol_name, 0) + 1
+        
+        # Trigger spread update every 50 price updates for this symbol (throttled spread updates)
+        if not hasattr(self, '_spread_update_counter'):
+            self._spread_update_counter = {}
+        if symbol_name not in self._spread_update_counter:
+            self._spread_update_counter[symbol_name] = 0
+        
+        self._spread_update_counter[symbol_name] += 1
+        
+        # Update spread information every 50 price ticks for efficiency
+        if self._spread_update_counter[symbol_name] % 50 == 0:
+            try:
+                self._update_symbol_spreads([symbol_name])
+            except Exception as e:
+                logger.debug(f"Error updating spread for {symbol_name}: {e}")
         
         # Log first few price updates to confirm data flow
         if not hasattr(self, '_spot_debug_count'):
@@ -2259,6 +3013,27 @@ class CTraderRealTimeTrader(BaseBroker):
             if state['cooldown'] > 0:
                 state['cooldown'] -= 1
                 return
+            
+            # 🚀 OPTIMIZATION: Check market status FIRST before any expensive calculations
+            # This prevents wasted CPU cycles on pairs with closed markets
+            if not self._is_pair_tradeable(pair_str):
+                # Only log this occasionally to avoid spam
+                if not hasattr(self, '_market_closed_log'):
+                    self._market_closed_log = {}
+                if pair_str not in self._market_closed_log:
+                    self._market_closed_log[pair_str] = 0
+                
+                self._market_closed_log[pair_str] += 1
+                # Log every 100th check to show it's working but not spam
+                if self._market_closed_log[pair_str] % 100 == 0:
+                    logger.debug(f"🔒 Skipping calculations for {pair_str} - market closed (check #{self._market_closed_log[pair_str]})")
+                return
+            
+            # Clear the closed market log counter if market becomes open
+            if hasattr(self, '_market_closed_log') and pair_str in self._market_closed_log:
+                if self._market_closed_log[pair_str] > 0:
+                    logger.debug(f"🟢 Market reopened for {pair_str} - resuming calculations")
+                    self._market_closed_log[pair_str] = 0
             
             # Check if we have enough data for strategy calculation
             try:
@@ -2539,16 +3314,22 @@ class CTraderRealTimeTrader(BaseBroker):
             logger.error(f"[ERROR] Trade blocked by drawdown limits for {pair_str}")
             return False
         
+        # CRITICAL: Check if markets are open for both symbols before attempting trade
+        # This prevents "MARKET_CLOSED" errors from cTrader
+        if not self._is_pair_tradeable(pair_str):
+            logger.warning(f"🚫 [MARKET_CLOSED] Cannot execute {direction} trade for {pair_str} - one or both markets are closed")
+            return False
+        
         state = self.pair_states[pair_str]
         s1, s2 = state['symbol1'], state['symbol2']
         
         # Get current prices
         if s1 not in self.spot_prices or s2 not in self.spot_prices:
             logger.warning(f"Missing spot prices for {pair_str}")
-            logger.warning(f"  Required: {s1}, {s2}")
-            logger.warning(f"  Available spot prices ({len(self.spot_prices)}): {list(self.spot_prices.keys())}")
+            # logger.warning(f"  Required: {s1}, {s2}")
+            # logger.warning(f"  Available spot prices ({len(self.spot_prices)}): {list(self.spot_prices.keys())}")
             logger.warning(f"  Missing: {[s for s in [s1, s2] if s not in self.spot_prices]}")
-            logger.warning(f"  Subscribed symbols: {self.subscribed_symbols}")
+            # logger.warning(f"  Subscribed symbols: {self.subscribed_symbols}")
             return False
         
         price1 = self._get_spot_price(s1)
@@ -3114,6 +3895,10 @@ class CTraderRealTimeTrader(BaseBroker):
             logger.warning(f"⚠️ Known pending orders: {list(self.execution_requests.keys())}")
             logger.warning(f"⚠️ Total pending orders: {len(self.execution_requests)}")
             
+            # CRITICAL: Handle manual position closures from cTrader panel
+            # This is where we process trades initiated outside our script
+            self._handle_manual_trade_execution(event, client_order_id)
+            
             # Check if this is a close position execution event by looking for position information
             # This handles cases where cTrader generates its own order IDs for close position requests
             if position:
@@ -3128,6 +3913,559 @@ class CTraderRealTimeTrader(BaseBroker):
                 similar_orders = [oid for oid in self.execution_requests.keys() if client_order_id.lower() in oid.lower() or oid.lower() in client_order_id.lower()]
                 if similar_orders:
                     logger.warning(f"⚠️ Similar order IDs found: {similar_orders}")
+    
+    def _handle_manual_trade_execution(self, event, client_order_id: str):
+        """
+        Handle execution events for trades initiated manually from cTrader panel.
+        This method efficiently tracks and absorbs manual position closures to keep
+        the script's internal state synchronized with the broker.
+        """
+        logger.info(f"🔧 PROCESSING MANUAL TRADE EXECUTION: {client_order_id}")
+        
+        # Track manual event processing
+        if not hasattr(self, '_manual_events_processed'):
+            self._manual_events_processed = 0
+        self._manual_events_processed += 1
+        self._last_manual_event_time = datetime.now().isoformat()
+        
+        try:
+            # Extract comprehensive execution details
+            execution_type = getattr(event, 'executionType', None)
+            order = getattr(event, 'order', None)
+            deal = getattr(event, 'deal', None) 
+            position = getattr(event, 'position', None)
+            
+            # Get order status
+            order_status = getattr(order, 'orderStatus', None) if order else None
+            
+            # Extract position details if available
+            position_id = getattr(position, 'positionId', None) if position else None
+            symbol_id = getattr(position, 'symbolId', None) if position else None
+            volume = getattr(position, 'volume', 0) if position else 0
+            trade_side = getattr(position, 'tradeSide', None) if position else None
+            
+            # Extract deal details if available
+            deal_volume = getattr(deal, 'volume', 0) if deal else 0
+            deal_price = getattr(deal, 'executionPrice', 0) if deal else 0
+            deal_id = getattr(deal, 'dealId', None) if deal else None
+            
+            # Convert symbol ID to name
+            symbol_name = self.symbol_id_to_name_map.get(symbol_id, f"Unknown({symbol_id})") if symbol_id else None
+            
+            logger.info(f"📊 Manual trade details:")
+            logger.info(f"   Symbol: {symbol_name} (ID: {symbol_id})")
+            logger.info(f"   Position ID: {position_id}")
+            logger.info(f"   Volume: {volume} (Deal volume: {deal_volume})")
+            logger.info(f"   Side: {trade_side} (1=BUY, 2=SELL)")
+            logger.info(f"   Deal Price: {deal_price}")
+            logger.info(f"   Deal ID: {deal_id}")
+            logger.info(f"   Execution Type: {execution_type}")
+            logger.info(f"   Order Status: {order_status}")
+            
+            # Only process FILLED orders (status 2) or ORDER_FILLED execution type
+            is_filled = (order_status == 2) or (execution_type == 3)  # 3 = ORDER_FILLED
+            
+            if not is_filled:
+                logger.debug(f"   Ignoring non-filled manual trade (status: {order_status}, exec_type: {execution_type})")
+                return
+            
+            # CRITICAL: Check if this manual trade affects any of our active positions
+            if symbol_name and position_id:
+                affected_pairs = self._identify_affected_pairs(symbol_name, position_id, volume, trade_side)
+                
+                if affected_pairs:
+                    logger.warning(f"🎯 MANUAL TRADE AFFECTS ACTIVE PAIRS: {affected_pairs}")
+                    
+                    for pair_str in affected_pairs:
+                        self._process_manual_position_change(
+                            pair_str, symbol_name, position_id, volume, trade_side, deal_price, client_order_id
+                        )
+                else:
+                    logger.info(f"   ✅ Manual trade doesn't affect tracked pairs - no action needed")
+            
+            # Log summary of manual trade processing
+            logger.info(f"📊 MANUAL TRADE PROCESSING SUMMARY:")
+            logger.info(f"   Events processed today: {self._manual_events_processed}")
+            logger.info(f"   Active positions: {len(self.active_positions)}")
+            logger.info(f"   Suspended pairs: {len(self.suspended_pairs)}")
+            if self.suspended_pairs:
+                logger.info(f"   Suspended: {', '.join(sorted(self.suspended_pairs))}")
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing manual trade execution: {e}")
+            logger.error(traceback.format_exc())
+    
+    def _identify_affected_pairs(self, symbol_name: str, position_id: str, volume: float, trade_side: int) -> List[str]:
+        """
+        Identify which active pairs are affected by a manual position change.
+        Returns list of affected pair strings.
+        """
+        affected_pairs = []
+        
+        try:
+            # Check all active positions to see which ones involve this symbol
+            for pair_str, position_data in self.active_positions.items():
+                symbol1 = position_data.get('symbol1')
+                symbol2 = position_data.get('symbol2')
+                
+                # Check if this symbol is part of the pair
+                if symbol_name in [symbol1, symbol2]:
+                    logger.info(f"   Checking pair {pair_str} ({symbol1}-{symbol2})")
+                    
+                    # For more sophisticated matching, could check:
+                    # - Position IDs match
+                    # - Volume matches
+                    # - Direction is opposite (indicating a close)
+                    
+                    # For now, any matching symbol indicates potential impact
+                    affected_pairs.append(pair_str)
+                    logger.info(f"   ✅ Pair {pair_str} potentially affected")
+            
+            logger.info(f"📊 Identified {len(affected_pairs)} potentially affected pairs")
+            
+        except Exception as e:
+            logger.error(f"Error identifying affected pairs: {e}")
+        
+        return affected_pairs
+    
+    def _process_manual_position_change(self, pair_str: str, symbol_name: str, position_id: str, 
+                                      volume: float, trade_side: int, price: float, order_id: str):
+        """
+        Process a manual position change and update internal tracking.
+        This handles partial closes, full closes, and other manual interventions.
+        """
+        logger.warning(f"🔧 PROCESSING MANUAL POSITION CHANGE:")
+        logger.warning(f"   Pair: {pair_str}")
+        logger.warning(f"   Symbol: {symbol_name}")
+        logger.warning(f"   Position ID: {position_id}")
+        logger.warning(f"   Volume: {volume}")
+        logger.warning(f"   Side: {'BUY' if trade_side == 1 else 'SELL'}")
+        logger.warning(f"   Price: {price}")
+        logger.warning(f"   Order ID: {order_id}")
+        
+        try:
+            # Get current position data
+            if pair_str not in self.active_positions:
+                logger.warning(f"   ⚠️ Pair {pair_str} not found in active positions - may have been closed")
+                return
+            
+            position_data = self.active_positions[pair_str]
+            symbol1 = position_data.get('symbol1')
+            symbol2 = position_data.get('symbol2')
+            current_volume1 = position_data.get('volume1', 0)
+            current_volume2 = position_data.get('volume2', 0)
+            
+            # Determine which leg was affected
+            is_symbol1 = (symbol_name == symbol1)
+            is_symbol2 = (symbol_name == symbol2)
+            
+            if not (is_symbol1 or is_symbol2):
+                logger.warning(f"   ⚠️ Symbol {symbol_name} not recognized in pair {pair_str}")
+                return
+            
+            # Calculate the impact
+            if is_symbol1:
+                current_volume = current_volume1
+                leg_name = "Symbol1"
+            else:
+                current_volume = current_volume2
+                leg_name = "Symbol2"
+            
+            logger.warning(f"   Affected leg: {leg_name} ({symbol_name})")
+            logger.warning(f"   Current tracked volume: {current_volume}")
+            logger.warning(f"   Manual trade volume: {volume}")
+            
+            # Determine the type of change
+            volume_change = abs(volume)  # Manual trades show absolute volume
+            
+            if volume_change >= abs(current_volume * 0.95):  # Within 5% tolerance
+                # Likely a full close
+                logger.warning(f"   🎯 DETECTED: Full position close for {symbol_name}")
+                logger.warning(f"   This indicates the entire pair may have been manually closed")
+                
+                # Check if both legs might have been closed
+                self._handle_manual_pair_closure(pair_str, "Full position detected", order_id)
+                
+            elif volume_change > 0:
+                # Partial close or modification
+                logger.warning(f"   🎯 DETECTED: Partial position change for {symbol_name}")
+                logger.warning(f"   Original volume: {current_volume}, Trade volume: {volume}")
+                
+                # Update tracking with new volume
+                self._handle_manual_position_modification(
+                    pair_str, symbol_name, current_volume, volume_change, is_symbol1, order_id
+                )
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing manual position change: {e}")
+            logger.error(traceback.format_exc())
+    
+    def _handle_manual_pair_closure(self, pair_str: str, reason: str, order_id: str):
+        """
+        Handle the complete manual closure of a pair position.
+        Removes it from active tracking and updates state.
+        """
+        logger.warning(f"🔒 MANUAL PAIR CLOSURE DETECTED:")
+        logger.warning(f"   Pair: {pair_str}")
+        logger.warning(f"   Reason: {reason}")
+        logger.warning(f"   Order ID: {order_id}")
+        
+        try:
+            # Remove from active positions
+            if pair_str in self.active_positions:
+                closed_position = self.active_positions.pop(pair_str)
+                logger.warning(f"   ✅ Removed from active positions tracking")
+                
+                # Update pair state to reflect closure
+                if pair_str in self.pair_states:
+                    self.pair_states[pair_str]['position'] = 'none'  # Changed from 'FLAT' to 'none'
+                    self.pair_states[pair_str]['last_action_time'] = datetime.now()
+                    logger.warning(f"   ✅ Updated pair state to none")
+                
+                # CRITICAL: Save changes to state manager immediately
+                self._save_manual_changes_to_state_manager(pair_str, "CLOSED")
+                
+                logger.warning(f"📊 MANUAL CLOSURE SUMMARY:")
+                logger.warning(f"   Closed pair: {pair_str}")
+                logger.warning(f"   Symbol1: {closed_position.get('symbol1')} (Vol: {closed_position.get('volume1')})")
+                logger.warning(f"   Symbol2: {closed_position.get('symbol2')} (Vol: {closed_position.get('volume2')})")
+                logger.warning(f"   Direction: {closed_position.get('direction')}")
+                logger.warning(f"   Entry time: {closed_position.get('entry_time')}")
+                logger.warning(f"   Remaining active positions: {len(self.active_positions)}")
+                
+                # Optionally log P&L if we can calculate it
+                self._log_manual_closure_pnl(closed_position, pair_str)
+                
+            else:
+                logger.warning(f"   ⚠️ Pair {pair_str} was not in active positions")
+        
+        except Exception as e:
+            logger.error(f"❌ Error handling manual pair closure: {e}")
+            logger.error(traceback.format_exc())
+    
+    def _handle_manual_position_modification(self, pair_str: str, symbol_name: str, 
+                                           original_volume: float, trade_volume: float, 
+                                           is_symbol1: bool, order_id: str):
+        """
+        Handle partial position modifications from manual trades.
+        Updates tracking with new volumes.
+        """
+        logger.warning(f"🔧 MANUAL POSITION MODIFICATION:")
+        logger.warning(f"   Pair: {pair_str}")
+        logger.warning(f"   Symbol: {symbol_name}")
+        logger.warning(f"   Original volume: {original_volume}")
+        logger.warning(f"   Trade volume: {trade_volume}")
+        logger.warning(f"   Order ID: {order_id}")
+        
+        try:
+            if pair_str in self.active_positions:
+                position_data = self.active_positions[pair_str]
+                
+                # Calculate new volume (assuming this was a partial close)
+                new_volume = abs(original_volume) - abs(trade_volume)
+                
+                if new_volume <= 0:
+                    logger.warning(f"   Volume reduced to zero - treating as position closure")
+                    self._handle_manual_pair_closure(pair_str, "Volume reduced to zero", order_id)
+                    return
+                
+                # Update the appropriate leg volume
+                if is_symbol1:
+                    position_data['volume1'] = new_volume if original_volume > 0 else -new_volume
+                    logger.warning(f"   Updated Symbol1 volume: {position_data['volume1']}")
+                else:
+                    position_data['volume2'] = new_volume if original_volume > 0 else -new_volume
+                    logger.warning(f"   Updated Symbol2 volume: {position_data['volume2']}")
+                
+                logger.warning(f"   ✅ Position volumes updated for {pair_str}")
+                
+                # CRITICAL: Save changes to state manager immediately
+                self._save_manual_changes_to_state_manager(pair_str, "MODIFIED")
+                
+        except Exception as e:
+            logger.error(f"❌ Error handling manual position modification: {e}")
+            logger.error(traceback.format_exc())
+    
+    def _save_manual_changes_to_state_manager(self, pair_str: str, change_type: str):
+        """
+        Save manual trade changes to the state manager immediately.
+        This ensures that manual position closures and modifications are persisted.
+        
+        Args:
+            pair_str: The pair that was changed
+            change_type: Type of change ("CLOSED", "MODIFIED")
+        """
+        try:
+            # Only save if we have a state manager (live trading mode)
+            if not hasattr(self, 'state_manager') or not self.state_manager:
+                logger.debug(f"No state manager available for saving manual changes to {pair_str}")
+                return
+            
+            logger.info(f"💾 SAVING MANUAL CHANGES TO STATE MANAGER:")
+            logger.info(f"   Pair: {pair_str}")
+            logger.info(f"   Change type: {change_type}")
+            logger.info(f"   Active positions: {len(self.active_positions)}")
+            logger.info(f"   Pair states: {len(self.pair_states)}")
+            
+            # Fix position data to meet schema requirements
+            active_positions_for_state = {}
+            for pair, position_data in self.active_positions.items():
+                try:
+                    processed_data = {
+                        'symbol1': position_data.get('symbol1', ''),
+                        'symbol2': position_data.get('symbol2', ''),
+                        'direction': position_data.get('direction', 'long'),
+                        'entry_time': position_data.get('entry_time', datetime.now()),
+                        'quantity': position_data.get('quantity', position_data.get('volume', 0.01)),  # Fix quantity field
+                        'entry_price': max(position_data.get('entry_price', 100.0), 0.01),  # Ensure > 0
+                        'stop_loss': position_data.get('stop_loss'),
+                        'take_profit': position_data.get('take_profit'),
+                    }
+                    
+                    # Validate quantity field
+                    if processed_data['quantity'] <= 0:
+                        processed_data['quantity'] = 0.01
+                    
+                    active_positions_for_state[pair] = processed_data
+                except Exception as pos_error:
+                    logger.warning(f"Error processing position {pair}: {pos_error}")
+                    continue
+            
+            # Fix pair state data to meet schema requirements  
+            pair_states_for_state = {}
+            for pair, state_data in self.pair_states.items():
+                try:
+                    # Extract symbols from pair string
+                    if '-' in pair:
+                        symbol1, symbol2 = pair.split('-', 1)
+                    else:
+                        symbol1 = pair[:6] if len(pair) >= 6 else pair
+                        symbol2 = pair[6:] if len(pair) > 6 else 'USD'
+                    
+                    # Fix position value to match schema pattern: '^(none|long|short)$'
+                    position_value = state_data.get('position', 'none')
+                    if position_value == 'FLAT' or position_value is None:
+                        position_value = 'none'
+                    elif position_value not in ['none', 'long', 'short']:
+                        position_value = 'none'
+                    
+                    processed_state = {
+                        'symbol1': symbol1,
+                        'symbol2': symbol2,
+                        'position': position_value,  # Must be 'none', 'long', or 'short'
+                        'last_update': state_data.get('last_update', datetime.now()),
+                        'last_signal_time': state_data.get('last_signal_time', datetime.now()),
+                        'trade_count': state_data.get('trade_count', 0),
+                        'total_pnl': state_data.get('total_pnl', 0.0),
+                        'z_score': state_data.get('z_score', 0.0),
+                        'spread': state_data.get('spread', 0.0),
+                        'status': state_data.get('status', 'active'),
+                    }
+                    
+                    pair_states_for_state[pair] = processed_state
+                except Exception as state_error:
+                    logger.warning(f"Error processing pair state {pair}: {state_error}")
+                    continue
+            
+            # Prepare current portfolio data
+            portfolio_data = {
+                'total_value': getattr(self, 'portfolio_value', 100000.0),
+                'available_balance': getattr(self, 'available_balance', 100000.0),
+                'total_pnl': 0.0,  # Will be calculated by portfolio manager
+                'open_positions': len(active_positions_for_state),
+                'daily_pnl': 0.0,  # Will be calculated
+                'peak_value': getattr(self, 'portfolio_peak_value', 100000.0),
+                'metadata': {
+                    'manual_change_info': {
+                        'pair': pair_str,
+                        'change_type': change_type,
+                        'timestamp': datetime.now().isoformat(),
+                        'trigger': 'manual_trade_handling'
+                    },
+                    'session_info': {
+                        'data_provider': 'ctrader',
+                        'broker': 'ctrader',
+                        'save_time': datetime.now().isoformat(),
+                        'system_version': 'EnhancedTradingSystemV3'
+                    }
+                }
+            }
+            
+            # Save to state manager with corrected data
+            success = self.state_manager.save_trading_state(
+                active_positions=active_positions_for_state,
+                pair_states=pair_states_for_state,
+                portfolio_data=portfolio_data
+            )
+            
+            if success:
+                logger.info(f"✅ Manual changes saved to state manager successfully")
+                logger.info(f"   Updated {len(active_positions_for_state)} positions")
+                logger.info(f"   Updated {len(pair_states_for_state)} pair states")
+            else:
+                logger.warning(f"⚠️ Failed to save manual changes to state manager")
+                
+        except Exception as e:
+            logger.error(f"❌ Error saving manual changes to state manager: {e}")
+            logger.debug(f"State save error details: {traceback.format_exc()}")
+    
+    def _save_reconciliation_to_state_manager(self, changes_count: int):
+        """
+        Save reconciliation results to state manager.
+        This ensures that position reconciliation changes are persisted.
+        
+        Args:
+            changes_count: Number of changes detected and processed
+        """
+        try:
+            # Only save if we have a state manager (live trading mode)
+            if not hasattr(self, 'state_manager') or not self.state_manager:
+                logger.debug(f"No state manager available for saving reconciliation results")
+                return
+            
+            logger.info(f"💾 SAVING RECONCILIATION RESULTS TO STATE MANAGER:")
+            logger.info(f"   Changes processed: {changes_count}")
+            logger.info(f"   Active positions: {len(self.active_positions)}")
+            logger.info(f"   Pair states: {len(self.pair_states)}")
+            
+            # Update last reconciliation time
+            self._last_reconciliation_time = datetime.now()
+            
+            # Fix position data to meet schema requirements
+            active_positions_for_state = {}
+            for pair, position_data in self.active_positions.items():
+                try:
+                    processed_data = {
+                        'symbol1': position_data.get('symbol1', ''),
+                        'symbol2': position_data.get('symbol2', ''),
+                        'direction': position_data.get('direction', 'long'),
+                        'entry_time': position_data.get('entry_time', datetime.now()),
+                        'quantity': position_data.get('quantity', position_data.get('volume', 0.01)),  # Fix quantity field
+                        'entry_price': max(position_data.get('entry_price', 100.0), 0.01),  # Ensure > 0
+                        'stop_loss': position_data.get('stop_loss'),
+                        'take_profit': position_data.get('take_profit'),
+                    }
+                    
+                    # Validate quantity field
+                    if processed_data['quantity'] <= 0:
+                        processed_data['quantity'] = 0.01
+                    
+                    active_positions_for_state[pair] = processed_data
+                except Exception as pos_error:
+                    logger.warning(f"Error processing position {pair}: {pos_error}")
+                    continue
+            
+            # Fix pair state data to meet schema requirements  
+            pair_states_for_state = {}
+            for pair, state_data in self.pair_states.items():
+                try:
+                    # Extract symbols from pair string
+                    if '-' in pair:
+                        symbol1, symbol2 = pair.split('-', 1)
+                    else:
+                        symbol1 = pair[:6] if len(pair) >= 6 else pair
+                        symbol2 = pair[6:] if len(pair) > 6 else 'USD'
+                    
+                    # Fix position value to match schema pattern: '^(none|long|short)$'
+                    position_value = state_data.get('position', 'none')
+                    if position_value == 'FLAT' or position_value is None:
+                        position_value = 'none'
+                    elif position_value not in ['none', 'long', 'short']:
+                        position_value = 'none'
+                    
+                    processed_state = {
+                        'symbol1': symbol1,
+                        'symbol2': symbol2,
+                        'position': position_value,  # Must be 'none', 'long', or 'short'
+                        'last_update': state_data.get('last_update', datetime.now()),
+                        'last_signal_time': state_data.get('last_signal_time', datetime.now()),
+                        'trade_count': state_data.get('trade_count', 0),
+                        'total_pnl': state_data.get('total_pnl', 0.0),
+                        'z_score': state_data.get('z_score', 0.0),
+                        'spread': state_data.get('spread', 0.0),
+                        'status': state_data.get('status', 'active'),
+                    }
+                    
+                    pair_states_for_state[pair] = processed_state
+                except Exception as state_error:
+                    logger.warning(f"Error processing pair state {pair}: {state_error}")
+                    continue
+            
+            # Prepare current portfolio data
+            portfolio_data = {
+                'total_value': getattr(self, 'portfolio_value', 100000.0),
+                'available_balance': getattr(self, 'available_balance', 100000.0),
+                'total_pnl': 0.0,  # Will be calculated by portfolio manager
+                'open_positions': len(active_positions_for_state),
+                'daily_pnl': 0.0,  # Will be calculated
+                'peak_value': getattr(self, 'portfolio_peak_value', 100000.0),
+                'metadata': {
+                    'reconciliation_info': {
+                        'changes_processed': changes_count,
+                        'timestamp': self._last_reconciliation_time.isoformat(),
+                        'trigger': 'position_reconciliation',
+                        'active_positions_after': len(active_positions_for_state)
+                    },
+                    'session_info': {
+                        'data_provider': 'ctrader',
+                        'broker': 'ctrader',
+                        'save_time': datetime.now().isoformat(),
+                        'system_version': 'EnhancedTradingSystemV3'
+                    }
+                }
+            }
+            
+            # Save to state manager with corrected data
+            success = self.state_manager.save_trading_state(
+                active_positions=active_positions_for_state,
+                pair_states=pair_states_for_state,
+                portfolio_data=portfolio_data
+            )
+            
+            if success:
+                logger.info(f"✅ Reconciliation results saved to state manager successfully")
+                logger.info(f"   Updated {len(active_positions_for_state)} positions")
+                logger.info(f"   Updated {len(pair_states_for_state)} pair states")
+                logger.info(f"   Processed {changes_count} manual changes")
+            else:
+                logger.warning(f"⚠️ Failed to save reconciliation results to state manager")
+                
+        except Exception as e:
+            logger.error(f"❌ Error saving reconciliation results to state manager: {e}")
+            logger.debug(f"Reconciliation save error details: {traceback.format_exc()}")
+    
+    def _log_manual_closure_pnl(self, closed_position: dict, pair_str: str):
+        """
+        Log estimated P&L for manually closed position (for informational purposes).
+        """
+        try:
+            symbol1 = closed_position.get('symbol1')
+            symbol2 = closed_position.get('symbol2')
+            
+            # Get current prices
+            current_price1 = self.get_current_price(symbol1) if symbol1 else None
+            current_price2 = self.get_current_price(symbol2) if symbol2 else None
+            
+            entry_price1 = closed_position.get('entry_price1', 0)
+            entry_price2 = closed_position.get('entry_price2', 0)
+            volume1 = closed_position.get('volume1', 0)
+            volume2 = closed_position.get('volume2', 0)
+            
+            if current_price1 and current_price2 and entry_price1 and entry_price2:
+                # Calculate estimated P&L (simplified)
+                pnl1 = (current_price1 - entry_price1) * volume1
+                pnl2 = (current_price2 - entry_price2) * volume2
+                total_pnl = pnl1 + pnl2
+                
+                logger.warning(f"📊 ESTIMATED MANUAL CLOSURE P&L:")
+                logger.warning(f"   {symbol1}: ${pnl1:.2f}")
+                logger.warning(f"   {symbol2}: ${pnl2:.2f}")
+                logger.warning(f"   Total: ${total_pnl:.2f}")
+            else:
+                logger.warning(f"   ⚠️ Cannot calculate P&L - missing price data")
+                
+        except Exception as e:
+            logger.debug(f"Error calculating manual closure P&L: {e}")
     
     def _get_order_status_name(self, status_code):
         """Convert order status code to readable name"""
@@ -3527,6 +4865,68 @@ class CTraderRealTimeTrader(BaseBroker):
             'count': len(self.suspended_pairs),
             'active_pairs': [pair for pair in self.pair_states.keys() if pair not in self.suspended_pairs]
         }
+    
+    def get_manual_trade_handling_status(self) -> dict:
+        """Get comprehensive status of manual trade handling and position tracking"""
+        try:
+            current_time = datetime.now()
+            
+            status = {
+                'manual_trade_tracking': {
+                    'enabled': True,
+                    'execution_events_processed': getattr(self, '_manual_events_processed', 0),
+                    'last_manual_event_time': getattr(self, '_last_manual_event_time', None)
+                },
+                'position_reconciliation': {
+                    'enabled': True,
+                    'last_reconciliation': self._last_reconciliation_time,
+                    'scheduled': self._position_reconciliation_scheduled,
+                    'time_since_last': None
+                },
+                'suspended_pairs': {
+                    'count': len(self.suspended_pairs),
+                    'pairs': list(self.suspended_pairs)
+                },
+                'active_positions': {
+                    'count': len(self.active_positions),
+                    'pairs': list(self.active_positions.keys())
+                },
+                'tracking_health': {
+                    'execution_requests_pending': len(self.execution_requests),
+                    'pending_pair_trades': len(self.pending_pair_trades),
+                    'pending_close_positions': len(getattr(self, 'pending_close_positions', {}))
+                }
+            }
+            
+            # Calculate time since last reconciliation
+            if self._last_reconciliation_time:
+                try:
+                    if isinstance(self._last_reconciliation_time, str):
+                        last_time = datetime.fromisoformat(self._last_reconciliation_time)
+                    else:
+                        last_time = self._last_reconciliation_time
+                    
+                    time_diff = current_time - last_time
+                    status['position_reconciliation']['time_since_last'] = str(time_diff)
+                    
+                    # Add health warning if reconciliation is overdue (>15 minutes)
+                    if time_diff.total_seconds() > 900:
+                        status['position_reconciliation']['status'] = 'OVERDUE'
+                    else:
+                        status['position_reconciliation']['status'] = 'HEALTHY'
+                        
+                except Exception as e:
+                    status['position_reconciliation']['status'] = f'ERROR: {e}'
+            else:
+                status['position_reconciliation']['status'] = 'NOT_RUN'
+            
+            return status
+            
+        except Exception as e:
+            return {
+                'error': f'Failed to get manual trade handling status: {e}',
+                'timestamp': current_time.isoformat()
+            }
     
     def _send_emergency_alert(self, symbol: str, original_side: str, volume: float, failed_trade: dict):
         """Send emergency alert for manual intervention (implement based on your alert system)"""
@@ -3972,13 +5372,20 @@ class CTraderRealTimeTrader(BaseBroker):
             current_price1 = self._get_spot_price(s1)
             current_price2 = self._get_spot_price(s2)
             
-            # Calculate current P&L percentage
-            if direction == 'LONG':
-                pnl = (current_price1 - position['entry_price1']) * position['volume1'] - \
-                      (current_price2 - position['entry_price2']) * position['volume2']
-            else:
-                pnl = (position['entry_price1'] - current_price1) * position['volume1'] - \
-                      (position['entry_price2'] - current_price2) * position['volume2']
+            # Calculate current P&L using portfolio manager
+            try:
+                pnl = self.portfolio_manager.portfolio_calculator.calculate_position_pnl(
+                    position, self, self.get_symbol_info_cache()
+                )
+            except Exception as e:
+                logger.debug(f"Error calculating P&L for {pair_str} using portfolio manager: {e}")
+                # Fallback to basic calculation
+                if direction == 'LONG':
+                    pnl = (current_price1 - position['entry_price1']) * position['volume1'] - \
+                          (current_price2 - position['entry_price2']) * position['volume2']
+                else:
+                    pnl = (position['entry_price1'] - current_price1) * position['volume1'] - \
+                          (position['entry_price2'] - current_price2) * position['volume2']
             
             # Calculate position value for percentage calculation
             position_value = abs(position['volume1'] * position['entry_price1']) + \
@@ -4074,13 +5481,20 @@ class CTraderRealTimeTrader(BaseBroker):
             if current_price2 is None:
                 current_price2 = position['entry_price2']
             
-            # Basic P&L calculation (expand for more accuracy)
-            if position['direction'] == 'LONG':
-                pnl = (current_price1 - position['entry_price1']) * position['volume1'] - \
-                      (current_price2 - position['entry_price2']) * position['volume2']
-            else:
-                pnl = (position['entry_price1'] - current_price1) * position['volume1'] - \
-                      (position['entry_price2'] - current_price2) * position['volume2']
+            # Use portfolio manager to calculate position P&L
+            try:
+                pnl = self.portfolio_manager.portfolio_calculator.calculate_position_pnl(
+                    position, self, self.get_symbol_info_cache()
+                )
+            except Exception as e:
+                logger.debug(f"Error calculating P&L for {pair_str} using portfolio manager: {e}")
+                # Fallback to basic calculation
+                if position['direction'] == 'LONG':
+                    pnl = (current_price1 - position['entry_price1']) * position['volume1'] - \
+                          (current_price2 - position['entry_price2']) * position['volume2']
+                else:
+                    pnl = (position['entry_price1'] - current_price1) * position['volume1'] - \
+                          (position['entry_price2'] - current_price2) * position['volume2']
             
             unrealized_pnl += pnl
             total_exposure += abs(position['volume1'] * current_price1) + abs(position['volume2'] * current_price2)
@@ -4130,23 +5544,29 @@ class CTraderRealTimeTrader(BaseBroker):
         unrealized_pnl = 0.0
         
         for pair_str, position in self.active_positions.items():
-            # Calculate position P&L (simplified) - use helper methods for price access
-            current_price1 = self._get_spot_price(position['symbol1'])
-            current_price2 = self._get_spot_price(position['symbol2'])
-            
-            # Fallback to entry prices if current prices not available
-            if current_price1 is None:
-                current_price1 = position['entry_price1']
-            if current_price2 is None:
-                current_price2 = position['entry_price2']
-            
-            # Basic P&L calculation
-            if position['direction'] == 'LONG':
-                pnl = (current_price1 - position['entry_price1']) * position['volume1'] - \
-                      (current_price2 - position['entry_price2']) * position['volume2']
-            else:
-                pnl = (position['entry_price1'] - current_price1) * position['volume1'] - \
-                      (position['entry_price2'] - current_price2) * position['volume2']
+            # Use portfolio manager to calculate position P&L
+            try:
+                pnl = self.portfolio_manager.portfolio_calculator.calculate_position_pnl(
+                    position, self, self.get_symbol_info_cache()
+                )
+            except Exception as e:
+                logger.debug(f"Error calculating P&L for {pair_str} using portfolio manager: {e}")
+                # Fallback to basic calculation
+                current_price1 = self._get_spot_price(position['symbol1'])
+                current_price2 = self._get_spot_price(position['symbol2'])
+                
+                # Fallback to entry prices if current prices not available
+                if current_price1 is None:
+                    current_price1 = position['entry_price1']
+                if current_price2 is None:
+                    current_price2 = position['entry_price2']
+                
+                if position['direction'] == 'LONG':
+                    pnl = (current_price1 - position['entry_price1']) * position['volume1'] - \
+                          (current_price2 - position['entry_price2']) * position['volume2']
+                else:
+                    pnl = (position['entry_price1'] - current_price1) * position['volume1'] - \
+                          (position['entry_price2'] - current_price2) * position['volume2']
             
             unrealized_pnl += pnl
         
@@ -4220,6 +5640,9 @@ class CTraderRealTimeTrader(BaseBroker):
                         logger.info(f"📊 Restored position: {pair_key} | {position_info['direction']} | Entry: {position_info.get('entry_price', 'N/A')}")
                 except Exception as e:
                     logger.warning(f"Failed to convert broker position: {e}")
+            
+            # ENHANCED: Compare broker positions with our local tracking to detect manual changes
+            self._detect_manual_position_changes(broker_positions, restored_positions)
             
             # Update our local position tracking
             if restored_positions:
@@ -4339,3 +5762,168 @@ class CTraderRealTimeTrader(BaseBroker):
         except Exception as e:
             logger.error(f"Error converting broker position: {e}")
             return None
+    
+    def _detect_manual_position_changes(self, broker_positions: list, restored_positions: dict):
+        """
+        Detect manual position changes by comparing broker positions with our local tracking.
+        This helps identify positions that were manually closed or modified.
+        """
+        logger.info("🔍 DETECTING MANUAL POSITION CHANGES...")
+        
+        try:
+            # Create a set of broker position symbols and their details for quick lookup
+            broker_symbols = {}
+            for pos in broker_positions:
+                symbol_id = getattr(pos, 'symbolId', None)
+                position_id = getattr(pos, 'positionId', None)
+                volume = getattr(pos, 'volume', 0)
+                
+                if symbol_id and position_id:
+                    symbol_name = self.symbol_id_to_name_map.get(symbol_id)
+                    if symbol_name:
+                        broker_symbols[symbol_name] = {
+                            'position_id': position_id,
+                            'volume': volume,
+                            'symbol_id': symbol_id
+                        }
+            
+            logger.info(f"📊 Broker has {len(broker_symbols)} individual positions")
+            logger.info(f"📊 We track {len(self.active_positions)} pair positions")
+            
+            # Check each of our tracked pairs against broker positions
+            manual_changes_detected = []
+            
+            for pair_str, position_data in list(self.active_positions.items()):
+                symbol1 = position_data.get('symbol1')
+                symbol2 = position_data.get('symbol2')
+                volume1 = position_data.get('volume1', 0)
+                volume2 = position_data.get('volume2', 0)
+                
+                # Check if both legs still exist in broker
+                symbol1_in_broker = symbol1 in broker_symbols if symbol1 else False
+                symbol2_in_broker = symbol2 in broker_symbols if symbol2 else False
+                
+                broker_volume1 = broker_symbols.get(symbol1, {}).get('volume', 0) if symbol1_in_broker else 0
+                broker_volume2 = broker_symbols.get(symbol2, {}).get('volume', 0) if symbol2_in_broker else 0
+                
+                logger.info(f"🔍 Checking pair {pair_str}:")
+                logger.info(f"   {symbol1}: Tracked={volume1}, Broker={broker_volume1}, Exists={symbol1_in_broker}")
+                logger.info(f"   {symbol2}: Tracked={volume2}, Broker={broker_volume2}, Exists={symbol2_in_broker}")
+                
+                # Detect various types of manual changes
+                if not symbol1_in_broker and not symbol2_in_broker:
+                    # Both legs missing - likely full pair closure
+                    logger.warning(f"🎯 MANUAL PAIR CLOSURE DETECTED: {pair_str}")
+                    logger.warning(f"   Both legs missing from broker positions")
+                    manual_changes_detected.append({
+                        'type': 'FULL_CLOSURE',
+                        'pair': pair_str,
+                        'reason': 'Both legs missing from broker'
+                    })
+                    
+                elif not symbol1_in_broker or not symbol2_in_broker:
+                    # One leg missing - asymmetric closure (concerning)
+                    missing_symbol = symbol1 if not symbol1_in_broker else symbol2
+                    remaining_symbol = symbol2 if not symbol1_in_broker else symbol1
+                    logger.warning(f"🚨 ASYMMETRIC CLOSURE DETECTED: {pair_str}")
+                    logger.warning(f"   Missing: {missing_symbol}")
+                    logger.warning(f"   Remaining: {remaining_symbol}")
+                    manual_changes_detected.append({
+                        'type': 'ASYMMETRIC_CLOSURE',
+                        'pair': pair_str,
+                        'missing_symbol': missing_symbol,
+                        'remaining_symbol': remaining_symbol
+                    })
+                    
+                elif abs(broker_volume1 - volume1) > 0.001 or abs(broker_volume2 - volume2) > 0.001:
+                    # Volume differences - partial closes or modifications
+                    logger.warning(f"🔧 VOLUME CHANGE DETECTED: {pair_str}")
+                    logger.warning(f"   {symbol1}: {volume1} -> {broker_volume1} (Δ: {broker_volume1 - volume1})")
+                    logger.warning(f"   {symbol2}: {volume2} -> {broker_volume2} (Δ: {broker_volume2 - volume2})")
+                    manual_changes_detected.append({
+                        'type': 'VOLUME_CHANGE',
+                        'pair': pair_str,
+                        'volume_changes': {
+                            symbol1: {'old': volume1, 'new': broker_volume1},
+                            symbol2: {'old': volume2, 'new': broker_volume2}
+                        }
+                    })
+                else:
+                    logger.debug(f"   ✅ No changes detected for {pair_str}")
+            
+            # Process detected changes
+            if manual_changes_detected:
+                logger.warning(f"🎯 DETECTED {len(manual_changes_detected)} MANUAL POSITION CHANGES:")
+                
+                for change in manual_changes_detected:
+                    self._process_detected_manual_change(change)
+                
+                # CRITICAL: Save all changes to state manager after processing
+                logger.info(f"💾 SAVING RECONCILIATION RESULTS TO STATE MANAGER...")
+                self._save_reconciliation_to_state_manager(len(manual_changes_detected))
+                
+            else:
+                logger.info("✅ No manual position changes detected")
+                
+        except Exception as e:
+            logger.error(f"❌ Error detecting manual position changes: {e}")
+            logger.error(traceback.format_exc())
+    
+    def _process_detected_manual_change(self, change: dict):
+        """
+        Process a detected manual position change and update internal state.
+        """
+        change_type = change.get('type')
+        pair_str = change.get('pair')
+        
+        logger.warning(f"🔧 PROCESSING DETECTED MANUAL CHANGE:")
+        logger.warning(f"   Type: {change_type}")
+        logger.warning(f"   Pair: {pair_str}")
+        
+        try:
+            if change_type == 'FULL_CLOSURE':
+                # Handle full pair closure
+                self._handle_manual_pair_closure(pair_str, "Detected via reconciliation", "RECONCILE")
+                
+            elif change_type == 'ASYMMETRIC_CLOSURE':
+                # Handle asymmetric closure - this is concerning as it leaves one-legged exposure
+                missing_symbol = change.get('missing_symbol')
+                remaining_symbol = change.get('remaining_symbol')
+                
+                logger.critical(f"🚨 ASYMMETRIC CLOSURE REQUIRES ATTENTION:")
+                logger.critical(f"   Pair: {pair_str}")
+                logger.critical(f"   Missing leg: {missing_symbol}")
+                logger.critical(f"   Remaining leg: {remaining_symbol}")
+                logger.critical(f"   ACTION: Consider manually closing {remaining_symbol} to balance exposure")
+                
+                # For now, remove the pair from tracking but log the issue
+                self._handle_manual_pair_closure(pair_str, f"Asymmetric closure - {missing_symbol} missing", "RECONCILE")
+                
+            elif change_type == 'VOLUME_CHANGE':
+                # Handle volume changes - partial closes
+                volume_changes = change.get('volume_changes', {})
+                
+                for symbol, volumes in volume_changes.items():
+                    old_vol = volumes['old']
+                    new_vol = volumes['new']
+                    
+                    if abs(new_vol) < abs(old_vol):
+                        logger.warning(f"   Volume reduced for {symbol}: {old_vol} -> {new_vol}")
+                    elif abs(new_vol) > abs(old_vol):
+                        logger.warning(f"   Volume increased for {symbol}: {old_vol} -> {new_vol}")
+                
+                # Update our tracking with new volumes
+                if pair_str in self.active_positions:
+                    position_data = self.active_positions[pair_str]
+                    
+                    for symbol, volumes in volume_changes.items():
+                        if symbol == position_data.get('symbol1'):
+                            position_data['volume1'] = volumes['new']
+                        elif symbol == position_data.get('symbol2'):
+                            position_data['volume2'] = volumes['new']
+                    
+                    logger.warning(f"   ✅ Updated volumes for {pair_str}")
+                
+        except Exception as e:
+            logger.error(f"❌ Error processing detected manual change: {e}")
+            logger.error(traceback.format_exc())

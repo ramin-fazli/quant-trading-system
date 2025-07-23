@@ -95,7 +95,19 @@ class BaseStrategy(ABC):
         Returns:
             Minimum number of data points needed
         """
-        return getattr(self.config, 'min_data_points', 50)
+        if not hasattr(self.config, 'min_data_points'):
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error("Missing required configuration field: min_data_points")
+            return 0  # Return 0 to indicate validation failure
+            
+        if not isinstance(self.config.min_data_points, int) or self.config.min_data_points <= 0:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Invalid min_data_points: {self.config.min_data_points}. Must be a positive integer.")
+            return 0  # Return 0 to indicate validation failure
+            
+        return self.config.min_data_points
     
     def validate_market_data(self, market_data: Dict[str, Any]) -> bool:
         """
@@ -124,9 +136,18 @@ class BaseStrategy(ABC):
         Returns:
             Dictionary containing strategy metadata
         """
+        # Validate strategy_type exists
+        if not hasattr(self, 'strategy_type'):
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error("Strategy missing required strategy_type attribute")
+            strategy_type = None  # Indicate missing type
+        else:
+            strategy_type = self.strategy_type
+            
         return {
             'name': self.__class__.__name__,
-            'type': getattr(self, 'strategy_type', 'unknown'),
+            'type': strategy_type,
             'min_data_points': self.get_minimum_data_points(),
             'required_symbols': self.get_required_symbols(),
             'tradeable_instruments': self.get_tradeable_instruments()
@@ -212,13 +233,49 @@ class PairsStrategyInterface(BaseStrategy):
         Returns:
             List of (symbol1, symbol2) tuples
         """
+        if not hasattr(self.config, 'pairs'):
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error("Missing required configuration field: pairs")
+            return []  # Return empty list to indicate validation failure
+            
+        if not isinstance(self.config.pairs, (list, tuple)):
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Invalid pairs configuration: {type(self.config.pairs)}. Must be a list or tuple.")
+            return []  # Return empty list to indicate validation failure
+        
         pairs = []
-        for pair_str in getattr(self.config, 'pairs', []):
+        for pair_str in self.config.pairs:
             try:
-                symbol1, symbol2 = pair_str.split('-')
-                pairs.append((symbol1.strip(), symbol2.strip()))
-            except ValueError:
+                if not isinstance(pair_str, str):
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"Invalid pair format: {pair_str}. Expected string, got {type(pair_str)}")
+                    continue
+                    
+                if '-' not in pair_str:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"Invalid pair format: {pair_str}. Expected format 'SYMBOL1-SYMBOL2'")
+                    continue
+                    
+                symbol1, symbol2 = pair_str.split('-', 1)  # Split only on first dash
+                symbol1, symbol2 = symbol1.strip(), symbol2.strip()
+                
+                if not symbol1 or not symbol2:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"Invalid pair format: {pair_str}. Empty symbols after splitting")
+                    continue
+                    
+                pairs.append((symbol1, symbol2))
+            except Exception as e:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Error parsing pair {pair_str}: {e}")
                 continue
+                
         return pairs
     
     def get_required_symbols(self) -> List[str]:
@@ -309,7 +366,35 @@ class SingleSymbolStrategyInterface(BaseStrategy):
         Returns:
             List of symbol names
         """
-        return getattr(self.config, 'symbols', [])
+        if not hasattr(self.config, 'symbols'):
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error("Missing required configuration field: symbols")
+            return []  # Return empty list to indicate validation failure
+            
+        if not isinstance(self.config.symbols, (list, tuple)):
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Invalid symbols configuration: {type(self.config.symbols)}. Must be a list or tuple.")
+            return []  # Return empty list to indicate validation failure
+        
+        symbols = []
+        for symbol in self.config.symbols:
+            if not isinstance(symbol, str):
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Invalid symbol format: {symbol}. Expected string, got {type(symbol)}")
+                continue
+                
+            if not symbol.strip():
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning("Empty symbol found in configuration")
+                continue
+                
+            symbols.append(symbol.strip())
+            
+        return symbols
     
     def get_required_symbols(self) -> List[str]:
         """Get symbols from configuration."""

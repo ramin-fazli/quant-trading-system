@@ -90,7 +90,7 @@ class StateManagementConfig:
     enable_validation: bool = True
     enable_file_fallback: bool = True
     fallback_directory: str = './state_fallback'
-    log_level: str = 'INFO'
+    log_level: str = 'WARNING'
     backup_retention_days: int = 30
     
     # Migration settings
@@ -151,7 +151,7 @@ class StateManagementConfig:
             enable_validation=os.getenv(f'{env_prefix}ENABLE_VALIDATION', 'true').lower() == 'true',
             enable_file_fallback=os.getenv(f'{env_prefix}ENABLE_FILE_FALLBACK', 'true').lower() == 'true',
             fallback_directory=os.getenv(f'{env_prefix}FALLBACK_DIR', './state_fallback'),
-            log_level=os.getenv(f'{env_prefix}LOG_LEVEL', 'INFO'),
+            log_level=os.getenv(f'{env_prefix}LOG_LEVEL', 'WARNING'),
             backup_retention_days=int(os.getenv(f'{env_prefix}BACKUP_RETENTION_DAYS', '30')),
             
             # Migration settings

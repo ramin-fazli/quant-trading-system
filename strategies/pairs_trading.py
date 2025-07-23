@@ -68,11 +68,16 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
 
     def get_minimum_data_points(self) -> int:
         """Get the minimum number of data points required for strategy calculation."""
-        return max(
-            getattr(self.config, 'z_period', 50),
-            getattr(self.config, 'corr_period', 50),
-            getattr(self.config, 'adf_period', 50)
-        )
+        required_fields = ['z_period', 'corr_period', 'adf_period']
+        periods = []
+        
+        for field in required_fields:
+            if not hasattr(self.config, field):
+                logger.error(f"Missing required config field: {field}")
+                return 0  # Return 0 to indicate configuration error
+            periods.append(getattr(self.config, field))
+        
+        return max(periods)
 
     def validate_market_data(self, market_data: Dict[str, Any]) -> bool:
         """Validate that market data is sufficient for pairs strategy calculations."""
@@ -159,17 +164,17 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
                     price2_clean = price2[~price2.index.duplicated(keep='last')]
                     df = pd.concat([price1_clean, price2_clean], axis=1).fillna(method='ffill').dropna()
                 except Exception as e2:
-                    logger.error(f"Fallback DataFrame creation also failed: {e2}")
+                    logger.error(f"DataFrame creation failed completely: {e2}")
                     return {}
             
-            # Check minimum data requirements
-            min_required = max(
-                getattr(self.config, 'z_period', 50),
-                getattr(self.config, 'corr_period', 50), 
-                getattr(self.config, 'adf_period', 50)
-            )
+            # Check minimum data requirements with validation
+            min_required = self.get_minimum_data_points()
+            if min_required == 0:
+                logger.error("Configuration validation failed - cannot proceed with indicators")
+                return {}
             
             if len(df) < min_required:
+                logger.warning(f"Insufficient data: {len(df)} points available, {min_required} required")
                 return {}
             
             df.columns = ['price1', 'price2']
@@ -183,10 +188,26 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
             
             # Check for invalid ratios
             if ratio.isnull().all() or not ratio.std() > 0:
+                logger.error("Invalid price ratios - cannot calculate indicators")
                 return {}
             
-            # Rolling statistics using pandas optimized functions
-            z_period = getattr(self.config, 'z_period', 50)
+            # Rolling statistics using pandas optimized functions with validation
+            if not hasattr(self.config, 'z_period'):
+                logger.error("Missing z_period in configuration")
+                return {}
+                
+            if not hasattr(self.config, 'corr_period'):
+                logger.error("Missing corr_period in configuration")
+                return {}
+                
+            z_period = self.config.z_period
+            if z_period <= 0:
+                logger.error(f"Invalid z_period: {z_period}. Must be positive.")
+                return {}
+                
+            if self.config.corr_period <= 0:
+                logger.error(f"Invalid corr_period: {self.config.corr_period}. Must be positive.")
+                return {}
             ratio_ma = ratio.rolling(z_period, min_periods=z_period).mean()
             ratio_std = ratio.rolling(z_period, min_periods=z_period).std()
             
@@ -205,7 +226,10 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
             
             # Calculate percentage distance from mean
             distance_from_mean = abs((ratio - ratio_ma) / ratio_ma) * 100
-            distance_from_mean_perc = distance_from_mean.iloc[-1] if not distance_from_mean.empty else 0
+            if distance_from_mean.empty:
+                logger.error("Distance from mean calculation resulted in empty series")
+                return {}
+            distance_from_mean_perc = distance_from_mean.iloc[-1]
             
             # Correlation using rolling window
             correlation = df['price1'].rolling(self.config.corr_period).corr(df['price2'])
@@ -215,30 +239,95 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
             vol2 = df['price2'].rolling(self.config.z_period).std() / df['price2'].rolling(self.config.z_period).mean()
             vol_ratio = np.maximum(vol1, vol2) / np.minimum(vol1, vol2)
             
-            # ADF test - skip if disabled
+            # ADF test - validate configuration and skip if disabled
+            if not hasattr(self.config, 'enable_adf'):
+                logger.error("Missing enable_adf in configuration")
+                return {}
+                
             if self.config.enable_adf:
+                if not hasattr(self.config, 'adf_period'):
+                    logger.error("Missing adf_period in configuration when enable_adf is True")
+                    return {}
+                    
+                if self.config.adf_period <= 0:
+                    logger.error(f"Invalid adf_period: {self.config.adf_period}. Must be positive.")
+                    return {}
+                    
                 adf_pvals = self._rolling_adf_vectorized(ratio, self.config.adf_period)
             else:
-                # Set to pass all tests when disabled
-                adf_pvals = np.zeros(len(ratio))  # Always pass (p-value = 0)
+                # When ADF is disabled, create array that will pass suitability checks
+                adf_pvals = np.zeros(len(ratio))  # p-value = 0 means stationary
             
-            # Johansen test - skip if disabled
+            # Johansen test - validate configuration and skip if disabled
+            if not hasattr(self.config, 'enable_johansen'):
+                logger.error("Missing enable_johansen in configuration")
+                return {}
+                
             if self.config.enable_johansen:
+                if not hasattr(self.config, 'adf_period'):
+                    logger.error("Missing adf_period in configuration when enable_johansen is True")
+                    return {}
+                    
+                if self.config.adf_period <= 0:
+                    logger.error(f"Invalid adf_period for Johansen test: {self.config.adf_period}. Must be positive.")
+                    return {}
+                    
                 johansen_stats, johansen_crits = self._rolling_johansen_vectorized(
                     df['price1'], df['price2'], self.config.adf_period
                 )
             else:
-                # Set to pass all tests when disabled
-                johansen_stats = np.ones(len(ratio))  # Always pass
-                johansen_crits = np.zeros(len(ratio))  # Always pass
+                # When Johansen is disabled, create arrays that will pass suitability checks
+                johansen_stats = np.ones(len(ratio))  # stat > crit means cointegrated
+                johansen_crits = np.zeros(len(ratio))  # crit = 0 makes stat > crit always true
         
             # Dynamic thresholds if enabled
             if self.config.dynamic_z:
-                # Prevent division by zero if min_volatility is zero or very small
-                min_vol = self.config.min_volatility if self.config.min_volatility > 0 else 1e-8
+                # Validate dynamic_z related configuration
+                if not hasattr(self.config, 'min_volatility'):
+                    logger.error("Missing min_volatility in configuration for dynamic_z")
+                    return {}
+                    
+                if not hasattr(self.config, 'z_entry'):
+                    logger.error("Missing z_entry in configuration for dynamic_z")
+                    return {}
+                    
+                if not hasattr(self.config, 'z_exit'):
+                    logger.error("Missing z_exit in configuration for dynamic_z")
+                    return {}
+                    
+                if self.config.min_volatility <= 0:
+                    logger.error(f"Invalid min_volatility: {self.config.min_volatility}. Must be positive for dynamic_z.")
+                    return {}
+                    
+                if self.config.z_entry <= 0:
+                    logger.error(f"Invalid z_entry: {self.config.z_entry}. Must be positive.")
+                    return {}
+                    
+                if self.config.z_exit < 0:
+                    logger.error(f"Invalid z_exit: {self.config.z_exit}. Must be non-negative.")
+                    return {}
+                    
+                min_vol = self.config.min_volatility
                 dynamic_entry = np.maximum(self.config.z_entry, self.config.z_entry * ratio_std / min_vol)
                 dynamic_exit = np.maximum(self.config.z_exit, self.config.z_exit * ratio_std / min_vol)
             else:
+                # Validate static threshold configuration
+                if not hasattr(self.config, 'z_entry'):
+                    logger.error("Missing z_entry in configuration")
+                    return {}
+                    
+                if not hasattr(self.config, 'z_exit'):
+                    logger.error("Missing z_exit in configuration")
+                    return {}
+                    
+                if self.config.z_entry <= 0:
+                    logger.error(f"Invalid z_entry: {self.config.z_entry}. Must be positive.")
+                    return {}
+                    
+                if self.config.z_exit < 0:
+                    logger.error(f"Invalid z_exit: {self.config.z_exit}. Must be non-negative.")
+                    return {}
+                    
                 dynamic_entry = np.full(len(zscore), self.config.z_entry)
                 dynamic_exit = np.full(len(zscore), self.config.z_exit)
         
@@ -248,6 +337,41 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
                 cost_filter = pd.Series(True, index=df.index)  # Always pass cost filter in backtest mode
             else:
                 cost_filter = self._calculate_cost_filter(price1.name, price2.name, df['price1'], df['price2'])
+        
+            # Validate configuration for suitability filter conditions
+            required_suitability_fields = [
+                'min_volatility', 'min_distance', 'enable_correlation', 'min_corr',
+                'max_adf_pval', 'johansen_crit_level', 'enable_vol_ratio', 'vol_ratio_max'
+            ]
+            for field in required_suitability_fields:
+                if not hasattr(self.config, field):
+                    logger.error(f"Missing required suitability configuration field: {field}")
+                    return {}
+                    
+            # Validate numeric ranges for suitability parameters
+            if self.config.min_volatility < 0:
+                logger.error(f"Invalid min_volatility: {self.config.min_volatility}. Must be non-negative.")
+                return {}
+                
+            if self.config.min_distance < 0:
+                logger.error(f"Invalid min_distance: {self.config.min_distance}. Must be non-negative.")
+                return {}
+                
+            if not (-1 <= self.config.min_corr <= 1):
+                logger.error(f"Invalid min_corr: {self.config.min_corr}. Must be between -1 and 1.")
+                return {}
+                
+            if not (0 <= self.config.max_adf_pval <= 1):
+                logger.error(f"Invalid max_adf_pval: {self.config.max_adf_pval}. Must be between 0 and 1.")
+                return {}
+                
+            if self.config.johansen_crit_level not in [90, 95, 99]:
+                logger.error(f"Invalid johansen_crit_level: {self.config.johansen_crit_level}. Must be 90, 95, or 99.")
+                return {}
+                
+            if self.config.vol_ratio_max <= 0:
+                logger.error(f"Invalid vol_ratio_max: {self.config.vol_ratio_max}. Must be positive.")
+                return {}
         
             # Suitability filter - build conditionally based on enabled tests and parameters
             suitable_conditions = []
@@ -317,13 +441,35 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
     def _calculate_cost_filter(self, symbol1: str, symbol2: str, price1: pd.Series, price2: pd.Series) -> pd.Series:
         """Calculate cost-based filter for pair trading suitability"""
         
-        # If no data manager available (backtesting), assume costs are acceptable
+        # Check trading mode
+        mode = os.getenv('TRADING_MODE', 'backtest').lower()
+        if mode == 'backtest':
+            return pd.Series(True, index=price1.index)  # Always pass cost filter in backtest mode
+        
+        # For live trading, validate cost parameters
         if not self.data_manager:
-            logger.warning("No data manager available for cost calculation - assuming costs are acceptable")
-            return pd.Series(True, index=price1.index)
+            logger.error("No data manager available for cost calculation in live mode")
+            return pd.Series(False, index=price1.index)
+        
+        # Validate required configuration for cost calculation
+        required_cost_fields = ['commission_fixed', 'max_commission_perc']
+        for field in required_cost_fields:
+            if not hasattr(self.config, field):
+                logger.error(f"Missing required cost configuration field: {field}")
+                return pd.Series(False, index=price1.index)
+        
+        if self.config.commission_fixed < 0:
+            logger.error(f"Invalid commission_fixed: {self.config.commission_fixed}. Must be non-negative.")
+            return pd.Series(False, index=price1.index)
+            
+        if not (0 <= self.config.max_commission_perc <= 100):
+            logger.error(f"Invalid max_commission_perc: {self.config.max_commission_perc}. Must be between 0 and 100.")
+            return pd.Series(False, index=price1.index)
         
         # Check for different data manager types
         symbol_info_available = False
+        info1 = None
+        info2 = None
         
         # MT5 data manager uses symbol_info_cache
         if hasattr(self.data_manager, 'symbol_info_cache'):
@@ -335,18 +481,34 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
         
         # cTrader data manager uses symbol_details  
         elif hasattr(self.data_manager, 'symbol_details'):
-            if symbol1 in self.data_manager.symbol_details and symbol2 in self.data_manager.symbol_details:
-                # cTrader doesn't provide spread info in the same way, so assume costs are acceptable
-                logger.debug(f"cTrader data manager detected for {symbol1}-{symbol2} - assuming costs are acceptable")
+            # Check if both symbols exist in cTrader
+            if symbol1 not in self.data_manager.symbol_details or symbol2 not in self.data_manager.symbol_details:
+                logger.debug(f"One or both symbols {symbol1}, {symbol2} not available in cTrader - skipping cost validation")
+                # For symbols not available in cTrader (like US stocks), skip cost validation 
+                # This allows the strategy to continue without cost filtering for unavailable symbols
+                return pd.Series(True, index=price1.index)
+            
+            info1 = self.data_manager.symbol_details[symbol1]
+            info2 = self.data_manager.symbol_details[symbol2]
+            
+            # Check if spread information is available (updated by cTrader broker)
+            if 'spread' in info1 and 'point' in info1 and 'spread' in info2 and 'point' in info2:
+                symbol_info_available = True
+                logger.debug(f"Using cTrader symbol details with spread info for {symbol1}-{symbol2}")
+            else:
+                logger.debug(f"cTrader symbol details available but spread info not yet calculated for {symbol1}-{symbol2}")
+                # Return True temporarily until spread info is available (allow trading to continue)
                 return pd.Series(True, index=price1.index)
         
-        # If no symbol info available, assume costs are acceptable
-        if not symbol_info_available:
-            logger.debug(f"Symbol info not available for {symbol1} or {symbol2} - assuming costs are acceptable")
+        # If no symbol info available in live mode, cannot validate costs
+        if not symbol_info_available or info1 is None or info2 is None:
+            logger.debug(f"Symbol info not available for {symbol1} or {symbol2} in live mode - using fallback cost validation")
+            # For cases where symbol info is not available, we can't do cost validation
+            # but we should allow trading to continue (this handles cases like symbols not available in the broker)
             return pd.Series(True, index=price1.index)
-        
-        # Process MT5 symbol info for cost calculation
-        # Calculate spreads as percentage of price
+              
+        # Process symbol info for cost calculation - spread calculation is now unified
+        # Calculate spreads as percentage of price (both MT5 and cTrader use same calculation)
         spread1_perc = (info1['spread'] * info1['point']) / price1 * 100
         spread2_perc = (info2['spread'] * info2['point']) / price2 * 100
         
@@ -402,7 +564,7 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
         return cost_acceptable
 
     def _rolling_adf_vectorized(self, series: pd.Series, window: int) -> np.ndarray:
-        """Optimized rolling ADF test"""
+        """Optimized rolling ADF test with proper error handling"""
         pvals = np.full(len(series), np.nan)
         
         # Use numpy arrays for faster computation
@@ -413,14 +575,27 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
                 window_data = values[i-window+1:i+1]
                 if len(np.unique(window_data)) > 1:  # Avoid constant series
                     pvals[i] = adfuller(window_data, autolag='AIC')[1]
-            except:
-                pvals[i] = 1.0  # Conservative assumption
+                else:
+                    # Skip calculation for constant series, leave as NaN
+                    logger.debug(f"Skipping ADF test at index {i} due to constant series")
+            except Exception as e:
+                # Log specific error and skip this window
+                logger.debug(f"ADF test failed at index {i}: {e}")
+                # Leave as NaN - will be handled by suitability filter
                 
         return pvals
     
     def _rolling_johansen_vectorized(self, series1: pd.Series, series2: pd.Series, 
                                    window: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Optimized rolling Johansen test"""
+        """Optimized rolling Johansen test with proper error handling"""
+        if not hasattr(self.config, 'johansen_crit_level'):
+            logger.error("Missing johansen_crit_level in configuration")
+            return np.array([]), np.array([])
+            
+        if self.config.johansen_crit_level not in [90, 95, 99]:
+            logger.error(f"Invalid johansen_crit_level: {self.config.johansen_crit_level}. Must be 90, 95, or 99.")
+            return np.array([]), np.array([])
+            
         stats = np.full(len(series1), np.nan)
         crits = np.full(len(series1), np.nan)
         
@@ -437,9 +612,13 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
                     result = coint_johansen(data, det_order=0, k_ar_diff=1)
                     stats[i] = result.lr1[0]
                     crits[i] = result.cvt[0, crit_idx]
-            except:
-                stats[i] = 0.0
-                crits[i] = 999.0  # High threshold for failed tests
+                else:
+                    # Skip calculation for windows with no variance, leave as NaN
+                    logger.debug(f"Skipping Johansen test at index {i} due to zero variance")
+            except Exception as e:
+                # Log specific error and skip this window
+                logger.debug(f"Johansen test failed at index {i}: {e}")
+                # Leave as NaN - will be handled by suitability filter
                 
         return stats, crits
     
@@ -494,26 +673,43 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
         """
         Returns True if both symbols are currently in an open and tradable market session,
         and both have recent tick data (Moscow time check).
-        If no data_manager or symbol_info_cache, assume True (for backtesting).
+        For backtesting mode, returns True. For live trading, validates market sessions.
         """
-        # If no data manager or no symbol info, assume tradable (for backtest)
-        if not self.data_manager or not hasattr(self.data_manager, 'symbol_info_cache'):
-            return True
+        # Check trading mode from environment
+        mode = os.getenv('TRADING_MODE', 'backtest').lower()
+        if mode == 'backtest':
+            return True  # Always allow trading in backtest mode
+        
+        # For live trading, validate market sessions
+        if not self.data_manager:
+            logger.error("No data manager available for market session validation in live mode")
+            return False
+            
+        if not hasattr(self.data_manager, 'symbol_info_cache'):
+            logger.error("No symbol_info_cache available for market session validation")
+            return False
 
         cache = self.data_manager.symbol_info_cache
         info1 = cache.get(symbol1)
         info2 = cache.get(symbol2)
-        if not info1 or not info2:
-            return True
+        
+        if not info1:
+            logger.warning(f"No symbol info available for {symbol1} - market session unknown")
+            return False
+            
+        if not info2:
+            logger.warning(f"No symbol info available for {symbol2} - market session unknown")
+            return False
 
         def is_tradable(info):
-            # MT5: trade_mode==0 means disabled, >0 means enabled
-            if 'trade_mode' in info and info['trade_mode'] != 4:
+            # MT5: trade_mode==4 means full trading allowed
+            if 'trade_mode' in info:
+                if info['trade_mode'] != 4:
+                    logger.debug(f"Symbol not tradable: trade_mode={info['trade_mode']}")
+                    return False
+            else:
+                logger.warning("No trade_mode information available")
                 return False
-            # if 'session_deals' in info and info['session_deals'] == 0:
-            #     return False
-            # if 'session_trade' in info and info['session_trade'] == 0:
-            #     return False
             return True
 
         def has_recent_tick(symbol):
@@ -522,18 +718,21 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
                 if last_tick is None:
                     logger.info(f"{symbol}: No tick data available. Market might be inactive or closed.")
                     return False
+                    
                 # Moscow time (UTC+3)
                 moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
                 current_utc_time = datetime.datetime.now(moscow_tz)
                 # Adjust for Moscow offset (+10800 seconds)
                 tick_time_diff = current_utc_time.timestamp() - last_tick.time + 10800
-                # Only accept if tick is within 60 seconds
+                
+                # Only accept if tick is within 10 minutes (600 seconds)
                 if tick_time_diff > 600:
                     last_tick_time = datetime.datetime.fromtimestamp(last_tick.time, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-                    # logger.info(f"{symbol}: Last tick is too old at {last_tick_time}). Market might be inactive.")
+                    logger.debug(f"{symbol}: Last tick is too old at {last_tick_time}). Market might be inactive.")
                     return False
                 return True
-            except Exception:
+            except Exception as e:
+                logger.error(f"Error checking tick data for {symbol}: {e}")
                 return False
 
         return (

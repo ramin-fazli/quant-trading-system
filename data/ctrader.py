@@ -128,10 +128,19 @@ class CTraderDataManager:
             relative_price: Raw price value from cTrader API
             
         Returns:
-            Properly formatted price rounded to symbol digits
+            Properly formatted price rounded to symbol digits, or None if invalid
         """
+        # Validate symbol_details and digits field
+        if not symbol_details or 'digits' not in symbol_details:
+            logger.error(f"Missing or invalid symbol_details for price conversion: {symbol_details}")
+            return None
+            
+        digits = symbol_details['digits']
+        if not isinstance(digits, int) or digits < 0:
+            logger.error(f"Invalid digits value: {digits}")
+            return None
+            
         # Divide by 100000 and round to symbol digits as per cTrader documentation
-        digits = symbol_details.get('digits', 5)  # Default to 5 digits if not available
         actual_price = relative_price / 100000.0
         return round(actual_price, digits)
     
@@ -181,10 +190,10 @@ class CTraderDataManager:
                 close_raw = low_raw + bar.deltaClose
                 prices['close'] = self._get_price_from_relative(symbol_details, close_raw)
             
-            # Ensure we have at least a close price
+            # Validate that we have at least a close price
             if 'close' not in prices:
-                # Fallback: use low price as close if no deltaClose
-                prices['close'] = low_price
+                logger.error("No close price available in trendbar data and no deltaClose field")
+                return None
                 
             return prices
             
@@ -336,10 +345,20 @@ class CTraderDataManager:
                 if clean_name not in self.symbol_name_to_id:
                     self.symbol_name_to_id[clean_name] = symbol.symbolId
                 
-                # Store basic symbol details for price conversion
+                # Store basic symbol details for price conversion with validation
+                digits = getattr(symbol, 'digits', None)
+                pip_position = getattr(symbol, 'pipPosition', None)
+                
+                if digits is None:
+                    logger.error(f"Missing digits field for symbol {symbol.symbolName}")
+                    continue
+                if pip_position is None:
+                    logger.warning(f"Missing pipPosition for symbol {symbol.symbolName}")
+                    pip_position = -5  # Common default for forex pairs
+                
                 self.symbol_details[symbol.symbolName] = {
-                    'digits': getattr(symbol, 'digits', 5),  # Default to 5 digits
-                    'pip_position': getattr(symbol, 'pipPosition', -5),  # Default pip position
+                    'digits': digits,
+                    'pip_position': pip_position,
                     'symbol_id': symbol.symbolId
                 }
                 
@@ -411,7 +430,15 @@ class CTraderDataManager:
                 '30M': ProtoOATrendbarPeriod.M30,
             }
             
-            period = period_map.get(self.interval.upper(), ProtoOATrendbarPeriod.D1)
+            if self.interval.upper() not in period_map:
+                logger.error(f"Unsupported interval: {self.interval}")
+                self.retrieved_data[symbol] = pd.Series(dtype=float)
+                self.pending_requests -= 1
+                if self.pending_requests <= 0:
+                    self._finish_data_collection()
+                return
+                
+            period = period_map[self.interval.upper()]
             
             # Convert dates to timestamps
             start_timestamp = int(self.start_date.timestamp() * 1000)
@@ -505,8 +532,14 @@ class CTraderDataManager:
                 dates = []
                 prices = []
                 
-                # Get symbol details for proper price conversion
-                symbol_details = self.symbol_details.get(target_symbol, {'digits': 5})
+                # Get symbol details for proper price conversion with validation
+                symbol_details = self.symbol_details.get(target_symbol)
+                if not symbol_details:
+                    logger.error(f"No symbol details available for {target_symbol}")
+                    self.retrieved_data[target_symbol] = pd.Series(dtype=float)
+                    self.pending_requests -= 1
+                    self._check_completion()
+                    return
                 
                 for bar in response.trendbar:
                     # Convert timestamp to datetime
@@ -519,27 +552,10 @@ class CTraderDataManager:
                     if bar_prices and 'close' in bar_prices:
                         prices.append(bar_prices['close'])
                     else:
-                        # Fallback: try direct price attributes with proper conversion
-                        try:
-                            if hasattr(bar, 'close'):
-                                close_price = self._get_price_from_relative(symbol_details, bar.close)
-                            elif hasattr(bar, 'closePrice'):
-                                close_price = self._get_price_from_relative(symbol_details, bar.closePrice)
-                            elif hasattr(bar, 'c'):
-                                close_price = self._get_price_from_relative(symbol_details, bar.c)
-                            elif hasattr(bar, 'low'):
-                                close_price = self._get_price_from_relative(symbol_details, bar.low)
-                            else:
-                                logger.error(f"No valid price data found for bar. Available attributes: {[attr for attr in dir(bar) if not attr.startswith('_')]}")
-                                dates.pop()  # Remove the date we just added
-                                continue
-                            
-                            prices.append(close_price)
-                            
-                        except Exception as bar_error:
-                            logger.warning(f"Error processing bar data with fallback: {bar_error}")
-                            dates.pop()  # Remove the date we just added
-                            continue
+                        # Skip bar if primary processing failed
+                        logger.error(f"Failed to process trendbar data for bar at {dt}")
+                        dates.pop()  # Remove the date we just added
+                        continue
                 
                 # Create pandas Series
                 if dates and prices:
@@ -1129,10 +1145,20 @@ class CTraderDataManager:
                 if clean_name not in self.async_symbol_name_to_id:
                     self.async_symbol_name_to_id[clean_name] = symbol.symbolId
                 
-                # Store basic symbol details for price conversion
+                # Store basic symbol details for price conversion with validation
+                digits = getattr(symbol, 'digits', None)
+                pip_position = getattr(symbol, 'pipPosition', None)
+                
+                if digits is None:
+                    logger.error(f"Missing digits field for async symbol {symbol.symbolName}")
+                    continue
+                if pip_position is None:
+                    logger.warning(f"Missing pipPosition for async symbol {symbol.symbolName}")
+                    pip_position = -5  # Common default for forex pairs
+                
                 symbol_details = {
-                    'digits': getattr(symbol, 'digits', 5),
-                    'pip_position': getattr(symbol, 'pipPosition', -5),
+                    'digits': digits,
+                    'pip_position': pip_position,
                     'symbol_id': symbol.symbolId
                 }
                 
@@ -1208,7 +1234,15 @@ class CTraderDataManager:
                 '30M': ProtoOATrendbarPeriod.M30,
             }
             
-            period = period_map.get(self.async_interval.upper(), ProtoOATrendbarPeriod.D1)
+            if self.async_interval.upper() not in period_map:
+                logger.error(f"Unsupported async interval: {self.async_interval}")
+                self.async_retrieved_data[symbol] = pd.Series(dtype=float)
+                self.async_pending_requests -= 1
+                if self.async_pending_requests <= 0:
+                    self._finish_data_collection_async()
+                return
+                
+            period = period_map[self.async_interval.upper()]
             
             # Convert dates to timestamps
             start_timestamp = int(self.start_date.timestamp() * 1000)
@@ -1301,8 +1335,14 @@ class CTraderDataManager:
                 dates = []
                 prices = []
                 
-                # Get symbol details for proper price conversion
-                symbol_details = self.async_symbol_details.get(target_symbol, {'digits': 5})
+                # Get symbol details for proper price conversion with validation
+                symbol_details = self.async_symbol_details.get(target_symbol)
+                if not symbol_details:
+                    logger.error(f"No async symbol details available for {target_symbol}")
+                    self.async_retrieved_data[target_symbol] = pd.Series(dtype=float)
+                    self.async_pending_requests -= 1
+                    self._check_completion_async()
+                    return
                 
                 for bar in response.trendbar:
                     # Convert timestamp to datetime

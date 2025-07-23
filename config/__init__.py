@@ -67,7 +67,7 @@ else:
             self.data_provider = os.getenv('DATA_PROVIDER', 'ctrader')
             self.broker = os.getenv('BROKER', 'ctrader')
             self.pairs = ['BTCUSD-ETHUSD', 'BTCUSD-SOLUSD', 'ETHUSD-SOLUSD']
-            self.log_level = os.getenv('LOG_LEVEL', 'INFO')
+            self.log_level = os.getenv('LOG_LEVEL', 'WARNING')
     
     TradingConfig = FallbackConfig
 
@@ -159,7 +159,7 @@ def get_config_health_check():
                 "validation": {"is_valid": True, "error_count": 0, "errors": []},
                 "configuration": {"data_provider": config.data_provider, "broker": config.broker},
                 "risk_assessment": {"risk_level": "UNKNOWN"},
-                "system": {"log_level": getattr(config, 'log_level', 'INFO')}
+                "system": {"log_level": getattr(config, 'log_level', 'WARNING')}
             }
     except Exception as e:
         return {

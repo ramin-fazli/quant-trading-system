@@ -23,7 +23,7 @@
                 "BTCUSD-XRPUSD",
                 "ETHUSD-XRPUSD"
             ],
-            "log_level": "INFO",
+            "log_level": "WARNING",
             "realtime_trading": false
         },
         "portfolio_summary": {

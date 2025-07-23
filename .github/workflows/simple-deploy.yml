@@ -99,7 +99,7 @@ jobs:
           # Production Environment Configuration
           ENVIRONMENT=production
           TRADING_MODE=live
-          LOG_LEVEL=INFO
+          LOG_LEVEL=WARNING
 
           # Port Configuration
           DASHBOARD_PORT=8050
