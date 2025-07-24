@@ -303,11 +303,207 @@ class PortfolioCalculator:
                 pnl_dollar = (close_value1 - entry_value1) + (entry_value2 - close_value2)
             else:
                 pnl_dollar = (entry_value1 - close_value1) + (close_value2 - entry_value2)
-            
+            # Log validation info for P&L calculation
+            # logger.info(f"P&L calculation for {symbol1}-{symbol2}: "
+            #        f"Direction={direction}, "
+            #        f"Entry: {entry_price1:.5f}/{entry_price2:.5f}, "
+            #        f"Close: {close_price1:.5f}/{close_price2:.5f}, "
+            #        f"Volumes: {volume1}/{volume2}, "
+            #        f"P&L: ${pnl_dollar:.2f}")            
             return pnl_dollar
-            
+
         except Exception as e:
             logger.error(f"Error calculating position P&L: {e}")
+            return 0.0
+    
+    def calculate_position_net_pnl(self, position: Dict[str, Any], 
+                                  price_provider: PriceProvider,
+                                  symbol_info_cache: Dict[str, Dict]) -> Tuple[float, float]:
+        """
+        Calculate the net P&L for a given position accounting for cTrader commission fees
+        
+        This method calculates both gross P&L and net P&L after deducting commissions
+        for both opening and closing the position legs.
+        
+        Args:
+            position: Position information dictionary
+            price_provider: Provider for current market prices
+            symbol_info_cache: Cache of symbol information including commission details
+            
+        Returns:
+            Tuple[float, float]: (gross_pnl, net_pnl) in account currency
+        """
+        try:
+            # First calculate gross P&L using existing method
+            gross_pnl = self.calculate_position_pnl(position, price_provider, symbol_info_cache)
+            
+            symbol1, symbol2 = position['symbol1'], position['symbol2']
+            
+            # Validate position volumes
+            volume1 = position.get('volume1')
+            volume2 = position.get('volume2')
+            if volume1 is None or volume1 <= 0 or volume2 is None or volume2 <= 0:
+                logger.error(f"Invalid volumes for position {symbol1}-{symbol2}: {volume1}, {volume2}")
+                return gross_pnl
+            
+            # Get symbol information for commission calculation
+            symbol1_info = symbol_info_cache.get(symbol1, {})
+            symbol2_info = symbol_info_cache.get(symbol2, {})
+            
+            if not symbol1_info or not symbol2_info:
+                logger.warning(f"Missing symbol info for commission calculation: {symbol1}, {symbol2}")
+                return gross_pnl
+            
+            # Calculate total commission for both legs (open + close)
+            total_commission = 0.0
+            
+            # Calculate commission for symbol1
+            commission1_open = self._calculate_trade_commission(
+                symbol1_info, volume1, position.get('entry_exec_price1') or position.get('entry_price1'))
+            commission1_close = self._calculate_trade_commission(
+                symbol1_info, volume1, self._get_current_close_price(symbol1, position, price_provider))
+            
+            # Calculate commission for symbol2
+            commission2_open = self._calculate_trade_commission(
+                symbol2_info, volume2, position.get('entry_exec_price2') or position.get('entry_price2'))
+            commission2_close = self._calculate_trade_commission(
+                symbol2_info, volume2, self._get_current_close_price(symbol2, position, price_provider))
+            
+            total_commission = commission1_open + commission1_close + commission2_open + commission2_close
+            
+            # Calculate net P&L
+            net_pnl = gross_pnl - total_commission
+            
+            # logger.info(f"P&L breakdown for {symbol1}-{symbol2}: "
+            #             f"Gross=${gross_pnl:.2f}, Commission=${total_commission:.2f}, Net=${net_pnl:.2f}")
+            # Log validation info for net P&L calculation
+            # logger.info(f"Net P&L calculation for {symbol1}-{symbol2}: "
+            #             f"Gross=${gross_pnl:.2f}, "
+            #             f"Commission breakdown: "
+            #             f"Open({commission1_open + commission2_open:.2f}) + "
+            #             f"Close({commission1_close + commission2_close:.2f}) = "
+            #             f"Total({total_commission:.2f}), "
+            #             f"Net=${net_pnl:.2f}")
+            return net_pnl
+
+        except Exception as e:
+            logger.error(f"Error calculating net position P&L: {e}")
+            return 0.0, 0.0
+    
+    def _calculate_trade_commission(self, symbol_info: Dict[str, Any], volume: float, price: float) -> float:
+        """
+        Calculate commission for a single trade leg based on cTrader symbol information
+        
+        Args:
+            symbol_info: Symbol information from cTrader including commission details
+            volume: Trade volume in lots
+            price: Trade price
+            
+        Returns:
+            Commission amount in account currency
+        """
+        try:
+            # Get commission configuration with detailed error handling
+            symbol_name = symbol_info.get('symbol_name', 'Unknown')
+            
+            commission_type = symbol_info.get('commissionType')
+            commission_rate = symbol_info.get('preciseTradingCommissionRate', 0)
+            min_commission = symbol_info.get('preciseMinCommission', 0)
+            lot_size = symbol_info.get('lot_size', 100000)  # Default to 100k for forex
+            
+            # Detailed logging for commission configuration debugging
+            # logger.info(f"Commission calculation for {symbol_name}:")
+            # logger.info(f"  Available fields: {list(symbol_info.keys())}")
+            # logger.info(f"  Commission type: {commission_type}")
+            # logger.info(f"  Commission rate: {commission_rate}")
+            # logger.info(f"  Min commission: {min_commission}")
+            # logger.info(f"  Lot size: {lot_size}")
+            
+            # Check for missing commission fields and handle gracefully
+            if commission_type is None:
+                logger.warning(f"Missing commissionType for {symbol_name} - commission calculation will return 0")
+                return 0.0
+            
+            commission_amount = 0.0
+            
+            # Calculate commission based on type according to cTrader documentation
+            if commission_type == 1:  # USD_PER_MILLION_USD
+                # Commission is USD per million USD volume
+                # preciseTradingCommissionRate is multiplied by 10^8 for non-percentage types
+                notional_value = volume * lot_size * price
+                commission_amount = (notional_value / 1_000_000) * (commission_rate / 100_000_000)
+                
+            elif commission_type == 2:  # USD_PER_LOT
+                # Commission is USD per 1 lot
+                # preciseTradingCommissionRate is multiplied by 10^8 for non-percentage types
+                commission_amount = volume * (commission_rate / 100_000_000)
+                
+            elif commission_type == 3:  # PERCENTAGE_OF_VALUE
+                # Commission is percentage of trading volume
+                # For percentage type, preciseTradingCommissionRate is multiplied by 10^5
+                notional_value = volume * lot_size * price
+                commission_percentage = commission_rate / 100_000  # Convert from 10^5 multiplied value
+                commission_amount = notional_value * (commission_percentage / 100)
+                
+            elif commission_type == 4:  # QUOTE_CCY_PER_LOT
+                # Commission is quote currency per 1 lot
+                # preciseTradingCommissionRate is multiplied by 10^8 for non-percentage types
+                commission_amount = volume * (commission_rate / 100_000_000)
+                # Note: This is in quote currency, may need conversion to account currency
+                
+            # Apply minimum commission if specified
+            if min_commission > 0:
+                min_commission_amount = min_commission / 100_000_000  # Convert from 10^8 multiplied value
+                commission_amount = max(commission_amount, min_commission_amount)
+            
+            # logger.info(f"Commission calculation result for {symbol_name}: "
+            #             f"type={commission_type}, rate={commission_rate}, "
+            #             f"volume={volume}, price={price}, commission=${commission_amount:.4f}")
+            
+            return commission_amount
+
+        except Exception as e:
+            symbol_name = symbol_info.get('symbol_name', 'Unknown')
+            logger.error(f"Error calculating trade commission for {symbol_name}: {e}")
+            return 0.0
+    
+    def _get_current_close_price(self, symbol: str, position: Dict[str, Any], 
+                                price_provider: PriceProvider) -> float:
+        """
+        Get the current close price for a symbol based on position direction
+        
+        Args:
+            symbol: Symbol name
+            position: Position information
+            price_provider: Price provider for current prices
+            
+        Returns:
+            Current close price for the symbol
+        """
+        try:
+            bid_ask_prices = price_provider.get_bid_ask_prices([symbol])
+            if symbol not in bid_ask_prices:
+                return 0.0
+            
+            bid, ask = bid_ask_prices[symbol]
+            
+            # Determine close price based on order type or direction
+            if 'order1_type' in position and 'order2_type' in position:
+                # Use explicit order types if available (MT5 style)
+                if symbol == position['symbol1']:
+                    return bid if position['order1_type'] == 'buy' else ask
+                else:  # symbol2
+                    return bid if position['order2_type'] == 'buy' else ask
+            else:
+                # Infer order types from position direction (CTrader style)
+                direction = position.get('direction', 'LONG')
+                if symbol == position['symbol1']:
+                    return bid if direction == 'LONG' else ask  # LONG: close buy at bid, SHORT: close sell at ask
+                else:  # symbol2
+                    return ask if direction == 'LONG' else bid  # LONG: close sell at ask, SHORT: close buy at bid
+                    
+        except Exception as e:
+            logger.error(f"Error getting close price for {symbol}: {e}")
             return 0.0
     
     def calculate_total_exposure(self, active_positions: Dict[str, Dict]) -> float:
@@ -658,3 +854,66 @@ class PortfolioManager:
                 margin_level=0,
                 positions=[]
             )
+    
+    def calculate_portfolio_net_pnl(self, active_positions: Dict[str, Dict],
+                                   price_provider: PriceProvider,
+                                   symbol_info_cache: Dict[str, Dict]) -> Dict[str, float]:
+        """
+        Calculate portfolio-wide P&L metrics including commission costs
+        
+        Args:
+            active_positions: Dict of pair_str -> position info
+            price_provider: Provider for current market prices
+            symbol_info_cache: Cache of symbol information including commission details
+            
+        Returns:
+            Dict with portfolio P&L metrics: {
+                'total_gross_pnl': float,
+                'total_net_pnl': float,
+                'total_commission': float,
+                'commission_percentage': float
+            }
+        """
+        try:
+            total_gross_pnl = 0.0
+            total_net_pnl = 0.0
+            position_details = []
+            
+            for pair_str, position in active_positions.items():
+                try:
+                    gross_pnl, net_pnl = self.portfolio_calculator.calculate_position_net_pnl(
+                        position, price_provider, symbol_info_cache)
+                    
+                    total_gross_pnl += gross_pnl
+                    total_net_pnl += net_pnl
+                    
+                    position_details.append({
+                        'pair': pair_str,
+                        'gross_pnl': gross_pnl,
+                        'net_pnl': net_pnl,
+                        'commission': gross_pnl - net_pnl
+                    })
+                    
+                except Exception as e:
+                    logger.error(f"Error calculating net P&L for position {pair_str}: {e}")
+            
+            total_commission = total_gross_pnl - total_net_pnl
+            commission_percentage = (total_commission / abs(total_gross_pnl) * 100) if total_gross_pnl != 0 else 0
+            
+            return {
+                'total_gross_pnl': total_gross_pnl,
+                'total_net_pnl': total_net_pnl,
+                'total_commission': total_commission,
+                'commission_percentage': commission_percentage,
+                'position_details': position_details
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calculating portfolio net P&L: {e}")
+            return {
+                'total_gross_pnl': 0.0,
+                'total_net_pnl': 0.0,
+                'total_commission': 0.0,
+                'commission_percentage': 0.0,
+                'position_details': []
+            }

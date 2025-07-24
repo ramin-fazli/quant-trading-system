@@ -2162,7 +2162,7 @@ class EnhancedTradingSystemV3:
             logger.info(f"💾 PREPARING TO SAVE STATE:")
             logger.info(f"   📊 Positions to save: {len(current_positions)}")
             logger.info(f"   📊 Pair states to save: {len(pair_states)}")
-            logger.info(f"   📊 Portfolio data keys: {list(portfolio_data.keys())}")
+            # logger.info(f"   📊 Portfolio data keys: {list(portfolio_data.keys())}")
             
             # Log sample of positions being saved
             if current_positions:

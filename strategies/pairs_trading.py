@@ -8,6 +8,7 @@ import warnings
 import logging
 from typing import Dict, Tuple, Any
 from strategies.base_strategy import PairsStrategyInterface
+from utils.portfolio_manager import PortfolioCalculator
 import datetime
 
 # Import TradingConfig - this needs to be a runtime import to avoid type checking issues
@@ -386,11 +387,10 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
             # Always check cost filter as it's critical for profitability
             suitable_conditions.append(cost_filter)
 
-            # --- Market session filter ---
-            if mode == 'realtime':
-                # logger.info(f"Checking market session for {price1.name} and {price2.name}")
-                session_filter = self._market_session_filter(price1.name, price2.name)
-                suitable_conditions.append(session_filter)
+            # --- Market session filter for MT5---
+            # if mode == 'realtime':
+            #     session_filter = self._market_session_filter(price1.name, price2.name)
+            #     suitable_conditions.append(session_filter)
 
             # Optional conditions based on enable flags and their respective parameters
             if self.config.enable_correlation and self.config.min_corr > 0:
@@ -483,7 +483,7 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
         elif hasattr(self.data_manager, 'symbol_details'):
             # Check if both symbols exist in cTrader
             if symbol1 not in self.data_manager.symbol_details or symbol2 not in self.data_manager.symbol_details:
-                logger.debug(f"One or both symbols {symbol1}, {symbol2} not available in cTrader - skipping cost validation")
+                logger.info(f"One or both symbols {symbol1}, {symbol2} not available in cTrader - skipping cost validation")
                 # For symbols not available in cTrader (like US stocks), skip cost validation 
                 # This allows the strategy to continue without cost filtering for unavailable symbols
                 return pd.Series(True, index=price1.index)
@@ -527,16 +527,55 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
             
             return False
         
-        # Calculate commission based on instrument type
-        if is_stock_or_etf(symbol1):
-            commission1_perc = (self.config.commission_fixed / price1) * 100
-        else:
-            commission1_perc = pd.Series(0.0, index=price1.index)  # No fixed commission for non-stocks
+        # Calculate commission using the new portfolio manager method with fallback
+        def calculate_commission_percentage(symbol_info, symbol, price_series):
+            """Calculate commission percentage for a symbol using portfolio manager or fallback"""
+            try:
+                # Try to use the new _calculate_trade_commission function
+                if hasattr(symbol_info, 'get') and all(key in symbol_info for key in ['commissionType', 'preciseTradingCommissionRate', 'preciseMinCommission']):
+                    # Create a temporary portfolio calculator to use the commission calculation
+                    temp_calculator = PortfolioCalculator(0, "USD")  # Initial value and currency don't matter for commission calc
+                    
+                    # Calculate commission for a sample trade (1 lot) and convert to percentage
+                    sample_volume = 1.0
+                    commission_results = []
+                    
+                    for price in price_series:
+                        if price > 0:
+                            commission_dollar = temp_calculator._calculate_trade_commission(symbol_info, sample_volume, price)
+                            # Convert to percentage of trade value
+                            lot_size = symbol_info.get('lot_size', 100000)  # Default for forex
+                            trade_value = sample_volume * price * lot_size
+                            if trade_value > 0:
+                                commission_perc = (commission_dollar / trade_value) * 100
+                                commission_results.append(commission_perc)
+                            else:
+                                commission_results.append(0.0)
+                        else:
+                            commission_results.append(0.0)
+                    
+                    if commission_results:
+                        logger.debug(f"Using portfolio manager commission calculation for {symbol}: "
+                                   f"avg={np.mean(commission_results):.4f}%")
+                        return pd.Series(commission_results, index=price_series.index)
+                    else:
+                        raise ValueError("No valid commission results calculated")
+                        
+                else:
+                    raise ValueError("Missing commission fields in symbol_info")
+                    
+            except Exception as e:
+                logger.debug(f"Portfolio manager commission calculation failed for {symbol}: {e}, using fallback")
+                
+                # Fallback to the original fixed commission method for stocks/ETFs
+                if is_stock_or_etf(symbol):
+                    return (self.config.commission_fixed / price_series) * 100
+                else:
+                    return pd.Series(0.0, index=price_series.index)  # No fixed commission for non-stocks
         
-        if is_stock_or_etf(symbol2):
-            commission2_perc = (self.config.commission_fixed / price2) * 100
-        else:
-            commission2_perc = pd.Series(0.0, index=price2.index)  # No fixed commission for non-stocks
+        # Calculate commission for both symbols
+        commission1_perc = calculate_commission_percentage(info1, symbol1, price1)
+        commission2_perc = calculate_commission_percentage(info2, symbol2, price2)
         
         # Total cost per trade (open + close) for both legs
         # Each leg: commission (open) + commission (close) + spread (paid once per round-trip)
@@ -556,11 +595,17 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
             symbol1_type = "Stock/ETF" if is_stock_or_etf(symbol1) else "Other"
             symbol2_type = "Stock/ETF" if is_stock_or_etf(symbol2) else "Other"
             
-            # logger.info(f"Cost filter for {symbol1}-{symbol2}: avg_cost={avg_cost:.4f}%, threshold={self.config.max_commission_perc:.4f}%, "
-            #            f"acceptable={cost_acceptable.mean()*100:.1f}% of time")
-            # logger.info(f"  {symbol1} ({symbol1_type}): commission={commission1_perc.mean():.4f}%, spread={spread1_perc.mean():.4f}%")
-            # logger.info(f"  {symbol2} ({symbol2_type}): commission={commission2_perc.mean():.4f}%, spread={spread2_perc.mean():.4f}%")
-        
+            # Determine commission calculation method used
+            commission1_method = "Portfolio Manager" if (hasattr(info1, 'get') and 
+                                                       all(key in info1 for key in ['commissionType', 'preciseTradingCommissionRate', 'preciseMinCommission'])) else "Fixed Fallback"
+            commission2_method = "Portfolio Manager" if (hasattr(info2, 'get') and 
+                                                       all(key in info2 for key in ['commissionType', 'preciseTradingCommissionRate', 'preciseMinCommission'])) else "Fixed Fallback"
+            
+            logger.info(f"Cost filter for {symbol1}-{symbol2}: avg_cost={avg_cost:.4f}%, threshold={self.config.max_commission_perc:.4f}%, "
+                       f"acceptable={cost_acceptable.mean()*100:.1f}% of time")
+            logger.info(f"  Cost for {symbol1}: commission={commission1_perc.mean():.4f}%, spread={spread1_perc.mean():.4f}%")
+            logger.info(f"  Cost for {symbol2}: commission={commission2_perc.mean():.4f}%, spread={spread2_perc.mean():.4f}%")
+
         return cost_acceptable
 
     def _rolling_adf_vectorized(self, series: pd.Series, window: int) -> np.ndarray:
@@ -639,13 +684,13 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
         
         # Check session filter for exit signals in real-time mode
         mode = os.getenv('TRADING_MODE', 'backtest').lower()
-        if mode == 'realtime' and symbol1 and symbol2:
-            session_active = self._market_session_filter(symbol1, symbol2)
-        else:
+        if mode == 'backtest' and symbol1 and symbol2:
             session_active = True  # Always allow exits in backtest mode
+        else:
+            session_active = True
+            # session_active = self._market_session_filter(symbol1, symbol2)      # for MT5 only: check if both symbols are in an open and tradable market session      
         
         # SIMPLIFIED signal generation - trigger when Z-score exceeds threshold
-        # Remove the transition requirement for more aggressive entries
         signals['long_entry'] = (
             (zscore < -dynamic_entry) & 
             suitable
@@ -713,6 +758,7 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
             return True
 
         def has_recent_tick(symbol):
+            """ For MT5: Check if the last tick for the symbol is recent (within 10 minutes)"""
             try:
                 last_tick = mt5.symbol_info_tick(symbol)
                 if last_tick is None:

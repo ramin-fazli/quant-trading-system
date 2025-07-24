@@ -305,7 +305,7 @@ class CTraderRealTimeTrader(BaseBroker):
         }
         
         # Add optional fields only if they exist and are valid
-        optional_fields = ['enable_short_selling', 'min_volume', 'max_volume', 'volume_step', 'lot_size', 'base_currency', 'quote_currency', 'spread', 'point']
+        optional_fields = ['enable_short_selling', 'min_volume', 'max_volume', 'volume_step', 'lot_size', 'base_currency', 'quote_currency', 'spread', 'point', 'commissionType', 'preciseTradingCommissionRate', 'preciseMinCommission']
         for field in optional_fields:
             value = symbol_detail.get(field)
             if value is not None:
@@ -324,6 +324,16 @@ class CTraderRealTimeTrader(BaseBroker):
                         result[field] = value
                     else:
                         logger.warning(f"Invalid {field} value for {symbol}: {value}")
+                elif field in ['commissionType', 'preciseTradingCommissionRate', 'preciseMinCommission']:
+                    # Commission fields should be integers (as per cTrader API specification)
+                    if isinstance(value, int):
+                        result[field] = value
+                        logger.debug(f"Added commission field {field}={value} for {symbol}")
+                    else:
+                        logger.warning(f"Invalid {field} value for {symbol}: {value} (expected integer)")
+                else:
+                    # Handle any other fields that might be added in the future
+                    result[field] = value
         
         return result
     
@@ -377,6 +387,7 @@ class CTraderRealTimeTrader(BaseBroker):
         - Each symbol has trading sessions for each day of the week
         - Each session contains intervals with startSecond and endSecond
         - Times are specified in seconds from SUNDAY 00:00 in the symbol's timezone
+        - scheduleTimeZone field provides the timezone for proper conversion
         
         SPECIAL HANDLING: For US stocks (.US symbols), cTrader provides extended/CFD hours
         but we override with standard US market hours (9:30 AM - 4:00 PM EST).
@@ -405,26 +416,54 @@ class CTraderRealTimeTrader(BaseBroker):
         if symbol.endswith('.US'):
             return self._is_us_market_open(symbol)
         
-        # Get trading sessions from schedule for non-US symbols
+        # Get trading sessions and timezone information
         trading_sessions = symbol_detail.get('trading_sessions', [])
         if not trading_sessions:
             logger.debug(f"🔒 No trading sessions available for {symbol} - assuming market closed")
             return False
         
-        # Get current time in UTC
+        # Get timezone information from cTrader API (NEW IMPROVEMENT)
+        schedule_timezone = symbol_detail.get('schedule_timezone')
+        
+        # Get current time and convert to appropriate timezone
         from datetime import datetime, timezone, timedelta
+        import pytz
         
         now_utc = datetime.now(timezone.utc)
         
-        # CRITICAL FIX: cTrader trading session times are in UTC for US stocks
-        # The API documentation is misleading - for .US symbols, times are already in UTC
-        # Calculate seconds since Sunday 00:00 UTC
-        python_weekday = now_utc.weekday()  # 0=Monday, 6=Sunday
-        days_since_sunday = (python_weekday + 1) % 7  # Days since Sunday (0=Sunday)
-        sunday_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_sunday)
-        seconds_since_sunday = int((now_utc - sunday_start).total_seconds())
-        
-        logger.debug(f"Market status check for {symbol}: UTC={now_utc}, seconds_since_sunday={seconds_since_sunday}")
+        # If we have timezone information from cTrader API, use it for proper conversion
+        if schedule_timezone:
+            try:
+                # Convert current UTC time to the symbol's trading timezone
+                symbol_tz = pytz.timezone(schedule_timezone)
+                now_local = now_utc.astimezone(symbol_tz)
+                
+                # Calculate seconds since Sunday 00:00 in the symbol's timezone
+                python_weekday = now_local.weekday()  # 0=Monday, 6=Sunday
+                days_since_sunday = (python_weekday + 1) % 7  # Days since Sunday (0=Sunday)
+                sunday_start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_sunday)
+                seconds_since_sunday = int((now_local - sunday_start_local).total_seconds())
+                
+                logger.debug(f"Market status check for {symbol}: {schedule_timezone} time={now_local}, seconds_since_sunday={seconds_since_sunday}")
+                
+            except Exception as e:
+                logger.warning(f"Failed to use timezone {schedule_timezone} for {symbol}: {e}. Falling back to UTC.")
+                # Fall back to UTC calculation
+                python_weekday = now_utc.weekday()  # 0=Monday, 6=Sunday
+                days_since_sunday = (python_weekday + 1) % 7  # Days since Sunday (0=Sunday)
+                sunday_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_sunday)
+                seconds_since_sunday = int((now_utc - sunday_start).total_seconds())
+                
+                logger.debug(f"Market status check for {symbol}: UTC={now_utc}, seconds_since_sunday={seconds_since_sunday}")
+        else:
+            # Fall back to UTC calculation if no timezone info available
+            logger.debug(f"No scheduleTimeZone for {symbol}, using UTC for trading session calculation")
+            python_weekday = now_utc.weekday()  # 0=Monday, 6=Sunday
+            days_since_sunday = (python_weekday + 1) % 7  # Days since Sunday (0=Sunday)
+            sunday_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_sunday)
+            seconds_since_sunday = int((now_utc - sunday_start).total_seconds())
+            
+            logger.debug(f"Market status check for {symbol}: UTC={now_utc}, seconds_since_sunday={seconds_since_sunday}")
         
         # Calculate current day of week for cTrader (1=Sunday, 2=Monday, ..., 7=Saturday)
         current_day_of_week = (seconds_since_sunday // 86400) + 1  # +1 because Sunday=1 in cTrader
@@ -451,15 +490,17 @@ class CTraderRealTimeTrader(BaseBroker):
                     end_time_str = f"{(end_second%86400)//3600:02d}:{((end_second%86400)%3600)//60:02d}"
                     current_time_str = f"{current_time_of_day//3600:02d}:{(current_time_of_day%3600)//60:02d}"
                     
-                    logger.debug(f"  Checking day {day_of_week} interval: {start_time_str}-{end_time_str} UTC, current: {current_time_str}")
+                    timezone_info = f" {schedule_timezone}" if schedule_timezone else " (timezone unknown)"
+                    logger.debug(f"  Checking day {day_of_week} interval: {start_time_str}-{end_time_str}{timezone_info}, current: {current_time_str}")
                     
                     # Check if current time of day is within this interval
                     if start_second <= current_time_of_day < end_second:
-                        logger.debug(f"✅ Market open for {symbol} - in trading session ({start_time_str}-{end_time_str} UTC)")
+                        logger.debug(f"✅ Market open for {symbol} - in trading session ({start_time_str}-{end_time_str}{timezone_info})")
                         return True
         
         logger.debug(f"🔒 Market closed for {symbol} - outside all trading sessions")
-        logger.debug(f"   Current time: {now_utc} UTC ({seconds_since_sunday}s since Sunday)")
+        timezone_info = f" in {schedule_timezone}" if schedule_timezone else " (timezone unknown)"
+        logger.debug(f"   Current time: {now_utc} UTC ({seconds_since_sunday}s since Sunday{timezone_info})")
         return False
     
     def _is_us_market_open(self, symbol: str) -> bool:
@@ -1541,7 +1582,7 @@ class CTraderRealTimeTrader(BaseBroker):
                     'quote_currency': 'quoteCurrency',
                     'max_exposure': 'maxExposure',
                     'commission': 'commission',
-                    'commission_type': 'commissionType',
+                    'commissionType': 'commissionType',  # Keep API field name for portfolio manager compatibility
                     'sl_distance': 'slDistance',
                     'tp_distance': 'tpDistance',
                     'gsl_distance': 'gslDistance',
@@ -1556,8 +1597,8 @@ class CTraderRealTimeTrader(BaseBroker):
                     'trading_mode': 'tradingMode',
                     'enable_short_selling': 'enableShortSelling',
                     'guaranteed_stop_loss': 'guaranteedStopLoss',
-                    'precise_trading_commission_rate': 'preciseTradingCommissionRate',
-                    'precise_min_commission': 'preciseMinCommission',
+                    'preciseTradingCommissionRate': 'preciseTradingCommissionRate',  # Keep API field name for portfolio manager compatibility
+                    'preciseMinCommission': 'preciseMinCommission',  # Keep API field name for portfolio manager compatibility
                     'measurement_units': 'measurementUnits'
                 }
                 
@@ -1653,7 +1694,14 @@ class CTraderRealTimeTrader(BaseBroker):
                 
                 symbol_details['trading_sessions'] = trading_sessions
                 
-                # Also store timezone information if available
+                # Store timezone information if available (CRITICAL for proper market hours calculation)
+                if hasattr(symbol, 'scheduleTimeZone'):
+                    symbol_details['schedule_timezone'] = symbol.scheduleTimeZone
+                    logger.debug(f"Found scheduleTimeZone for {symbol_name}: {symbol.scheduleTimeZone}")
+                else:
+                    logger.debug(f"No scheduleTimeZone field for {symbol_name}")
+                
+                # Also store trading mode
                 if hasattr(symbol, 'tradingMode'):
                     symbol_details['trading_mode'] = symbol.tradingMode
                 
@@ -1677,12 +1725,18 @@ class CTraderRealTimeTrader(BaseBroker):
                 # Log market status information for debugging
                 trading_mode = symbol_details.get('trading_mode')
                 trading_sessions = symbol_details.get('trading_sessions', [])
+                schedule_timezone = symbol_details.get('schedule_timezone')
                 
                 if trading_mode is not None:
                     mode_desc = {0: "🟢 ENABLED", 1: "🔴 DISABLED", 2: "🟡 CLOSE_ONLY"}.get(trading_mode, f"❓ UNKNOWN({trading_mode})")
                     logger.info(f"   tradingMode={trading_mode} ({mode_desc})")
                 else:
                     logger.warning(f"   tradingMode=N/A (⚠️ Trading mode unknown)")
+                
+                if schedule_timezone:
+                    logger.info(f"   scheduleTimeZone={schedule_timezone} (🌍 Timezone available)")
+                else:
+                    logger.warning(f"   scheduleTimeZone=N/A (⚠️ No timezone info - using UTC)")
                 
                 if trading_sessions:
                     logger.info(f"   tradingSessions={len(trading_sessions)} days configured")
@@ -1704,7 +1758,10 @@ class CTraderRealTimeTrader(BaseBroker):
                           f"digits={symbol_details.get('digits')}, "
                           f"min_volume={symbol_details.get('min_volume')}, "
                           f"max_volume={symbol_details.get('max_volume')}, "
-                          f"lot_size={symbol_details.get('lot_size')}")
+                          f"lot_size={symbol_details.get('lot_size')}, "
+                          f"commissionType={symbol_details.get('commissionType')}, "
+                          f"commissionRate=${(symbol_details.get('preciseTradingCommissionRate', 0)/100_000_000):.2f}/lot, "
+                          f"minCommission=${(symbol_details.get('preciseMinCommission', 0)/100_000_000):.4f}")
             
             logger.info(f"✅ Successfully processed detailed information for {symbols_processed}/{len(required_symbols)} required symbols")
             
@@ -1740,6 +1797,17 @@ class CTraderRealTimeTrader(BaseBroker):
                 logger.warning(f"⚠️ Missing detailed info for {missing_count} required symbols")
             else:
                 logger.info("🎯 All required symbols have detailed information")
+            
+            # Share the broker's symbol_details with the data manager so the strategy can access it
+            if hasattr(self, 'data_manager') and self.data_manager:
+                if hasattr(self.data_manager, 'symbol_details'):
+                    # Update the data manager's symbol_details with the broker's populated data
+                    self.data_manager.symbol_details.update(self.symbol_details)
+                    logger.info(f"✅ Shared {len(self.symbol_details)} symbol details with data manager for strategy access")
+                else:
+                    logger.warning("Data manager does not have symbol_details attribute - strategy cost filter may not work")
+            else:
+                logger.warning("No data manager available to share symbol details with")
             
             # Now we can safely proceed with initialization since we have detailed symbol info
             if not hasattr(self, '_pair_states_initialized'):
@@ -1798,6 +1866,12 @@ class CTraderRealTimeTrader(BaseBroker):
             
             updated_count += 1
             logger.debug(f"Updated spread for {symbol}: {spread_points:.1f} points (bid={bid:.5f}, ask={ask:.5f})")
+        
+        # Share updated spread information with data manager
+        if updated_count > 0 and hasattr(self, 'data_manager') and self.data_manager:
+            if hasattr(self.data_manager, 'symbol_details'):
+                self.data_manager.symbol_details.update(self.symbol_details)
+                logger.debug(f"Shared updated spread info for {updated_count} symbols with data manager")
         
         return updated_count
     
@@ -5374,18 +5448,11 @@ class CTraderRealTimeTrader(BaseBroker):
             
             # Calculate current P&L using portfolio manager
             try:
-                pnl = self.portfolio_manager.portfolio_calculator.calculate_position_pnl(
+                pnl = self.portfolio_manager.portfolio_calculator.calculate_position_net_pnl(
                     position, self, self.get_symbol_info_cache()
                 )
             except Exception as e:
                 logger.debug(f"Error calculating P&L for {pair_str} using portfolio manager: {e}")
-                # Fallback to basic calculation
-                if direction == 'LONG':
-                    pnl = (current_price1 - position['entry_price1']) * position['volume1'] - \
-                          (current_price2 - position['entry_price2']) * position['volume2']
-                else:
-                    pnl = (position['entry_price1'] - current_price1) * position['volume1'] - \
-                          (position['entry_price2'] - current_price2) * position['volume2']
             
             # Calculate position value for percentage calculation
             position_value = abs(position['volume1'] * position['entry_price1']) + \
@@ -5393,6 +5460,7 @@ class CTraderRealTimeTrader(BaseBroker):
             
             if position_value > 0:
                 pnl_percentage = (pnl / position_value) * 100
+                # logger.info(f"Checking exit conditions for {pair_str}: P&L = {pnl:.2f} ({pnl_percentage:.2f}%)")
                 
                 # Check stop loss
                 if pnl_percentage <= -self.config.stop_loss_perc:
@@ -5483,18 +5551,11 @@ class CTraderRealTimeTrader(BaseBroker):
             
             # Use portfolio manager to calculate position P&L
             try:
-                pnl = self.portfolio_manager.portfolio_calculator.calculate_position_pnl(
+                pnl = self.portfolio_manager.portfolio_calculator.calculate_position_net_pnl(
                     position, self, self.get_symbol_info_cache()
                 )
             except Exception as e:
                 logger.debug(f"Error calculating P&L for {pair_str} using portfolio manager: {e}")
-                # Fallback to basic calculation
-                if position['direction'] == 'LONG':
-                    pnl = (current_price1 - position['entry_price1']) * position['volume1'] - \
-                          (current_price2 - position['entry_price2']) * position['volume2']
-                else:
-                    pnl = (position['entry_price1'] - current_price1) * position['volume1'] - \
-                          (position['entry_price2'] - current_price2) * position['volume2']
             
             unrealized_pnl += pnl
             total_exposure += abs(position['volume1'] * current_price1) + abs(position['volume2'] * current_price2)
@@ -5546,7 +5607,7 @@ class CTraderRealTimeTrader(BaseBroker):
         for pair_str, position in self.active_positions.items():
             # Use portfolio manager to calculate position P&L
             try:
-                pnl = self.portfolio_manager.portfolio_calculator.calculate_position_pnl(
+                pnl = self.portfolio_manager.portfolio_calculator.calculate_position_net_pnl(
                     position, self, self.get_symbol_info_cache()
                 )
             except Exception as e:
@@ -5554,19 +5615,6 @@ class CTraderRealTimeTrader(BaseBroker):
                 # Fallback to basic calculation
                 current_price1 = self._get_spot_price(position['symbol1'])
                 current_price2 = self._get_spot_price(position['symbol2'])
-                
-                # Fallback to entry prices if current prices not available
-                if current_price1 is None:
-                    current_price1 = position['entry_price1']
-                if current_price2 is None:
-                    current_price2 = position['entry_price2']
-                
-                if position['direction'] == 'LONG':
-                    pnl = (current_price1 - position['entry_price1']) * position['volume1'] - \
-                          (current_price2 - position['entry_price2']) * position['volume2']
-                else:
-                    pnl = (position['entry_price1'] - current_price1) * position['volume1'] - \
-                          (position['entry_price2'] - current_price2) * position['volume2']
             
             unrealized_pnl += pnl
         
