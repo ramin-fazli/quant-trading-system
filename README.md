@@ -10,6 +10,7 @@ A comprehensive quantitative trading system that integrates real-time data from 
 - **Advanced Backtesting**: Powered by vectorbt for comprehensive strategy testing
 - **Time-Series Database**: InfluxDB integration for efficient data storage and retrieval
 - **Real-Time Dashboard**: Interactive web interface with live updates
+- **Label-Based Position Tracking**: Isolate script trades from manual trades and other scripts
 
 ### Dashboard Features
 - **Live Market Data**: Real-time price feeds and market updates
@@ -94,6 +95,9 @@ MT5_SERVER=your_mt5_server
 DASHBOARD_HOST=localhost
 DASHBOARD_PORT=5000
 DASHBOARD_DEBUG=False
+
+# CTrader Label Settings (New Feature!)
+CTRADER_TRADING_LABEL=PairsTradingBot
 
 # Trading Mode
 TRADING_MODE=backtest

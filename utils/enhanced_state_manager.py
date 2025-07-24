@@ -310,7 +310,18 @@ class EnhancedTradingStateManager:
                 for version in position_history:
                     if version.operation != StateOperationType.DELETE:
                         state_id = version.state_id
-                        if state_id not in latest_positions or version.timestamp > latest_positions[state_id].timestamp:
+                        # Safe timestamp comparison
+                        try:
+                            if state_id not in latest_positions:
+                                latest_positions[state_id] = version
+                            else:
+                                current_ts = self._normalize_timestamp(latest_positions[state_id].timestamp)
+                                new_ts = self._normalize_timestamp(version.timestamp)
+                                if new_ts > current_ts:
+                                    latest_positions[state_id] = version
+                        except Exception as e:
+                            logger.warning(f"Timestamp comparison error for {state_id}: {e}")
+                            # Fallback: use the newer version if we can't compare
                             latest_positions[state_id] = version
                 
                 for state_id, version in latest_positions.items():
@@ -329,7 +340,18 @@ class EnhancedTradingStateManager:
                 for version in pair_history:
                     if version.operation != StateOperationType.DELETE:
                         state_id = version.state_id
-                        if state_id not in latest_pairs or version.timestamp > latest_pairs[state_id].timestamp:
+                        # Safe timestamp comparison
+                        try:
+                            if state_id not in latest_pairs:
+                                latest_pairs[state_id] = version
+                            else:
+                                current_ts = self._normalize_timestamp(latest_pairs[state_id].timestamp)
+                                new_ts = self._normalize_timestamp(version.timestamp)
+                                if new_ts > current_ts:
+                                    latest_pairs[state_id] = version
+                        except Exception as e:
+                            logger.warning(f"Timestamp comparison error for {state_id}: {e}")
+                            # Fallback: use the newer version if we can't compare
                             latest_pairs[state_id] = version
                 
                 for state_id, version in latest_pairs.items():
@@ -401,7 +423,18 @@ class EnhancedTradingStateManager:
                 for version in position_history:
                     if version.operation != StateOperationType.DELETE:
                         state_id = version.state_id
-                        if state_id not in active_positions or version.timestamp > active_positions[state_id].timestamp:
+                        # Safe timestamp comparison
+                        try:
+                            if state_id not in active_positions:
+                                active_positions[state_id] = version
+                            else:
+                                current_ts = self._normalize_timestamp(active_positions[state_id].timestamp)
+                                new_ts = self._normalize_timestamp(version.timestamp)
+                                if new_ts > current_ts:
+                                    active_positions[state_id] = version
+                        except Exception as e:
+                            logger.warning(f"Timestamp comparison error for {state_id}: {e}")
+                            # Fallback: use the newer version if we can't compare
                             active_positions[state_id] = version
                 
                 # Count pair states
@@ -414,7 +447,19 @@ class EnhancedTradingStateManager:
                 for version in pair_history:
                     if version.operation != StateOperationType.DELETE:
                         state_id = version.state_id
-                        if state_id not in active_pairs or version.timestamp > active_pairs[state_id].timestamp:
+                        # Safe timestamp comparison
+                        try:
+                            if state_id not in active_pairs:
+                                active_pairs[state_id] = version
+                            else:
+                                current_ts = self._normalize_timestamp(active_pairs[state_id].timestamp)
+                                new_ts = self._normalize_timestamp(version.timestamp)
+                                if new_ts > current_ts:
+                                    active_pairs[state_id] = version
+                        except Exception as e:
+                            logger.warning(f"Timestamp comparison error for {state_id}: {e}")
+                            # Fallback: use the newer version if we can't compare
+                            active_pairs[state_id] = version
                             active_pairs[state_id] = version
                 
                 summary = {
@@ -594,6 +639,40 @@ class EnhancedTradingStateManager:
             self.cleanup()
         except:
             pass
+    
+    def _normalize_timestamp(self, timestamp):
+        """
+        Normalize timestamp to a comparable float value.
+        Handles both datetime objects and numeric timestamps.
+        """
+        if timestamp is None:
+            return 0.0
+            
+        try:
+            # If it's already a number, return it
+            if isinstance(timestamp, (int, float)):
+                return float(timestamp)
+            
+            # If it's a datetime object, convert to timestamp
+            if hasattr(timestamp, 'timestamp'):
+                return timestamp.timestamp()
+            
+            # If it's a string, try to parse it
+            if isinstance(timestamp, str):
+                from datetime import datetime
+                try:
+                    dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                    return dt.timestamp()
+                except:
+                    # Try parsing as a simple float string
+                    return float(timestamp)
+            
+            # Fallback: try to convert directly
+            return float(timestamp)
+            
+        except Exception as e:
+            logger.warning(f"Could not normalize timestamp {timestamp}: {e}")
+            return 0.0
 
 
 # Factory function for easy integration

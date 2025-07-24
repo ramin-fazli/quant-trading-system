@@ -76,7 +76,7 @@ try:
     
     if os.path.exists(env_path):
         load_dotenv(env_path)
-        print(f"✅ Loaded environment variables from: {env_path}")
+        # print(f"✅ Loaded environment variables from: {env_path}")
     else:
         print(f"⚠️  .env file not found at: {env_path}")
         
@@ -1432,6 +1432,120 @@ class EnhancedTradingSystemV3:
             logger.debug(f"State restoration error details: {traceback.format_exc()}")
             return False
     
+    def _transform_active_position_to_schema(self, position: Dict[str, Any], position_key: str) -> Optional[Dict[str, Any]]:
+        """Transform active position data to match PositionSchema requirements"""
+        try:
+            logger.debug(f"🔍 Transforming active position {position_key}: {position}")
+            
+            # Get the required fields from active position data
+            symbol1 = position.get('symbol1', '')
+            symbol2 = position.get('symbol2', '')
+            
+            # Handle case where symbol2 might be None (single symbol positions)
+            if symbol2 is None:
+                # For pair trading, we need to figure out the pair from the key
+                # Active positions are stored with pair keys like "BTCUSD-ETHUSD"
+                if '-' in position_key:
+                    # This is a proper pair key
+                    parts = position_key.split('-')
+                    symbol1 = parts[0]
+                    symbol2 = parts[1] if len(parts) > 1 else 'USD'
+                    logger.debug(f"📊 Extracted pair from key {position_key}: {symbol1}-{symbol2}")
+                else:
+                    # This is a single symbol, try to find its pair from configuration
+                    # For now, default to pairing with USD for crypto symbols
+                    symbol1 = position_key
+                    if symbol1.endswith('USD'):
+                        # This is already a USD pair, just use it
+                        symbol2 = 'USD'
+                    else:
+                        # Try to pair with USD
+                        symbol2 = 'USD'
+                        logger.debug(f"📊 Single symbol {symbol1} paired with {symbol2}")
+            
+            # Ensure we have valid symbols
+            if not symbol1 or not symbol2:
+                logger.warning(f"⚠️ Invalid symbols for position {position_key}: symbol1={symbol1}, symbol2={symbol2}")
+                return None
+            
+            # Get direction and normalize to lowercase
+            direction = position.get('direction', 'long')
+            if isinstance(direction, str):
+                direction = direction.lower()
+            
+            # Validate direction matches schema pattern
+            if direction not in ['long', 'short']:
+                logger.warning(f"⚠️ Invalid direction '{direction}' for position {position_key}, defaulting to 'long'")
+                direction = 'long'
+            
+            # Get quantities/volumes
+            volume1 = position.get('volume1', position.get('volume', 0))
+            volume2 = position.get('volume2', 0)
+            
+            # Ensure we have valid volumes
+            if volume1 <= 0:
+                volume1 = 0.01  # Minimum required by schema
+                logger.debug(f"📊 Set minimum volume1 for {position_key}: {volume1}")
+            
+            if volume2 <= 0:
+                volume2 = volume1  # Use same volume as volume1 for pairs
+                logger.debug(f"📊 Set volume2 equal to volume1 for {position_key}: {volume2}")
+            
+            # Get entry prices
+            entry_price1 = position.get('entry_price1', position.get('entry_price', 100.0))
+            entry_price2 = position.get('entry_price2', position.get('entry_price', 100.0))
+            
+            # Ensure valid entry prices
+            if entry_price1 <= 0:
+                entry_price1 = 100.0
+                logger.debug(f"📊 Set default entry_price1 for {position_key}: {entry_price1}")
+            
+            if entry_price2 <= 0:
+                entry_price2 = 100.0
+                logger.debug(f"📊 Set default entry_price2 for {position_key}: {entry_price2}")
+            
+            # Get entry time
+            entry_time = position.get('entry_time', datetime.now())
+            if isinstance(entry_time, str):
+                try:
+                    entry_time = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
+                except Exception:
+                    entry_time = datetime.now()
+            elif not isinstance(entry_time, datetime):
+                entry_time = datetime.now()
+            
+            # Create the transformed position matching PositionSchema
+            transformed = {
+                'symbol1': symbol1,
+                'symbol2': symbol2,
+                'direction': direction,  # lowercase as required by schema
+                'entry_time': entry_time,
+                'quantity': max(volume1, volume2),  # Use larger volume as main quantity
+                'entry_price': entry_price1,  # Use symbol1 price as main entry price
+                'stop_loss': position.get('stop_loss'),
+                'take_profit': position.get('take_profit'),
+                # Additional fields for broker compatibility
+                'pair': f"{symbol1}-{symbol2}",
+                'entry_price1': entry_price1,
+                'entry_price2': entry_price2,
+                'volume1': volume1,
+                'volume2': volume2,
+                'volume': max(volume1, volume2),
+                # Preserve original broker data
+                'position_id1': position.get('position_id1'),
+                'position_id2': position.get('position_id2'),
+                'order_ids': position.get('order_ids', []),
+                'label': position.get('label', 'PairsTradingBot')
+            }
+            
+            logger.debug(f"✅ Active position transformation successful: {symbol1}-{symbol2} {direction} qty:{transformed['quantity']}")
+            return transformed
+            
+        except Exception as e:
+            logger.error(f"Failed to transform active position {position_key}: {e}")
+            logger.debug(f"Transformation error details: {traceback.format_exc()}")
+            return None
+
     def _transform_position_for_schema(self, position: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Transform position data to match PositionSchema requirements"""
         try:
@@ -1947,12 +2061,49 @@ class EnhancedTradingSystemV3:
                 try:
                     portfolio = self.trader.get_portfolio_status()
                     
-                    # Try multiple sources to ensure we capture positions (use all sources, not elif)
+                    # PRIORITY 1: Use broker's direct active_positions (most reliable source)
                     positions_found = False
+                    if hasattr(self.trader, 'trader') and hasattr(self.trader.trader, 'active_positions'):
+                        active_positions = self.trader.trader.active_positions
+                        if active_positions:
+                            logger.debug(f"📊 Using broker's active_positions: {len(active_positions)} positions")
+                            # Transform active positions to meet PositionSchema requirements
+                            for key, position in active_positions.items():
+                                if isinstance(position, dict):
+                                    # Transform position to match schema format
+                                    transformed_position = self._transform_active_position_to_schema(position, key)
+                                    if transformed_position:
+                                        current_positions[key] = transformed_position
+                                        logger.debug(f"✅ Transformed active position {key}: direction={transformed_position.get('direction')}, pair={transformed_position.get('symbol1', 'N/A')}-{transformed_position.get('symbol2', 'N/A')}")
+                                    else:
+                                        logger.warning(f"⚠️ Failed to transform active position {key}")
+                            positions_found = True
+                            logger.info(f"✅ Using {len(current_positions)} positions from broker's active_positions (most reliable)")
                     
-                    # Source 1: Try enhanced_state (if available)
-                    if 'enhanced_state' in portfolio and 'position_details' in portfolio['enhanced_state']:
+                    # PRIORITY 2: Only use portfolio positions if we don't have active_positions
+                    if not positions_found and 'positions' in portfolio and portfolio['positions']:
+                        positions_list = portfolio['positions']
+                        logger.debug(f"📊 Fallback to broker's portfolio positions: {len(positions_list)} positions")
+                        # Convert positions list to dictionary, transforming to PositionSchema format
+                        for i, position in enumerate(positions_list):
+                            if isinstance(position, dict):
+                                # Transform broker position data to match PositionSchema requirements
+                                transformed_position = self._transform_position_for_schema(position)
+                                if transformed_position:
+                                    position_key = position.get('pair', f'position_{i}')
+                                    current_positions[position_key] = transformed_position
+                                    logger.debug(f"✅ Transformed portfolio position {position_key}: {transformed_position}")
+                                else:
+                                    logger.warning(f"⚠️ Failed to transform position {i}: {position}")
+                            else:
+                                current_positions[f'position_{i}'] = position
+                        positions_found = True
+                        logger.info(f"✅ Using {len(current_positions)} positions from portfolio fallback")
+                    
+                    # PRIORITY 3: Only use enhanced_state if we have no other sources (lowest priority)
+                    if not positions_found and 'enhanced_state' in portfolio and 'position_details' in portfolio['enhanced_state']:
                         position_details = portfolio['enhanced_state']['position_details']
+                        logger.debug(f"📊 Last resort: enhanced_state positions")
                         # Convert list of positions to dictionary format expected by state manager
                         if isinstance(position_details, list) and position_details:
                             for i, position in enumerate(position_details):
@@ -1969,7 +2120,6 @@ class EnhancedTradingSystemV3:
                                 else:
                                     current_positions[f'position_{i}'] = position
                             logger.debug(f"✅ Found {len(current_positions)} positions from enhanced_state")
-                            positions_found = True
                         elif isinstance(position_details, dict) and position_details:
                             # Transform each position in the dict
                             for key, position in position_details.items():
@@ -1982,50 +2132,11 @@ class EnhancedTradingSystemV3:
                                 else:
                                     current_positions[key] = position
                             logger.debug(f"✅ Found {len(position_details)} positions from enhanced_state dict")
-                            positions_found = True
+                        logger.info(f"✅ Using {len(current_positions)} positions from enhanced_state (last resort)")
                     
-                    # Source 2: Try broker's direct positions (always try this - it's the most reliable)
-                    if 'positions' in portfolio and portfolio['positions']:
-                        positions_list = portfolio['positions']
-                        logger.debug(f"📊 Checking broker's direct positions: {len(positions_list)} positions")
-                        # Convert positions list to dictionary, transforming to PositionSchema format
-                        for i, position in enumerate(positions_list):
-                            if isinstance(position, dict):
-                                # Transform broker position data to match PositionSchema requirements
-                                transformed_position = self._transform_position_for_schema(position)
-                                if transformed_position:
-                                    position_key = position.get('pair', f'position_{i}')
-                                    current_positions[position_key] = transformed_position
-                                    logger.debug(f"✅ Transformed position {position_key}: {transformed_position}")
-                                else:
-                                    logger.warning(f"⚠️ Failed to transform position {i}: {position}")
-                            else:
-                                current_positions[f'position_{i}'] = position
-                        logger.debug(f"✅ Found {len(positions_list)} positions from broker's direct positions")
-                        positions_found = True
-                    
-                    # Source 3: Try active_positions directly from the broker (fallback)
-                    if hasattr(self.trader, 'trader') and hasattr(self.trader.trader, 'active_positions'):
-                        active_positions = self.trader.trader.active_positions
-                        if active_positions:
-                            logger.debug(f"📊 Checking broker's active_positions: {len(active_positions)} positions")
-                            # Add or update with active positions, transforming each one
-                            for key, position in active_positions.items():
-                                if isinstance(position, dict):
-                                    transformed_position = self._transform_position_for_schema(position)
-                                    if transformed_position:
-                                        current_positions[key] = transformed_position
-                                        logger.debug(f"✅ Transformed active position {key}: {transformed_position}")
-                                    else:
-                                        current_positions[key] = position  # Keep original if transformation fails
-                                        logger.warning(f"⚠️ Failed to transform active position {key}, keeping original")
-                                else:
-                                    current_positions[key] = position
-                            logger.debug(f"✅ Added {len(active_positions)} positions from broker's active_positions")
-                            positions_found = True
-                    
-                    # Final check and logging
-                    if positions_found:
+                    if not positions_found:
+                        logger.warning("⚠️ No positions found from any source")
+                    else:
                         logger.debug(f"✅ TOTAL POSITIONS CAPTURED: {len(current_positions)} positions")
                         for pair_name, pos_data in current_positions.items():
                             if isinstance(pos_data, dict):
@@ -2033,8 +2144,6 @@ class EnhancedTradingSystemV3:
                                 symbol1 = pos_data.get('symbol1', 'N/A')
                                 symbol2 = pos_data.get('symbol2', 'N/A') 
                                 logger.debug(f"   📈 {pair_name}: {direction} ({symbol1}-{symbol2})")
-                    else:
-                        logger.warning("⚠️ No positions found from any source!")
                     
                 except Exception as e:
                     logger.debug(f"Could not get current positions from trader: {e}")

@@ -600,11 +600,11 @@ class OptimizedPairsStrategy(PairsStrategyInterface):
                                                        all(key in info1 for key in ['commissionType', 'preciseTradingCommissionRate', 'preciseMinCommission'])) else "Fixed Fallback"
             commission2_method = "Portfolio Manager" if (hasattr(info2, 'get') and 
                                                        all(key in info2 for key in ['commissionType', 'preciseTradingCommissionRate', 'preciseMinCommission'])) else "Fixed Fallback"
-            
-            logger.info(f"Cost filter for {symbol1}-{symbol2}: avg_cost={avg_cost:.4f}%, threshold={self.config.max_commission_perc:.4f}%, "
-                       f"acceptable={cost_acceptable.mean()*100:.1f}% of time")
-            logger.info(f"  Cost for {symbol1}: commission={commission1_perc.mean():.4f}%, spread={spread1_perc.mean():.4f}%")
-            logger.info(f"  Cost for {symbol2}: commission={commission2_perc.mean():.4f}%, spread={spread2_perc.mean():.4f}%")
+            if not cost_acceptable.iloc[-1]:
+                logger.info(f"Cost filter for {symbol1}-{symbol2}: avg_cost={avg_cost:.4f}%, threshold={self.config.max_commission_perc:.4f}%, "
+                        f"acceptable={cost_acceptable.mean()*100:.1f}% of time")
+                logger.info(f"  Cost for {symbol1}: commission={commission1_perc.mean():.4f}%, spread={spread1_perc.mean():.4f}%")
+                logger.info(f"  Cost for {symbol2}: commission={commission2_perc.mean():.4f}%, spread={spread2_perc.mean():.4f}%")
 
         return cost_acceptable
 

@@ -615,7 +615,7 @@ class MT5RealTimeTrader(BaseBroker):
         # Calculate balanced volumes for equal monetary exposure using mid-prices
         volumes = self._calculate_balanced_volumes(s1, s2, mid_price1, mid_price2)
         if volumes is None:
-            logger.error(f"Cannot calculate balanced volumes for {pair_str}")
+            logger.warning(f"The {pair_str} signal rejected: Cannot calculate balanced volumes ")
             return False
         volume1, volume2, monetary_value1, monetary_value2 = volumes
         # Validate monetary values are within tolerance

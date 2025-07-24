@@ -328,7 +328,6 @@ class CTraderRealTimeTrader(BaseBroker):
                     # Commission fields should be integers (as per cTrader API specification)
                     if isinstance(value, int):
                         result[field] = value
-                        logger.debug(f"Added commission field {field}={value} for {symbol}")
                     else:
                         logger.warning(f"Invalid {field} value for {symbol}: {value} (expected integer)")
                 else:
@@ -407,8 +406,6 @@ class CTraderRealTimeTrader(BaseBroker):
         # First check if trading is enabled at all
         trading_mode = symbol_detail.get('trading_mode')
         if trading_mode is not None and trading_mode != 0:  # Not ENABLED
-            mode_desc = {0: "ENABLED", 1: "DISABLED", 2: "CLOSE_ONLY"}.get(trading_mode, f"UNKNOWN({trading_mode})")
-            logger.debug(f"🔒 Trading disabled for {symbol} - trading mode: {mode_desc}")
             return False
         
         # SPECIAL HANDLING FOR US STOCKS
@@ -419,7 +416,6 @@ class CTraderRealTimeTrader(BaseBroker):
         # Get trading sessions and timezone information
         trading_sessions = symbol_detail.get('trading_sessions', [])
         if not trading_sessions:
-            logger.debug(f"🔒 No trading sessions available for {symbol} - assuming market closed")
             return False
         
         # Get timezone information from cTrader API (NEW IMPROVEMENT)
@@ -444,8 +440,6 @@ class CTraderRealTimeTrader(BaseBroker):
                 sunday_start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_sunday)
                 seconds_since_sunday = int((now_local - sunday_start_local).total_seconds())
                 
-                logger.debug(f"Market status check for {symbol}: {schedule_timezone} time={now_local}, seconds_since_sunday={seconds_since_sunday}")
-                
             except Exception as e:
                 logger.warning(f"Failed to use timezone {schedule_timezone} for {symbol}: {e}. Falling back to UTC.")
                 # Fall back to UTC calculation
@@ -454,22 +448,16 @@ class CTraderRealTimeTrader(BaseBroker):
                 sunday_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_sunday)
                 seconds_since_sunday = int((now_utc - sunday_start).total_seconds())
                 
-                logger.debug(f"Market status check for {symbol}: UTC={now_utc}, seconds_since_sunday={seconds_since_sunday}")
         else:
             # Fall back to UTC calculation if no timezone info available
-            logger.debug(f"No scheduleTimeZone for {symbol}, using UTC for trading session calculation")
             python_weekday = now_utc.weekday()  # 0=Monday, 6=Sunday
             days_since_sunday = (python_weekday + 1) % 7  # Days since Sunday (0=Sunday)
             sunday_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_sunday)
             seconds_since_sunday = int((now_utc - sunday_start).total_seconds())
             
-            logger.debug(f"Market status check for {symbol}: UTC={now_utc}, seconds_since_sunday={seconds_since_sunday}")
-        
         # Calculate current day of week for cTrader (1=Sunday, 2=Monday, ..., 7=Saturday)
         current_day_of_week = (seconds_since_sunday // 86400) + 1  # +1 because Sunday=1 in cTrader
         current_time_of_day = seconds_since_sunday % 86400
-        
-        logger.debug(f"Current cTrader day: {current_day_of_week}, time_of_day: {current_time_of_day} ({current_time_of_day//3600:02d}:{(current_time_of_day%3600)//60:02d})")
         
         # Check if current time falls within any trading session
         # trading_sessions contains intervals organized by day_of_week
@@ -486,21 +474,10 @@ class CTraderRealTimeTrader(BaseBroker):
                 end_second = interval.get('end_second')
                 
                 if start_second is not None and end_second is not None:
-                    start_time_str = f"{(start_second%86400)//3600:02d}:{((start_second%86400)%3600)//60:02d}"
-                    end_time_str = f"{(end_second%86400)//3600:02d}:{((end_second%86400)%3600)//60:02d}"
-                    current_time_str = f"{current_time_of_day//3600:02d}:{(current_time_of_day%3600)//60:02d}"
-                    
-                    timezone_info = f" {schedule_timezone}" if schedule_timezone else " (timezone unknown)"
-                    logger.debug(f"  Checking day {day_of_week} interval: {start_time_str}-{end_time_str}{timezone_info}, current: {current_time_str}")
-                    
                     # Check if current time of day is within this interval
                     if start_second <= current_time_of_day < end_second:
-                        logger.debug(f"✅ Market open for {symbol} - in trading session ({start_time_str}-{end_time_str}{timezone_info})")
                         return True
         
-        logger.debug(f"🔒 Market closed for {symbol} - outside all trading sessions")
-        timezone_info = f" in {schedule_timezone}" if schedule_timezone else " (timezone unknown)"
-        logger.debug(f"   Current time: {now_utc} UTC ({seconds_since_sunday}s since Sunday{timezone_info})")
         return False
     
     def _is_us_market_open(self, symbol: str) -> bool:
@@ -525,7 +502,6 @@ class CTraderRealTimeTrader(BaseBroker):
         # Check if it's a weekday (Monday=0, Sunday=6)
         weekday = now_utc.weekday()
         if weekday >= 5:  # Saturday=5, Sunday=6
-            logger.debug(f"🔒 US market closed for {symbol} - weekend (weekday {weekday})")
             return False
         
         # Determine if we're in Eastern Daylight Time (DST) or Eastern Standard Time
@@ -562,12 +538,6 @@ class CTraderRealTimeTrader(BaseBroker):
         
         # Check if within trading hours
         is_open = market_open_utc <= current_hour_utc < market_close_utc
-        
-        logger.debug(f"US market check for {symbol}:")
-        logger.debug(f"  Current UTC: {now_utc.strftime('%H:%M:%S')} ({current_hour_utc:.2f})")
-        logger.debug(f"  Timezone: {timezone_name} (DST: {is_dst})")
-        logger.debug(f"  Market hours: {market_open_utc:.1f} - {market_close_utc:.1f} UTC")
-        logger.debug(f"  Status: {'✅ OPEN' if is_open else '🔒 CLOSED'}")
         
         return is_open
     
@@ -617,22 +587,14 @@ class CTraderRealTimeTrader(BaseBroker):
         
         tradeable_pairs = []
         filtered_count = 0
-        
-        logger.info(f"🔍 Filtering {len(pairs)} pairs for market status...")
-        
         for pair_str in pairs:
             if self._is_pair_tradeable(pair_str):
                 tradeable_pairs.append(pair_str)
             else:
                 filtered_count += 1
         
-        logger.info(f"✅ Market status filtering complete:")
-        logger.info(f"   Total pairs checked: {len(pairs)}")
-        logger.info(f"   Tradeable pairs: {len(tradeable_pairs)}")
-        logger.info(f"   Filtered out (closed markets): {filtered_count}")
-        
         if filtered_count > 0:
-            logger.info(f"📊 Market closure impact: {(filtered_count/len(pairs)*100):.1f}% of pairs filtered out")
+            logger.info(f"📊 Market filtering: {filtered_count}/{len(pairs)} pairs filtered (markets closed)")
         
         return tradeable_pairs
     
@@ -938,10 +900,8 @@ class CTraderRealTimeTrader(BaseBroker):
         
         # Check if markets are open for both symbols (prevents MARKET_CLOSED errors)
         if not self._is_pair_tradeable(pair_str):
-            logger.debug(f"🔒 Trading not ready for {pair_str} - market closed for one or both symbols")
             return False
             
-        logger.debug(f"✅ Trading ready for {pair_str} - all price feeds available and current")
         return True
     
     def _create_protobuf_request(self, request_type: str, **kwargs):
@@ -987,6 +947,12 @@ class CTraderRealTimeTrader(BaseBroker):
                     request.tradeSide = kwargs.get('trade_side')
                     request.clientOrderId = kwargs.get('client_order_id')
                     request.volume = kwargs.get('volume')
+                    
+                    # Add trading label to track our script's orders vs other scripts/manual trades
+                    trading_label = kwargs.get('label', self._get_trading_label())
+                    if trading_label:
+                        request.label = trading_label
+                    
                     return request
             elif request_type == 'UNSUBSCRIBE_SPOTS':
                 if globals().get('ProtoOAUnsubscribeSpotsReq'):
@@ -1012,6 +978,10 @@ class CTraderRealTimeTrader(BaseBroker):
             
         return None
     
+    def _get_trading_label(self) -> str:
+        """Get the configured trading label for this script"""
+        return getattr(self.config, 'ctrader_trading_label', 'PairsTradingBot')
+    
     def _get_trade_side_value(self, side_name: str):
         """Get trade side value with strict validation"""
         if not side_name or not isinstance(side_name, str):
@@ -1030,15 +1000,7 @@ class CTraderRealTimeTrader(BaseBroker):
     
     def initialize(self) -> bool:
         """Initialize cTrader real-time trading system"""
-        logger.info("Initializing Strategy-Agnostic CTrader trading system...")
-        
-        # Log environment configuration for debugging
-        logger.info("🔍 CTRADER CONFIGURATION:")
-        logger.info(f"   Account ID: {self.account_id}")
-        logger.info(f"   Client ID: {self.client_id[:8] + '...' if self.client_id else 'NOT SET'}")
-        logger.info(f"   Client Secret: {'SET' if self.client_secret else 'NOT SET'}")
-        logger.info(f"   Access Token: {'SET' if self.access_token else 'NOT SET'}")
-        logger.info(f"   Host Type: {os.getenv('CTRADER_HOST_TYPE', 'Live')}")
+        logger.info("Initializing CTrader trading system...")
         
         # Validate credentials
         if not all([self.client_id, self.client_secret, self.access_token]):
@@ -1066,14 +1028,10 @@ class CTraderRealTimeTrader(BaseBroker):
             host_type = os.getenv('CTRADER_HOST_TYPE', 'Live').lower()
             if host_type == 'demo':
                 host = EndPoints.PROTOBUF_DEMO_HOST
-                logger.info(f"🔧 Using DEMO server: {host}:{EndPoints.PROTOBUF_PORT}")
             else:
                 host = EndPoints.PROTOBUF_LIVE_HOST
-                logger.info(f"🔧 Using LIVE server: {host}:{EndPoints.PROTOBUF_PORT}")
             
             port = EndPoints.PROTOBUF_PORT
-            
-            logger.info(f"Connecting to cTrader API at {host}:{port}")
             
             self.client = Client(host, port, TcpProtocol)
             self.client.setConnectedCallback(self._on_connected)
@@ -1081,7 +1039,6 @@ class CTraderRealTimeTrader(BaseBroker):
             self.client.setMessageReceivedCallback(self._on_message_received)
             
             # Start the client - handle case where startService returns None
-            logger.info("Starting cTrader client service...")
             d = self.client.startService()
             if d is not None:
                 d.addErrback(self._on_error)
@@ -1349,22 +1306,15 @@ class CTraderRealTimeTrader(BaseBroker):
                 logger.info("Account authenticated with cTrader")
                 # Extract account details for verification
                 response = Protobuf.extract(message)
-                logger.info(f"🔍 ACCOUNT VERIFICATION:")
-                logger.info(f"   Account ID: {getattr(response, 'ctidTraderAccountId', 'Unknown')}")
-                logger.info(f"   Live Account: {getattr(response, 'liveAccount', 'Unknown')}")
-                logger.info(f"   Account Type: {'LIVE' if getattr(response, 'liveAccount', False) else 'DEMO'}")
-                
                 if not self.symbols_initialized:  # Only request once
                     self._get_symbols_list()
                     
             elif (message.payloadType == MESSAGE_TYPES.get('SYMBOLS_LIST_RES', 2115) or
                   message.payloadType == 2115):
-                logger.info("Received symbols list response")
                 self._process_symbols_list(message)
                 
             elif (message.payloadType == MESSAGE_TYPES.get('SYMBOL_BY_ID_RES', 2117) or
                   message.payloadType == 2117):
-                logger.info("Received symbol details response")
                 self._process_symbol_details(message)
                 
             elif (message.payloadType == MESSAGE_TYPES.get('TRENDBAR_RES', 2138) or
@@ -1380,10 +1330,8 @@ class CTraderRealTimeTrader(BaseBroker):
             elif (message.payloadType == MESSAGE_TYPES.get('EXECUTION_EVENT', 2126) or
                   message.payloadType == 2126):  # Direct check for correct EXECUTION_EVENT type
                 # Extract the execution event properly  
-                logger.info(f"🎯 RECEIVED EXECUTION EVENT - payload type: {message.payloadType}")
                 try:
                     event = Protobuf.extract(message)
-                    logger.info(f"🎯 Successfully extracted execution event: {type(event)}")
                     self._process_execution_event(event)
                 except Exception as e:
                     logger.error(f"🎯 Error extracting/processing execution event: {e}")
@@ -1552,7 +1500,6 @@ class CTraderRealTimeTrader(BaseBroker):
                 
                 # Verify this is a symbol we actually need
                 if symbol_name not in required_symbols:
-                    logger.debug(f"Skipping symbol {symbol_name} - not required by strategy")
                     continue
                 
                 # Extract detailed symbol information with proper error handling
@@ -1614,20 +1561,9 @@ class CTraderRealTimeTrader(BaseBroker):
                             
                             # Additional validation and correction for unrealistic values
                             if local_name == 'min_volume' and converted_value >= 1:
-                            #     # If min_volume > 10 lots after conversion, likely needs more division
-                            #     # Try dividing by 1000 instead (some brokers use micro-lots)
                                 converted_value = 0.01
-                                logger.info(f"Applied lot conversion for {symbol_name} {local_name}: {value} -> {converted_value}")
                             elif local_name == 'step_volume' and converted_value >= 1:
-                            #     # If step_volume > 1 lot after conversion, likely needs more division
                                 converted_value = 0.01
-                                logger.info(f"Applied lot conversion for {symbol_name} {local_name}: {value} -> {converted_value}")
-                            
-                            # # Ensure reasonable minimums
-                            # if local_name == 'min_volume' and converted_value < 0.001:
-                            #     converted_value = 0.01  # Default to 0.01 lots minimum
-                            # elif local_name == 'step_volume' and converted_value < 0.001:
-                            #     converted_value = 0.01  # Default to 0.01 lots step
                             
                             symbol_details[local_name] = converted_value
                             # logger.info(f"Converted {local_name} from {value} centilots to {converted_value} lots")
@@ -1642,7 +1578,6 @@ class CTraderRealTimeTrader(BaseBroker):
                 # According to cTrader API docs, trading sessions are in the 'schedule' field
                 trading_sessions = []
                 if hasattr(symbol, 'schedule') and symbol.schedule:
-                    logger.debug(f"Found {len(symbol.schedule)} schedule intervals for {symbol_name}")
                     for interval in symbol.schedule:
                         if hasattr(interval, 'startSecond') and hasattr(interval, 'endSecond'):
                             # Extract day of week from the interval (if available)
@@ -1688,99 +1623,24 @@ class CTraderRealTimeTrader(BaseBroker):
                                     }]
                                 })
                     
-                    logger.debug(f"Processed {len(trading_sessions)} trading sessions for {symbol_name}")
-                else:
-                    logger.debug(f"No schedule found for {symbol_name}")
-                
                 symbol_details['trading_sessions'] = trading_sessions
                 
                 # Store timezone information if available (CRITICAL for proper market hours calculation)
                 if hasattr(symbol, 'scheduleTimeZone'):
                     symbol_details['schedule_timezone'] = symbol.scheduleTimeZone
-                    logger.debug(f"Found scheduleTimeZone for {symbol_name}: {symbol.scheduleTimeZone}")
-                else:
-                    logger.debug(f"No scheduleTimeZone field for {symbol_name}")
                 
                 # Also store trading mode
                 if hasattr(symbol, 'tradingMode'):
                     symbol_details['trading_mode'] = symbol.tradingMode
                 
-                # Set reasonable defaults for missing volume constraints
-                # if local_name == 'min_volume':
-                #     symbol_details[local_name] = 0.01  # 0.01 lots minimum
-                # elif local_name == 'max_volume':
-                #     symbol_details[local_name] = 1000.0  # 1000 lots maximum  
-                # elif local_name == 'step_volume':
-                #     symbol_details[local_name] = 0.01  # 0.01 lots step
-                # elif local_name == 'lot_size':
-                #     symbol_details[local_name] = 100000.0  # Standard forex lot size
-                logger.info(f"📊 Raw symbol details for {symbol_name}:")
-                logger.info(f"   digits={symbol.digits if hasattr(symbol, 'digits') else 'N/A'}")
-                logger.info(f"   pipPosition={symbol.pipPosition if hasattr(symbol, 'pipPosition') else 'N/A'}")
-                logger.info(f"   minVolume={getattr(symbol, 'minVolume', 'N/A')} (raw)")
-                logger.info(f"   maxVolume={getattr(symbol, 'maxVolume', 'N/A')} (raw)")
-                logger.info(f"   stepVolume={getattr(symbol, 'stepVolume', 'N/A')} (raw)")
-                logger.info(f"   lotSize={getattr(symbol, 'lotSize', 'N/A')} (raw)")
-                
-                # Log market status information for debugging
-                trading_mode = symbol_details.get('trading_mode')
-                trading_sessions = symbol_details.get('trading_sessions', [])
-                schedule_timezone = symbol_details.get('schedule_timezone')
-                
-                if trading_mode is not None:
-                    mode_desc = {0: "🟢 ENABLED", 1: "🔴 DISABLED", 2: "🟡 CLOSE_ONLY"}.get(trading_mode, f"❓ UNKNOWN({trading_mode})")
-                    logger.info(f"   tradingMode={trading_mode} ({mode_desc})")
-                else:
-                    logger.warning(f"   tradingMode=N/A (⚠️ Trading mode unknown)")
-                
-                if schedule_timezone:
-                    logger.info(f"   scheduleTimeZone={schedule_timezone} (🌍 Timezone available)")
-                else:
-                    logger.warning(f"   scheduleTimeZone=N/A (⚠️ No timezone info - using UTC)")
-                
-                if trading_sessions:
-                    logger.info(f"   tradingSessions={len(trading_sessions)} days configured")
-                else:
-                    logger.warning(f"   tradingSessions=NONE (❌ No session data - cannot determine market hours)")
-                
-                logger.info(f"📊 Processed symbol details for {symbol_name}: {symbol_details}")
-                # Store the detailed symbol information FIRST
                 self.symbol_details[symbol_name] = symbol_details
                 symbols_processed += 1
-                
-                # NOW we can check market status since symbol details are stored
-                if trading_sessions:
-                    is_open = self._is_market_open(symbol_name)
-                    status_desc = "🟢 OPEN" if is_open else "🔴 CLOSED"
-                    logger.info(f"   currentStatus={status_desc}")
-                
-                logger.info(f"✅ Processed detailed info for {symbol_name}: "
-                          f"digits={symbol_details.get('digits')}, "
-                          f"min_volume={symbol_details.get('min_volume')}, "
-                          f"max_volume={symbol_details.get('max_volume')}, "
-                          f"lot_size={symbol_details.get('lot_size')}, "
-                          f"commissionType={symbol_details.get('commissionType')}, "
-                          f"commissionRate=${(symbol_details.get('preciseTradingCommissionRate', 0)/100_000_000):.2f}/lot, "
-                          f"minCommission=${(symbol_details.get('preciseMinCommission', 0)/100_000_000):.4f}")
-            
+
             logger.info(f"✅ Successfully processed detailed information for {symbols_processed}/{len(required_symbols)} required symbols")
             
-            # Log comprehensive market status summary
+            # Log summary market status 
             market_status = self.get_market_status_summary()
-            logger.info("="*60)
-            logger.info("📊 MARKET STATUS SUMMARY (Using Trading Sessions)")
-            logger.info("-"*60)
-            logger.info(f"Total symbols: {market_status['total_symbols']}")
-            logger.info(f"Markets open: {market_status['markets_open']} (🟢)")
-            logger.info(f"Markets closed: {market_status['markets_closed']} (🔴)")
-            logger.info(f"Trading disabled: {market_status['trading_disabled']} (⛔)")
-            logger.info(f"No session data: {market_status['no_session_data']} (❓)")
-            logger.info(f"Market open percentage: {market_status['market_open_percentage']:.1f}%")
-            
-            if market_status['closed_symbols']:
-                logger.info(f"Closed markets: {', '.join(market_status['closed_symbols'][:10])}")
-                if len(market_status['closed_symbols']) > 10:
-                    logger.info(f"  ... and {len(market_status['closed_symbols']) - 10} more")
+            logger.info(f"📊 Market Status: {market_status['markets_open']}/{market_status['total_symbols']} markets open ({market_status['market_open_percentage']:.1f}%)")
                     
             if market_status['disabled_symbols']:
                 logger.info(f"Disabled symbols: {', '.join(market_status['disabled_symbols'])}")
@@ -1795,19 +1655,12 @@ class CTraderRealTimeTrader(BaseBroker):
             if symbols_processed < len(required_symbols):
                 missing_count = len(required_symbols) - symbols_processed
                 logger.warning(f"⚠️ Missing detailed info for {missing_count} required symbols")
-            else:
-                logger.info("🎯 All required symbols have detailed information")
             
             # Share the broker's symbol_details with the data manager so the strategy can access it
             if hasattr(self, 'data_manager') and self.data_manager:
                 if hasattr(self.data_manager, 'symbol_details'):
                     # Update the data manager's symbol_details with the broker's populated data
                     self.data_manager.symbol_details.update(self.symbol_details)
-                    logger.info(f"✅ Shared {len(self.symbol_details)} symbol details with data manager for strategy access")
-                else:
-                    logger.warning("Data manager does not have symbol_details attribute - strategy cost filter may not work")
-            else:
-                logger.warning("No data manager available to share symbol details with")
             
             # Now we can safely proceed with initialization since we have detailed symbol info
             if not hasattr(self, '_pair_states_initialized'):
@@ -1937,7 +1790,6 @@ class CTraderRealTimeTrader(BaseBroker):
             self.trading_started = True
         
         # Start periodic market status monitoring (every 5 minutes)
-        logger.info("🔍 Starting periodic market status monitoring...")
         reactor.callLater(300, self._periodic_market_status_check)
     
     def _initialize_pair_states(self):
@@ -2534,13 +2386,8 @@ class CTraderRealTimeTrader(BaseBroker):
                 'health_score': 100.0
             }
         
-        logger.info("🔍 Starting enhanced subscription monitoring system")
-        logger.info(f"   Health check interval: {self._subscription_health_check_interval}s")
-        logger.info(f"   Max concurrent subscriptions: {self._max_concurrent_subscriptions}")
-        
         # Schedule first health check
         reactor.callLater(10.0, self._monitor_subscriptions)  # Start after 10 seconds
-        logger.info("🔍 Subscription monitoring started")
     
     def _monitor_subscriptions(self):
         """Enhanced subscription monitoring with health scoring and intelligent recovery"""
@@ -2593,37 +2440,21 @@ class CTraderRealTimeTrader(BaseBroker):
             
             # Calculate coverage percentage for logging
             coverage_percent = (active_feeds / len(required_symbols)) * 100 if required_symbols else 0
-            
-            # Log brief status every 60 seconds (every 2 cycles since we run every 30s)
-            if self._monitor_log_counter % 2 == 0:
-                logger.info(f"📊 Subscription Status: {active_feeds} active price feeds")
-                logger.info(f"📊 Total subscribed symbols: {subscribed_count}")
-                logger.info(f"� Price feed coverage: {coverage_percent:.1f}% ({active_feeds}/{len(required_symbols)})")
-                
-                if stale_feeds:
-                    logger.warning(f"⚠️ {len(stale_feeds)} stale feeds detected - some may need re-subscription")
-            
+
             # Log detailed status every 10 cycles (5 minutes with 30s interval)
             if self._monitor_log_counter % 10 == 0:
-                logger.info("=" * 60)
                 logger.info("📊 SUBSCRIPTION HEALTH REPORT")
-                logger.info("-" * 60)
-                logger.info(f"Required symbols      : {total_required}")
-                logger.info(f"Subscribed symbols    : {subscribed_count}")
-                logger.info(f"Active price feeds    : {active_feeds}")
-                logger.info(f"Healthy feeds         : {healthy_feeds}")
-                logger.info(f"Missing feeds         : {len(missing_feeds)}")
-                logger.info(f"Stale feeds           : {len(stale_feeds)}")
-                logger.info(f"Health score          : {health_score:.1f}%")
-                logger.info(f"Subscription efficiency: {self.subscription_stats['subscription_efficiency']:.1f}%")
+                logger.info(f"Active feeds: {active_feeds}/{total_required} ({health_score:.1f}%)")
+                if len(missing_feeds) > 0:
+                    logger.info(f"Missing feeds: {len(missing_feeds)}")
+                if len(stale_feeds) > 0:
+                    logger.info(f"Stale feeds: {len(stale_feeds)}")
                 
                 # Show rate limiter status
                 non_hist_queue_size = len(self._non_historical_rate_limiter['queue'])
                 hist_queue_size = len(self._historical_rate_limiter['queue'])
                 if non_hist_queue_size > 0 or hist_queue_size > 0:
                     logger.info(f"Rate limiter queues   : Non-hist={non_hist_queue_size}, Hist={hist_queue_size}")
-                
-                logger.info("=" * 60)
             
             # Handle missing feeds - retry with rate limiting
             if missing_feeds and health_score < 90:  # Only if health is below 90%
@@ -2642,7 +2473,7 @@ class CTraderRealTimeTrader(BaseBroker):
             
             # Handle stale feeds
             if stale_feeds and len(stale_feeds) > 5:  # Only if many stale feeds
-                logger.warning(f"⚠️ {len(stale_feeds)} stale feeds detected - some may need re-subscription")
+                # logger.warning(f"⚠️ {len(stale_feeds)} stale feeds detected - some may need re-subscription")
                 
                 # Re-subscribe to worst stale feeds
                 stale_retry_count = min(len(stale_feeds), 5)
@@ -2676,7 +2507,7 @@ class CTraderRealTimeTrader(BaseBroker):
     def _retry_missing_subscriptions(self, missing_symbols):
         """Retry subscriptions for symbols that should have feeds but don't"""
         
-        logger.info(f"🔄 Retrying subscriptions for {len(missing_symbols)} symbols")
+        # logger.info(f"🔄 Retrying subscriptions for {len(missing_symbols)} symbols")
         
         # Remove from subscribed set to allow retry
         for symbol in missing_symbols:
@@ -3124,8 +2955,8 @@ class CTraderRealTimeTrader(BaseBroker):
                     self._data_accumulation_log[pair_str] = 0
                 
                 self._data_accumulation_log[pair_str] += 1
-                if self._data_accumulation_log[pair_str] % 50 == 0:
-                    logger.info(f"📊 DATA ACCUMULATION: {pair_str} has {len(state['price1'])}/{min_data_points} points for {state['symbol1']}, {len(state['price2'])}/{min_data_points} for {state['symbol2']}")
+                # if self._data_accumulation_log[pair_str] % 50 == 0:
+                #     logger.info(f"📊 DATA ACCUMULATION: {pair_str} has {len(state['price1'])}/{min_data_points} points for {state['symbol1']}, {len(state['price2'])}/{min_data_points} for {state['symbol2']}")
                 return
             
             # Extract recent prices for strategy calculation
@@ -3180,44 +3011,10 @@ class CTraderRealTimeTrader(BaseBroker):
             
             # Use strategy to calculate indicators
             try:
-                if self._strategy_calc_log[pair_str] % 10 == 0:
-                    logger.info(f"🔍 STRATEGY CALCULATION: Computing indicators for {pair_str} (calc #{self._strategy_calc_log[pair_str]})")
-                    # logger.info(f"   Data points: {len(series1)} x {len(series2)}")
-                    logger.info(f"   Latest prices: {state['symbol1']}=${series1.iloc[-1]:.5f}, {state['symbol2']}=${series2.iloc[-1]:.5f}")
-                
                 indicators = self.strategy.calculate_indicators(market_data)
                 if not indicators:
-                    if self._strategy_calc_log[pair_str] % 10 == 0:
-                        logger.warning(f"❌ STRATEGY CALCULATION: No indicators returned for {pair_str}")
                     return
                     
-                # Log indicator values periodically with enhanced debugging
-                if self._strategy_calc_log[pair_str] % 10 == 0:
-                    logger.info(f"✅ STRATEGY CALCULATION: Indicators calculated for {pair_str}")
-                    # logger.info(f"   Available indicators: {list(indicators.keys())}")
-                    
-                    if 'zscore' in indicators:
-                        zscore_val = indicators['zscore'].iloc[-1] if hasattr(indicators['zscore'], 'iloc') else indicators['zscore']
-                        logger.info(f"   💡 Z-Score: {zscore_val:.6f}")
-                        logger.info(f"   💡 Z-Entry Threshold: ±{self.config.z_entry:.6f}")
-                        logger.info(f"   💡 Z-Exit Threshold: ±{self.config.z_exit:.6f}")
-                        if abs(zscore_val) > self.config.z_entry:
-                            logger.info(f"   🎯 Z-Score {zscore_val:.6f} EXCEEDS entry threshold {self.config.z_entry:.6f}!")
-                    else:
-                        logger.warning(f"   ❌ No Z-Score in indicators")
-                        
-                    if 'ratio' in indicators:
-                        ratio_val = indicators['ratio'].iloc[-1] if hasattr(indicators['ratio'], 'iloc') else indicators['ratio']
-                        logger.info(f"   💡 Price Ratio: {ratio_val:.6f}")
-                        
-                    if 'suitable' in indicators:
-                        suitable_val = indicators['suitable'].iloc[-1] if hasattr(indicators['suitable'], 'iloc') else indicators['suitable']
-                        logger.info(f"   💡 Suitable for Trading: {suitable_val}")
-                        
-                    if 'spread' in indicators:
-                        spread_val = indicators['spread'].iloc[-1] if hasattr(indicators['spread'], 'iloc') else indicators['spread']
-                        logger.info(f"   💡 Spread: {spread_val:.5f}")
-                        
             except Exception as e:
                 logger.error(f"Error calculating indicators with strategy for {pair_str}: {type(e).__name__}: {e}")
                 return
@@ -3246,7 +3043,7 @@ class CTraderRealTimeTrader(BaseBroker):
                     else:
                         signal_info.append("NOT_SUITABLE")
                     
-                    logger.info(f"🎯 SIGNAL GENERATED: {pair_str} -> {', '.join(signal_info) if signal_info else 'NO_SIGNAL'}")
+                    # logger.info(f"🎯 SIGNAL GENERATED: {pair_str} -> {', '.join(signal_info) if signal_info else 'NO_SIGNAL'}")
                     
             except Exception as e:
                 logger.error(f"Error generating signals with strategy: {e}")
@@ -3429,7 +3226,7 @@ class CTraderRealTimeTrader(BaseBroker):
         )
         
         if volumes is None:
-            logger.error(f"Cannot calculate balanced volumes for {pair_str}")
+            # logger.warning(f"The {pair_str} signal rejected: Cannot calculate balanced volumes ")
             return False
         
         volume1, volume2, monetary1, monetary2 = volumes
@@ -3454,9 +3251,10 @@ class CTraderRealTimeTrader(BaseBroker):
             side1 = self._get_trade_side_value("SELL")  # Sell first symbol
             side2 = self._get_trade_side_value("BUY")   # Buy second symbol
         
-        # Execute trades
-        order1 = self._send_market_order(s1, side1, volume1)
-        order2 = self._send_market_order(s2, side2, volume2)
+        # Execute trades with pair-encoded labels
+        pair_label = f"{self._get_trading_label()}:{pair_str}"
+        order1 = self._send_market_order(s1, side1, volume1, label=pair_label)
+        order2 = self._send_market_order(s2, side2, volume2, label=pair_label)
         
         # Only proceed if both orders were successfully sent
         if order1 and order2:
@@ -3503,7 +3301,18 @@ class CTraderRealTimeTrader(BaseBroker):
     def _close_pair_position(self, pair_str: str) -> bool:
         """Close a pair position using ProtoOAClosePositionReq when position IDs are available"""
         if pair_str not in self.active_positions:
+            logger.warning(f"Cannot close {pair_str} - pair not in active positions")
             return False
+        
+        # CRITICAL FIX: Prevent duplicate close attempts
+        if hasattr(self, '_closing_pairs') and pair_str in self._closing_pairs:
+            logger.warning(f"Already closing {pair_str} - skipping duplicate close request")
+            return False
+        
+        # Track that we're closing this pair
+        if not hasattr(self, '_closing_pairs'):
+            self._closing_pairs = set()
+        self._closing_pairs.add(pair_str)
         
         position = self.active_positions[pair_str]
         state = self.pair_states[pair_str]
@@ -3560,9 +3369,17 @@ class CTraderRealTimeTrader(BaseBroker):
             
             logger.info(f"Initiated close for {direction} position on {pair_str} ({success_count}/2 orders sent)")
             logger.info(f"Portfolio now: {len(self.active_positions)}/{self.config.max_open_positions}")
+            
+            # Remove from closing tracking after successful close initiation
+            if hasattr(self, '_closing_pairs') and pair_str in self._closing_pairs:
+                self._closing_pairs.discard(pair_str)
+                
             return True
         else:
             logger.error(f"Failed to send any close orders for {pair_str}")
+            # Remove from closing tracking on failure
+            if hasattr(self, '_closing_pairs') and pair_str in self._closing_pairs:
+                self._closing_pairs.discard(pair_str)
             return False
     
     def _close_position_by_id(self, symbol: str, position_id: int, volume: float) -> bool:
@@ -3574,10 +3391,10 @@ class CTraderRealTimeTrader(BaseBroker):
             return False
         
         # Convert volume to cTrader centilots format
-        if symbol == 'XRPUSD':
-            broker_volume = int(round(volume * 10000))
-        else:
-            broker_volume = int(round(volume * 100))
+        # if symbol == 'XRPUSD':
+        #     broker_volume = int(round(volume * 10000))
+        # else:
+        broker_volume = int(round(volume * 100))
         
         # Ensure minimum volume
         broker_volume = max(broker_volume, 1)
@@ -3746,7 +3563,7 @@ class CTraderRealTimeTrader(BaseBroker):
         logger.info("✅ ProtoOAClosePositionReq implementation validation complete")
         return True
     
-    def _send_market_order(self, symbol: str, side, volume: Optional[float] = None, is_close: bool = False) -> Optional[str]:
+    def _send_market_order(self, symbol: str, side, volume: Optional[float] = None, is_close: bool = False, label: Optional[str] = None) -> Optional[str]:
         """Send a market order to cTrader"""
         if symbol not in self.symbols_map:
             logger.error(f"Symbol {symbol} not found")
@@ -3757,9 +3574,9 @@ class CTraderRealTimeTrader(BaseBroker):
         self.next_order_id += 1
         
         # Log account and trading details for debugging
-        logger.info(f"🔍 TRADING DEBUG - Account ID: {self.account_id}")
-        logger.info(f"🔍 TRADING DEBUG - Symbol: {symbol} (ID: {symbol_id})")
-        logger.info(f"🔍 TRADING DEBUG - Client Order ID: {client_order_id}")
+        # logger.info(f"🔍 TRADING DEBUG - Account ID: {self.account_id}")
+        # logger.info(f"🔍 TRADING DEBUG - Symbol: {symbol} (ID: {symbol_id})")
+        # logger.info(f"🔍 TRADING DEBUG - Client Order ID: {client_order_id}")
         
         # Validate volume is provided and reasonable
         if volume is None:
@@ -3788,10 +3605,8 @@ class CTraderRealTimeTrader(BaseBroker):
         # Special case for XRPUSD which requires different volume conversion
         if symbol == 'XRPUSD':
             broker_volume = int(round(volume * 10000))
-            logger.info(f"Special volume conversion for {symbol}: {volume:.5f} lots -> {broker_volume} (x10000)")
         else:
             broker_volume = int(round(volume * 100))
-            logger.info(f"Volume conversion for {symbol}: {volume:.5f} lots -> {broker_volume} centilots")
         
         # Ensure minimum volume (at least 1 unit)
         broker_volume = max(broker_volume, 1)
@@ -3801,7 +3616,8 @@ class CTraderRealTimeTrader(BaseBroker):
                                symbol_id=symbol_id,
                                trade_side=side,
                                client_order_id=client_order_id,
-                               volume=broker_volume)
+                               volume=broker_volume,
+                               label=label)
         
         if request is None:
             logger.error(f"Failed to create market order request for {symbol}")
@@ -3810,13 +3626,12 @@ class CTraderRealTimeTrader(BaseBroker):
         if is_close:
             # Note: This is a fallback method for closing positions when position IDs are not available
             # The preferred method is to use _close_position_by_id() with ProtoOAClosePositionReq
-            logger.debug(f"Using market order to close position for {symbol} (fallback method - no position ID)")
+            pass
         
         # Convert side to readable string for logging
         buy_side_value = self._get_trade_side_value("BUY")
         side_name = "BUY" if side == buy_side_value else "SELL"
         action_type = "Closing" if is_close else "Opening"
-        logger.info(f"{action_type} {side_name} order for {symbol}: {volume:.5f} lots ({broker_volume} centilots)")
         
         try:
             deferred = self.client.send(request)
@@ -3830,11 +3645,6 @@ class CTraderRealTimeTrader(BaseBroker):
                 'timestamp': datetime.now(),
                 'is_close': is_close
             }
-            
-            logger.info(f"📨 ORDER SENT - ID: {client_order_id}, Symbol: {symbol}, Side: {side_name}, Volume: {volume:.5f}")
-            logger.info(f"📨 Awaiting execution confirmation from cTrader...")
-            logger.info(f"📨 Total pending orders: {len(self.execution_requests)}")
-            logger.info(f"📨 Pending order IDs: {list(self.execution_requests.keys())}")
             
             return client_order_id
             
@@ -3869,14 +3679,14 @@ class CTraderRealTimeTrader(BaseBroker):
             order_status = getattr(order, 'orderStatus', None)
         
         # Log all execution events for debugging
-        logger.info(f"🎯 EXECUTION EVENT RECEIVED:")
-        logger.info(f"   Execution Type: {execution_type}")
-        logger.info(f"   Client Order ID: {client_order_id}")
-        logger.info(f"   Order Status: {order_status} ({self._get_order_status_name(order_status) if order_status else 'None'})")
-        logger.info(f"   Has Order Object: {order is not None}")
-        logger.info(f"   Has Deal Object: {deal is not None}")
-        logger.info(f"   Has Position Object: {position is not None}")
-        logger.info(f"   Current pending orders: {list(self.execution_requests.keys())}")
+        # logger.info(f"🎯 EXECUTION EVENT RECEIVED:")
+        # logger.info(f"   Execution Type: {execution_type}")
+        # logger.info(f"   Client Order ID: {client_order_id}")
+        # logger.info(f"   Order Status: {order_status} ({self._get_order_status_name(order_status) if order_status else 'None'})")
+        # logger.info(f"   Has Order Object: {order is not None}")
+        # logger.info(f"   Has Deal Object: {deal is not None}")
+        # logger.info(f"   Has Position Object: {position is not None}")
+        # logger.info(f"   Current pending orders: {list(self.execution_requests.keys())}")
         
         # Handle cases where clientOrderId might be directly on event (fallback)
         if not client_order_id:
@@ -3895,16 +3705,16 @@ class CTraderRealTimeTrader(BaseBroker):
                     return
             
             # Log raw event structure for debugging if it's not a close position event
-            logger.info(f"🔍 Raw execution event attributes:")
-            for attr in dir(event):
-                if not attr.startswith('_'):
-                    try:
-                        value = getattr(event, attr)
-                        if not callable(value):
-                            logger.info(f"🔍   {attr}: {value}")
-                    except:
-                        pass
-            return
+            # logger.info(f"🔍 Raw execution event attributes:")
+            # for attr in dir(event):
+            #     if not attr.startswith('_'):
+            #         try:
+            #             value = getattr(event, attr)
+            #             if not callable(value):
+            #                 logger.info(f"🔍   {attr}: {value}")
+            #         except:
+            #             pass
+            # return
         
         if client_order_id in self.execution_requests:
             order_data = self.execution_requests[client_order_id]
@@ -4940,6 +4750,15 @@ class CTraderRealTimeTrader(BaseBroker):
             'active_pairs': [pair for pair in self.pair_states.keys() if pair not in self.suspended_pairs]
         }
     
+    def get_label_tracking_status(self) -> dict:
+        """Get status information about label-based position tracking"""
+        return {
+            'trading_label': self._get_trading_label(),
+            'label_filtering_enabled': True,
+            'description': 'Only positions with our trading label are tracked and managed',
+            'note': 'This isolates our script\'s trades from other trading scripts or manual trades on the same account'
+        }
+    
     def get_manual_trade_handling_status(self) -> dict:
         """Get comprehensive status of manual trade handling and position tracking"""
         try:
@@ -5620,6 +5439,29 @@ class CTraderRealTimeTrader(BaseBroker):
         
         return portfolio_value + unrealized_pnl
     
+    def get_total_pnl(self) -> float:
+        """Get total unrealized P&L across all positions"""
+        total_pnl = 0.0
+        
+        for pair_str, position in self.active_positions.items():
+            try:
+                pnl = self.portfolio_manager.portfolio_calculator.calculate_position_net_pnl(
+                    position, self, self.get_symbol_info_cache()
+                )
+                total_pnl += pnl
+            except Exception as e:
+                logger.debug(f"Error calculating P&L for {pair_str}: {e}")
+                # Fallback to 0 if calculation fails
+                continue
+        
+        return total_pnl
+    
+    def get_daily_pnl(self) -> float:
+        """Get daily P&L (placeholder - could be enhanced with historical data)"""
+        # For now, return current unrealized P&L as daily P&L
+        # This could be enhanced to track P&L from start of trading day
+        return self.get_total_pnl()
+    
     def _reconcile_positions(self):
         """Request position reconciliation from CTrader broker"""
         logger.info("="*60)
@@ -5678,16 +5520,18 @@ class CTraderRealTimeTrader(BaseBroker):
                 logger.info("📊 No pending orders found in broker")
             
             # Process and convert broker positions to our format
-            restored_positions = {}
+            individual_positions = []
             for pos in broker_positions:
                 try:
                     position_info = self._convert_broker_position_to_local(pos)
                     if position_info:
-                        pair_key = position_info['pair']
-                        restored_positions[pair_key] = position_info
-                        logger.info(f"📊 Restored position: {pair_key} | {position_info['direction']} | Entry: {position_info.get('entry_price', 'N/A')}")
+                        individual_positions.append(position_info)
+                        logger.info(f"📊 Processed individual position: {position_info['symbol']} | {position_info['direction_side']} | Pair: {position_info.get('pair_str', 'N/A')}")
                 except Exception as e:
                     logger.warning(f"Failed to convert broker position: {e}")
+            
+            # Group individual positions into pairs
+            restored_positions = self._reconstruct_pairs_from_positions(individual_positions)
             
             # ENHANCED: Compare broker positions with our local tracking to detect manual changes
             self._detect_manual_position_changes(broker_positions, restored_positions)
@@ -5721,19 +5565,45 @@ class CTraderRealTimeTrader(BaseBroker):
                             state_positions[pair_key] = {
                                 'symbol1': pos.get('symbol1', ''),
                                 'symbol2': pos.get('symbol2', ''),
-                                'direction': pos.get('direction', ''),
-                                'entry_price': pos.get('entry_price', 0),
+                                'direction': pos.get('direction', '').lower(),  # Convert to lowercase for schema validation
+                                'entry_price': pos.get('entry_price1', pos.get('entry_price', 0)),  # Use entry_price1 first, fallback to entry_price
                                 'quantity': pos.get('volume1', 0),  # Use first leg volume
                                 'entry_time': pos.get('entry_time', datetime.now().isoformat()),
                                 'pair': pair_key,
-                                'broker_position_id': pos.get('position_id', None)
+                                'broker_position_id': pos.get('position_id1', pos.get('position_id', None))  # Use position_id1 first
                             }
+                        
+                        # Calculate proper portfolio data for schema compliance
+                        try:
+                            total_value = self.get_portfolio_value()
+                            open_positions_count = len(self.active_positions)
+                            total_pnl = self.get_total_pnl()
+                            daily_pnl = self.get_daily_pnl()
+                            available_balance = total_value - abs(total_pnl) if total_pnl < 0 else total_value
+                        except Exception as e:
+                            logger.warning(f"Error calculating portfolio metrics: {e}, using defaults")
+                            # Safe defaults for portfolio schema compliance
+                            total_value = getattr(self.config, 'initial_portfolio_value', 100000.0)
+                            open_positions_count = len(self.active_positions)
+                            total_pnl = 0.0
+                            daily_pnl = 0.0
+                            available_balance = total_value
+                        
+                        portfolio_data = {
+                            'reconciliation_time': datetime.now().isoformat(),
+                            'total_value': total_value,
+                            'available_balance': available_balance,
+                            'total_pnl': total_pnl,
+                            'open_positions': open_positions_count,
+                            'daily_pnl': daily_pnl,
+                            'peak_value': total_value  # Use current value as peak for now
+                        }
                         
                         # Save reconciled positions to state manager
                         self.state_manager.save_trading_state(
                             active_positions=state_positions,
                             pair_states={},
-                            portfolio_data={'reconciliation_time': datetime.now().isoformat()}
+                            portfolio_data=portfolio_data
                         )
                         logger.info("✅ State manager updated with reconciled positions")
                     except Exception as e:
@@ -5758,52 +5628,98 @@ class CTraderRealTimeTrader(BaseBroker):
     def _convert_broker_position_to_local(self, broker_position):
         """Convert a broker position object to our local position format"""
         try:
+            # Log all available attributes for debugging
+            logger.debug(f"🔍 Broker position object attributes: {dir(broker_position)}")
+            
             # Extract basic position information
             position_id = getattr(broker_position, 'positionId', None)
-            symbol_id = getattr(broker_position, 'symbolId', None)
-            trade_side = getattr(broker_position, 'tradeSide', None)
-            volume = getattr(broker_position, 'volume', 0)
-            entry_price = getattr(broker_position, 'entryPrice', 0)
-            open_timestamp = getattr(broker_position, 'openTimestamp', None)
+            entry_price = getattr(broker_position, 'price', 0)  # Use 'price' from position object
+            
+            # CRITICAL FIX: Extract symbolId, volume, tradeSide, timestamp, and label from tradeData nested object
+            trade_data = getattr(broker_position, 'tradeData', None)
+            if trade_data:
+                symbol_id = getattr(trade_data, 'symbolId', None)
+                volume = getattr(trade_data, 'volume', 0)
+                trade_side = getattr(trade_data, 'tradeSide', None)
+                open_timestamp = getattr(trade_data, 'openTimestamp', None)
+                position_label = getattr(trade_data, 'label', None)
+                logger.debug(f"🔍 TradeData fields: symbolId={symbol_id}, volume={volume}, tradeSide={trade_side}, label={position_label}")
+            else:
+                # Fallback: try to extract directly from position object (old format)
+                symbol_id = getattr(broker_position, 'symbolId', None)
+                volume = getattr(broker_position, 'volume', 0)
+                trade_side = getattr(broker_position, 'tradeSide', None)
+                open_timestamp = getattr(broker_position, 'openTimestamp', None)
+                position_label = getattr(broker_position, 'label', None)
+                logger.debug(f"🔍 Direct position fields: symbolId={symbol_id}, volume={volume}, tradeSide={trade_side}, label={position_label}")
+            
+            # Enhanced logging for debugging symbolId issue
+            logger.debug(f"🔍 Extracted fields: positionId={position_id}, symbolId={symbol_id}, tradeSide={trade_side}, volume={volume}, label={position_label}")
+            
+            # LABEL FILTERING: Check if this position belongs to our trading script
+            expected_label_prefix = self._get_trading_label()
+            if not position_label or not position_label.startswith(expected_label_prefix):
+                logger.debug(f"🏷️ Skipping position with different label: '{position_label}' (expected prefix: '{expected_label_prefix}')")
+                return None
+            
+            logger.info(f"✅ Position belongs to our script (label: '{position_label}')")
+            
+            # Try alternative symbol field names if symbolId is None
+            if symbol_id is None and trade_data:
+                # Check for alternative field names in tradeData
+                symbol_id = getattr(trade_data, 'symbol_id', None)
+                if symbol_id is None:
+                    symbol_id = getattr(trade_data, 'symbol', None)
+                if symbol_id is None:
+                    symbol_id = getattr(trade_data, 'symbolName', None)
+                logger.debug(f"🔍 Alternative tradeData symbol lookup result: {symbol_id}")
+            
+            # Also check for alternative label field names if position_label is None
+            if position_label is None and trade_data:
+                position_label = getattr(trade_data, 'orderLabel', None) or getattr(trade_data, 'Label', None)
+                logger.debug(f"🔍 Alternative tradeData label lookup result: {position_label}")
             
             if not symbol_id or not position_id:
-                logger.warning(f"Position missing required fields: symbolId={symbol_id}, positionId={position_id}")
+                logger.warning(f"⚠️ Position missing required fields: symbolId={symbol_id}, positionId={position_id}")
+                # Try to extract what we can for debugging
+                available_fields = {attr: getattr(broker_position, attr, 'N/A') for attr in dir(broker_position) if not attr.startswith('_')}
+                logger.warning(f"🔍 Available position fields: {available_fields}")
+                if trade_data:
+                    trade_fields = {attr: getattr(trade_data, attr, 'N/A') for attr in dir(trade_data) if not attr.startswith('_')}
+                    logger.warning(f"🔍 Available tradeData fields: {trade_fields}")
                 return None
             
             # Convert symbol ID to symbol name
             symbol_name = self.symbol_id_to_name_map.get(symbol_id)
             if not symbol_name:
-                logger.warning(f"Unknown symbol ID: {symbol_id}")
-                return None
+                logger.warning(f"⚠️ Unknown symbol ID: {symbol_id}")
+                # Use symbol_id as fallback symbol name
+                symbol_name = str(symbol_id)
+                logger.warning(f"🔄 Using symbolId as symbol name: {symbol_name}")
             
-            # For now, we can only handle single-symbol positions
-            # Pairs positions would require additional logic to match pairs
-            logger.info(f"📊 Found broker position: {symbol_name} | {trade_side} | Volume: {volume} | Price: {entry_price}")
+            # Extract pair information from label if available
+            pair_str = None
+            if ':' in position_label:
+                _, pair_str = position_label.split(':', 1)
+                logger.info(f"📊 Extracted pair from label: {pair_str}")
             
-            # Convert to our format (simplified for single symbols)
+            # Store individual position information for potential pair reconstruction
             direction = "LONG" if trade_side == 1 else "SHORT"  # 1=BUY, 2=SELL in cTrader
-            
-            # Try to identify if this could be part of a pairs trade
-            # This is a simplified approach - in practice, you'd need better logic
-            # to match individual positions back to pairs
             
             position_info = {
                 'position_id': position_id,
-                'position_id1': position_id,  # For backward compatibility with pairs logic
-                'position_id2': None,  # Unknown for single positions
-                'symbol1': symbol_name,
-                'symbol2': None,  # Unknown for single positions
-                'direction': direction,
-                'volume1': volume / 100,  # Convert centilots to lots
-                'volume2': 0,
+                'symbol': symbol_name,
+                'direction_side': direction,
+                'volume': volume / 100,  # Convert centilots to lots
                 'entry_price': entry_price,
-                'entry_price1': entry_price,
-                'entry_price2': 0,
                 'entry_time': datetime.fromtimestamp(open_timestamp / 1000) if open_timestamp else datetime.now(),
-                'pair': symbol_name,  # Use symbol name as pair key for now
+                'pair_str': pair_str,  # Store extracted pair string
                 'status': 'open',
-                'broker_reconciled': True
+                'broker_reconciled': True,
+                'trading_label': position_label  # Store the full label for reference
             }
+            
+            logger.info(f"📊 Processed broker position: {symbol_name} | {direction} | Volume: {position_info['volume']} | Price: {entry_price} | Pair: {pair_str}")
             
             return position_info
             
@@ -5811,41 +5727,299 @@ class CTraderRealTimeTrader(BaseBroker):
             logger.error(f"Error converting broker position: {e}")
             return None
     
+    def _reconstruct_pairs_from_positions(self, individual_positions):
+        """Reconstruct pair positions from individual broker positions using label metadata"""
+        restored_positions = {}
+        pair_groups = {}
+        orphaned_positions = []
+        
+        # Group positions by pair string from label
+        for pos in individual_positions:
+            pair_str = pos.get('pair_str')
+            if not pair_str:
+                logger.warning(f"⚠️ Position without pair info: {pos['symbol']} | {pos['direction_side']} | Volume: {pos['volume']}")
+                orphaned_positions.append(pos)
+                continue
+                
+            if pair_str not in pair_groups:
+                pair_groups[pair_str] = []
+            pair_groups[pair_str].append(pos)
+        
+        # Handle orphaned positions (those without pair metadata) gracefully
+        if orphaned_positions:
+            logger.warning(f"⚠️ Found {len(orphaned_positions)} orphaned positions without pair metadata")
+            for pos in orphaned_positions:
+                # Create a single-symbol "pair" for orphaned positions to prevent system crashes
+                # This ensures graceful handling of legacy or manually opened positions
+                symbol = pos['symbol']
+                fake_pair_key = f"{symbol}-ORPHANED"
+                
+                logger.warning(f"🔄 Creating fallback entry for orphaned position: {fake_pair_key}")
+                
+                # Create a minimal position entry that won't break the system
+                fallback_position = {
+                    'direction': pos['direction_side'],
+                    'symbol1': symbol,
+                    'symbol2': '',  # Empty string instead of None to avoid validation issues
+                    'volume1': pos['volume'],
+                    'volume2': 0.0,  # Explicit float zero
+                    'entry_price1': pos['entry_price'],
+                    'entry_price2': 0.0,  # Explicit float zero
+                    'entry_time': pos['entry_time'],
+                    'position_id1': pos['position_id'],
+                    'position_id2': None,
+                    'status': 'open',
+                    'broker_reconciled': True,
+                    'trading_label': pos['trading_label'],
+                    'is_orphaned': True  # Flag for special handling
+                }
+                
+                restored_positions[fake_pair_key] = fallback_position
+        
+        # Reconstruct pairs from grouped positions
+        for pair_str, positions in pair_groups.items():
+            if len(positions) != 2:
+                logger.warning(f"⚠️ Found {len(positions)} positions for pair {pair_str}, expected 2. Skipping incomplete pair.")
+                for pos in positions:
+                    logger.warning(f"   Incomplete pair position: {pos['symbol']} | {pos['direction_side']} | Volume: {pos['volume']}")
+                continue
+            
+            # Determine which position is symbol1 and symbol2 based on the pair string
+            if '-' not in pair_str:
+                logger.warning(f"⚠️ Invalid pair format: {pair_str}")
+                continue
+                
+            symbol1, symbol2 = pair_str.split('-', 1)
+            
+            pos1 = None
+            pos2 = None
+            for pos in positions:
+                if pos['symbol'] == symbol1:
+                    pos1 = pos
+                elif pos['symbol'] == symbol2:
+                    pos2 = pos
+            
+            if not pos1 or not pos2:
+                logger.warning(f"⚠️ Could not match positions to symbols for pair {pair_str}")
+                logger.warning(f"   Expected: {symbol1}, {symbol2}")
+                logger.warning(f"   Found: {[pos['symbol'] for pos in positions]}")
+                continue
+            
+            # Determine overall pair direction based on symbol1 position
+            # In pair trading: LONG pair = BUY symbol1 + SELL symbol2, SHORT pair = SELL symbol1 + BUY symbol2
+            if pos1['direction_side'] == 'LONG':  # Buying symbol1
+                pair_direction = 'LONG'
+            else:  # Selling symbol1
+                pair_direction = 'SHORT'
+            
+            # Create properly formatted pair position
+            pair_position = {
+                'direction': pair_direction,
+                'symbol1': symbol1,
+                'symbol2': symbol2,
+                'volume1': pos1['volume'],
+                'volume2': pos2['volume'],
+                'entry_price1': pos1['entry_price'],
+                'entry_price2': pos2['entry_price'],
+                'entry_time': min(pos1['entry_time'], pos2['entry_time']),  # Use earlier time
+                'position_id1': pos1['position_id'],
+                'position_id2': pos2['position_id'],
+                'status': 'open',
+                'broker_reconciled': True,
+                'trading_label': pos1['trading_label']  # Use first position's label
+            }
+            
+            restored_positions[pair_str] = pair_position
+            logger.info(f"✅ Reconstructed pair: {pair_str} | {pair_direction} | {symbol1}:{pos1['volume']:.5f} + {symbol2}:{pos2['volume']:.5f}")
+        
+        logger.info(f"📊 Pair reconstruction complete: {len(restored_positions)} entries from {len(individual_positions)} individual positions")
+        return restored_positions
+    
     def _detect_manual_position_changes(self, broker_positions: list, restored_positions: dict):
         """
-        Detect manual position changes by comparing broker positions with our local tracking.
+        Detect manual position changes by comparing broker positions with our state manager positions.
         This helps identify positions that were manually closed or modified.
         """
         logger.info("🔍 DETECTING MANUAL POSITION CHANGES...")
         
         try:
-            # Create a set of broker position symbols and their details for quick lookup
-            broker_symbols = {}
-            for pos in broker_positions:
-                symbol_id = getattr(pos, 'symbolId', None)
-                position_id = getattr(pos, 'positionId', None)
-                volume = getattr(pos, 'volume', 0)
+            # CRITICAL FIX: Only run manual change detection for subsequent reconciliations, not initial ones
+            # If we have restored_positions from broker, that means positions exist and are valid
+            if restored_positions:
+                logger.info("📊 Positions successfully restored from broker - no manual changes detected")
+                logger.info(f"📊 Found {len(restored_positions)} active pairs from broker reconciliation")
                 
-                if symbol_id and position_id:
-                    symbol_name = self.symbol_id_to_name_map.get(symbol_id)
-                    if symbol_name:
-                        broker_symbols[symbol_name] = {
-                            'position_id': position_id,
-                            'volume': volume,
-                            'symbol_id': symbol_id
-                        }
+                # Log the broker positions for debugging
+                for pair_str, pair_data in restored_positions.items():
+                    symbol1 = pair_data.get('symbol1', 'N/A')
+                    symbol2 = pair_data.get('symbol2', 'N/A')
+                    direction = pair_data.get('direction', 'N/A')
+                    logger.info(f"   ✅ {pair_str}: {direction} | {symbol1} + {symbol2}")
+                
+                logger.info("📊 Skipping manual change detection - all positions accounted for")
+                return
             
-            logger.info(f"📊 Broker has {len(broker_symbols)} individual positions")
-            logger.info(f"📊 We track {len(self.active_positions)} pair positions")
+            # Only run manual change detection if we have no restored positions but expected some
+            logger.info("📊 No positions restored from broker - checking for manual changes...")
             
-            # Check each of our tracked pairs against broker positions
+            # Get the positions we should be tracking from the state manager
+            state_manager_positions = {}
+            if hasattr(self, 'state_manager') and self.state_manager:
+                try:
+                    # Get the latest trading state from state manager
+                    if hasattr(self.state_manager, 'get_latest_trading_state'):
+                        latest_state = self.state_manager.get_latest_trading_state()
+                    else:
+                        logger.warning("State manager does not have get_latest_trading_state method")
+                        latest_state = None
+                        
+                    if latest_state and 'positions' in latest_state:
+                        positions_data = latest_state['positions']
+                        
+                        # Convert to proper format for comparison with safer type handling
+                        if isinstance(positions_data, list):
+                            for pos in positions_data:
+                                if isinstance(pos, dict):
+                                    pair_key = pos.get('pair')
+                                    if not pair_key:
+                                        # Construct pair key from symbols
+                                        symbol1 = pos.get('symbol1', '')
+                                        symbol2 = pos.get('symbol2', '')
+                                        if symbol1 and symbol2:
+                                            pair_key = f"{symbol1}-{symbol2}"
+                                    
+                                    if pair_key:
+                                        # Ensure safe data types for comparison
+                                        safe_pos = {}
+                                        for key, value in pos.items():
+                                            # Convert datetime objects to strings for safe comparison
+                                            if hasattr(value, 'isoformat'):
+                                                safe_pos[key] = value.isoformat()
+                                            # Convert any numeric that might be stored as string back to float
+                                            elif isinstance(value, str) and key in ['entry_time', 'volume1', 'volume2', 'entry_price1', 'entry_price2', 'quantity']:
+                                                try:
+                                                    # Try to convert timestamp strings to datetime for proper comparison
+                                                    if key == 'entry_time' and 'T' in value:
+                                                        safe_pos[key] = str(value)  # Keep as string
+                                                    elif key in ['volume1', 'volume2', 'entry_price1', 'entry_price2', 'quantity']:
+                                                        safe_pos[key] = float(value)
+                                                    else:
+                                                        safe_pos[key] = value
+                                                except (ValueError, TypeError):
+                                                    safe_pos[key] = value
+                                            else:
+                                                safe_pos[key] = value
+                                        state_manager_positions[pair_key] = safe_pos
+                        elif isinstance(positions_data, dict):
+                            for key, pos_data in positions_data.items():
+                                if isinstance(pos_data, dict):
+                                    # Handle generic position keys like "position_1", "position_2"
+                                    pair_key = pos_data.get('pair')
+                                    if not pair_key:
+                                        # Construct pair key from symbols
+                                        symbol1 = pos_data.get('symbol1', '')
+                                        symbol2 = pos_data.get('symbol2', '')
+                                        if symbol1 and symbol2:
+                                            pair_key = f"{symbol1}-{symbol2}"
+                                    
+                                    # Use the constructed pair key or fall back to original key
+                                    final_key = pair_key if pair_key else key
+                                    # Ensure safe data types for comparison
+                                    safe_pos_data = {}
+                                    for k, v in pos_data.items():
+                                        # Convert datetime objects to strings for safe comparison
+                                        if hasattr(v, 'isoformat'):
+                                            safe_pos_data[k] = v.isoformat()
+                                        # Convert any numeric that might be stored as string back to float
+                                        elif isinstance(v, str) and k in ['entry_time', 'volume1', 'volume2', 'entry_price1', 'entry_price2', 'quantity']:
+                                            try:
+                                                # Try to convert timestamp strings to datetime for proper comparison
+                                                if k == 'entry_time' and 'T' in v:
+                                                    safe_pos_data[k] = str(v)  # Keep as string
+                                                elif k in ['volume1', 'volume2', 'entry_price1', 'entry_price2', 'quantity']:
+                                                    safe_pos_data[k] = float(v)
+                                                else:
+                                                    safe_pos_data[k] = v
+                                            except (ValueError, TypeError):
+                                                safe_pos_data[k] = v
+                                        else:
+                                            safe_pos_data[k] = v
+                                    state_manager_positions[final_key] = safe_pos_data
+                            
+                        logger.info(f"📦 Retrieved {len(state_manager_positions)} positions from state manager")
+                        # Enhanced logging for debugging
+                        if state_manager_positions:
+                            logger.info("📊 STATE MANAGER POSITIONS SUMMARY:")
+                            for i, (pair_key, pos_data) in enumerate(list(state_manager_positions.items())[:5]):
+                                logger.info(f"   {i+1}. {pair_key}: {pos_data.get('direction', 'N/A')} | {pos_data.get('symbol1', 'N/A')}-{pos_data.get('symbol2', 'N/A')}")
+                            if len(state_manager_positions) > 5:
+                                logger.info(f"   ... and {len(state_manager_positions) - 5} more positions")
+                except Exception as e:
+                    logger.warning(f"Could not retrieve positions from state manager: {e}")
+                    # Fallback to using current active_positions if state manager fails
+                    state_manager_positions = self.active_positions.copy()
+            else:
+                logger.warning("No state manager available, using current active_positions for comparison")
+                state_manager_positions = self.active_positions.copy()
+
+            # Create a set of broker position symbols and their details for quick lookup
+            # CRITICAL FIX: Use the already processed individual_positions that have been filtered by our label
+            # instead of reprocessing raw broker_positions
+            broker_symbols = {}
+            
+            # Convert the restored_positions back to individual symbol format for comparison
+            for pair_str, pair_data in restored_positions.items():
+                symbol1 = pair_data.get('symbol1')
+                symbol2 = pair_data.get('symbol2')
+                
+                if symbol1:
+                    broker_symbols[symbol1] = {
+                        'position_id': pair_data.get('position_id1'),
+                        'volume': pair_data.get('volume1', 0),
+                        'symbol_id': None  # Not needed for comparison
+                    }
+                
+                if symbol2:
+                    broker_symbols[symbol2] = {
+                        'position_id': pair_data.get('position_id2'),
+                        'volume': pair_data.get('volume2', 0),
+                        'symbol_id': None  # Not needed for comparison
+                    }
+            
+            logger.info(f"📊 Broker has {len(broker_symbols)} individual positions (with our label: '{self._get_trading_label()}')")
+            logger.info(f"📊 State manager has {len(state_manager_positions)} pair positions")
+            
+            # Enhanced logging for debugging the comparison
+            expected_label = self._get_trading_label()
+            if broker_symbols:
+                logger.info("📊 BROKER POSITIONS SUMMARY (filtered by our label):")
+                for symbol, data in list(broker_symbols.items())[:5]:
+                    logger.info(f"   {symbol}: Volume={data['volume']}, Position ID={data['position_id']}")
+            else:
+                logger.info(f"📊 BROKER has NO positions with our label ('{expected_label}')")
+            
+            # Check each position from state manager against broker positions
             manual_changes_detected = []
             
-            for pair_str, position_data in list(self.active_positions.items()):
+            for pair_str, position_data in list(state_manager_positions.items()):
                 symbol1 = position_data.get('symbol1')
                 symbol2 = position_data.get('symbol2')
-                volume1 = position_data.get('volume1', 0)
-                volume2 = position_data.get('volume2', 0)
+                
+                # Handle different volume field names from different sources
+                # State manager format might use 'quantity' while broker format uses 'volume1'/'volume2'
+                volume1 = position_data.get('volume1', position_data.get('quantity', 0))
+                volume2 = position_data.get('volume2', position_data.get('quantity', 0))  # Fallback to same quantity
+                
+                # Handle null values gracefully
+                if volume1 is None:
+                    volume1 = 0
+                if volume2 is None:
+                    volume2 = 0
+                    
+                # Handle null symbol names gracefully
+                if not symbol1 or not symbol2:
+                    logger.warning(f"⚠️ Invalid position data for {pair_str}: symbol1={symbol1}, symbol2={symbol2}")
+                    continue
                 
                 # Check if both legs still exist in broker
                 symbol1_in_broker = symbol1 in broker_symbols if symbol1 else False
@@ -5885,9 +6059,13 @@ class CTraderRealTimeTrader(BaseBroker):
                     
                 elif abs(broker_volume1 - volume1) > 0.001 or abs(broker_volume2 - volume2) > 0.001:
                     # Volume differences - partial closes or modifications
+                    # Handle null values gracefully
+                    vol1_diff = broker_volume1 - volume1 if broker_volume1 is not None and volume1 is not None else 0
+                    vol2_diff = broker_volume2 - volume2 if broker_volume2 is not None and volume2 is not None else 0
+                    
                     logger.warning(f"🔧 VOLUME CHANGE DETECTED: {pair_str}")
-                    logger.warning(f"   {symbol1}: {volume1} -> {broker_volume1} (Δ: {broker_volume1 - volume1})")
-                    logger.warning(f"   {symbol2}: {volume2} -> {broker_volume2} (Δ: {broker_volume2 - volume2})")
+                    logger.warning(f"   {symbol1}: {volume1} -> {broker_volume1} (Δ: {vol1_diff})")
+                    logger.warning(f"   {symbol2}: {volume2} -> {broker_volume2} (Δ: {vol2_diff})")
                     manual_changes_detected.append({
                         'type': 'VOLUME_CHANGE',
                         'pair': pair_str,

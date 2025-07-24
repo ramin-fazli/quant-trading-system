@@ -21,7 +21,7 @@ try:
     env_path = project_root / '.env'
     if env_path.exists():
         load_dotenv(env_path)
-        print(f"✅ Loaded environment variables from: {env_path}")
+        # print(f"✅ Loaded environment variables from: {env_path}")
     else:
         print(f"⚠️  .env file not found at: {env_path}")
 except ImportError:
@@ -197,6 +197,9 @@ class TradingConfig:
     mt5_server: str = field(default_factory=lambda: os.getenv('MT5_SERVER', 'MetaQuotes-Demo'))
     mt5_login: Optional[int] = field(default_factory=lambda: _parse_mt5_login())
     mt5_password: Optional[str] = field(default_factory=lambda: _parse_mt5_password())
+    
+    # === CTrader Specific Parameters ===
+    ctrader_trading_label: str = field(default_factory=lambda: os.getenv('CTRADER_TRADING_LABEL', 'PairsTradingBot'))
     
     # === Dashboard Parameters ===
     dashboard_host: str = field(default_factory=lambda: os.getenv('DASHBOARD_HOST', '0.0.0.0'))

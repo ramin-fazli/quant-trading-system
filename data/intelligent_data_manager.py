@@ -62,13 +62,10 @@ class IntelligentDataManager:
         # Cache settings
         self.data_retention_days = 365  # Keep data for 1 year
         self.batch_size = 1000  # Points per batch for InfluxDB writes
-        
-        logger.info("Intelligent Data Manager initialized")
     
     def register_data_provider(self, provider_name: str, provider_instance):
         """Register a data provider for fetching data"""
         self.data_providers[provider_name] = provider_instance
-        logger.info(f"Registered data provider: {provider_name}")
     
     def get_historical_data_intelligent(self, symbols: Union[str, List[str]], interval: str, 
                                       start_date: Union[str, datetime], end_date: Optional[Union[str, datetime]] = None,

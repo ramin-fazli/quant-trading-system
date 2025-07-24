@@ -66,8 +66,7 @@ class BaseBroker(PriceProvider, ABC):
         
         # Initialize shared utility modules (after account_currency is set)
         self._initialize_shared_modules()
-        
-        logger.info(f"Base broker initialized with {self.strategy.__class__.__name__}")
+
     
     def _initialize_shared_modules(self):
         """Initialize shared utility modules"""

@@ -263,6 +263,23 @@ class UnifiedStateManager:
         
         return self.enhanced_manager.load_trading_state()
     
+    def get_latest_trading_state(self) -> Optional[Dict[str, Any]]:
+        """
+        Get the latest trading state with positions and pair data.
+        This method provides a convenient wrapper around load_trading_state()
+        for use in position reconciliation and manual trade detection.
+        
+        Returns:
+            Dictionary containing:
+            - 'active_positions': Dict of pair -> position data
+            - 'pair_states': Dict of pair -> pair state data
+            - Other portfolio data
+        """
+        if not self._initialized and not self.initialize():
+            return None
+        
+        return self.enhanced_manager.load_trading_state()
+    
     def get_portfolio_summary(self) -> Dict[str, Any]:
         """Get portfolio summary with enhanced information."""
         if not self._initialized and not self.initialize():
