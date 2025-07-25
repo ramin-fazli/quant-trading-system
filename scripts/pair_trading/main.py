@@ -611,6 +611,14 @@ class EnhancedRealTimeTrader:
                 raise ValueError("CTrader broker not available. Install ctrader-open-api: pip install ctrader-open-api")
             self.trader = CTraderRealTimeTrader(config, data_manager, strategy)
             
+            # Share symbol details from data manager to broker to avoid duplicate API calls
+            if hasattr(data_manager, 'share_symbol_details_with_broker'):
+                try:
+                    data_manager.share_symbol_details_with_broker(self.trader)
+                    logger.info("✅ Symbol details shared from data manager to broker")
+                except Exception as e:
+                    logger.warning(f"Could not share symbol details: {e}")
+            
             # Pass state manager to CTrader broker for manual trade handling
             if self.state_manager:
                 self.trader.state_manager = self.state_manager
@@ -2573,7 +2581,6 @@ class EnhancedTradingSystemV3:
             logger.info(f"Data Provider: {self.data_provider}")
             logger.info(f"Execution Broker: {self.broker}")
             logger.info(f"Data Source: Intelligent caching with {len(backtest_data_cache)} symbols")
-            logger.info(f"Report: {report_path}")
             
             return backtest_results
             
@@ -3202,17 +3209,14 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
             backtest_results = system.run_enhanced_backtest(force_refresh=force_refresh)
             
             # Start dashboard with results
-            system.start_dashboard(backtest_results)
+            # system.start_dashboard(backtest_results)
             
-            logger.info("=== Backtest Complete ===")
-            logger.info(f"Data Provider: {system.data_provider}")
-            logger.info(f"Execution Broker: {system.broker}")
-            logger.info(f"Enhanced State Management: {'✅ Active' if system.state_manager else '❌ Disabled'}")
             logger.info(f"Portfolio Return: {backtest_results.get('portfolio_metrics', {}).get('portfolio_return', 0):.2%}")
             logger.info(f"Sharpe Ratio: {backtest_results.get('portfolio_metrics', {}).get('portfolio_sharpe', 0):.2f}")
             logger.info(f"Max Drawdown: {backtest_results.get('portfolio_metrics', {}).get('portfolio_max_drawdown', 0):.2%}")
             logger.info(f"Total Trades: {backtest_results.get('portfolio_metrics', {}).get('total_trades', 0)}")
             logger.info(f"Report: {backtest_results.get('report_path', 'N/A')}")
+            logger.info("="*80)
             
             # Log enhanced state information if available
             if system.state_manager:
@@ -3225,7 +3229,7 @@ def main(data_provider: str = 'ctrader', broker: str = 'ctrader', mode: str = 'b
                     logger.debug(f"Could not retrieve state management info: {e}")
             
             # Keep dashboard running
-            input("Press Enter to stop the dashboard...")
+            # input("Press Enter to stop the dashboard...")
             
         elif mode.lower() == 'live':
             logger.info(f"Starting live trading...")
@@ -3381,7 +3385,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # Set environment variables for mode (if needed by other components)
-    os.environ['TRADING_MODE'] = args.mode
+    # IMPORTANT: Only set TRADING_MODE=live for actual live trading to avoid reactor conflicts in backtest
+    if args.mode == 'live':
+        os.environ['TRADING_MODE'] = 'live'
+    else:
+        # For backtest mode, explicitly set to backtest to avoid live trading detection
+        os.environ['TRADING_MODE'] = 'backtest'
     
     main(data_provider=args.data_provider, broker=args.broker, mode=args.mode, 
          force_refresh=args.force_refresh, strategy=args.strategy, fresh_state=args.fresh_state)

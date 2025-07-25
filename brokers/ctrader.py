@@ -408,6 +408,11 @@ class CTraderRealTimeTrader(BaseBroker):
         if trading_mode is not None and trading_mode != 0:  # Not ENABLED
             return False
         
+        # Check if short selling is enabled (required for trading)
+        enable_short_selling = symbol_detail.get('enable_short_selling')
+        if enable_short_selling is False:  # Explicitly check for False, not just falsy values
+            return False
+        
         # SPECIAL HANDLING FOR US STOCKS
         # cTrader provides extended/CFD hours for .US symbols, but we want standard market hours
         if symbol.endswith('.US'):

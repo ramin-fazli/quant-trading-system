@@ -6,12 +6,11 @@ import time
 import logging
 from collections import deque, defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional, Union, Any
 import vectorbt as vbt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 from config import TradingConfig
-from data.mt5 import MT5DataManager
 from strategies.pairs_trading import OptimizedPairsStrategy
 
 def get_mt5_config():
@@ -43,7 +42,7 @@ warnings.filterwarnings("ignore")
 class VectorBTBacktester:
     """High-performance vectorbt-based backtesting engine"""
     
-    def __init__(self, config: TradingConfig, data_manager: MT5DataManager):
+    def __init__(self, config: TradingConfig, data_manager: Any):
         self.config = config
         self.data_manager = data_manager
         self.strategy = OptimizedPairsStrategy(config, data_manager)
@@ -85,12 +84,22 @@ class VectorBTBacktester:
         return backtest_results
     
     def _run_pair_backtests(self) -> List[Dict]:
-        """Run backtests for all pairs using parallel processing"""
+        """Run backtests for all pairs using appropriate processing method"""
         logger.info(f"Running backtests for {len(self.config.pairs)} pairs...")
         
-        if self.use_multiprocessing:
+        # Detect data manager type and choose processing method
+        data_manager_type = type(self.data_manager).__name__
+        is_ctrader = 'CTrader' in data_manager_type
+        
+        # Force sequential processing for CTrader to avoid API overload
+        if is_ctrader:
+            logger.info(f"Using sequential processing for {data_manager_type} data manager")
+            return self._run_pairs_sequential()
+        elif self.use_multiprocessing:
+            logger.info(f"Using parallel processing for {data_manager_type} data manager")
             return self._run_pairs_parallel()
         else:
+            logger.info(f"Using sequential processing for {data_manager_type} data manager")
             return self._run_pairs_sequential()
     
     def _run_pairs_parallel(self) -> List[Dict]:
@@ -119,8 +128,16 @@ class VectorBTBacktester:
         return results
     
     def _run_pairs_sequential(self) -> List[Dict]:
-        """Run pair backtests sequentially (for debugging)"""
+        """Run pair backtests sequentially (better for CTrader API)"""
         results = []
+        
+        # Detect data manager type
+        data_manager_type = type(self.data_manager).__name__
+        is_ctrader = 'CTrader' in data_manager_type
+        
+        logger.info(f"Running sequential processing (detected {data_manager_type})")
+        if is_ctrader:
+            logger.info(f"Using sequential processing for {data_manager_type} to avoid API rate limits")
         
         for i, pair_str in enumerate(self.config.pairs):
             try:
@@ -128,21 +145,76 @@ class VectorBTBacktester:
                 result = self._backtest_single_pair(pair_str)
                 if result:
                     results.append(result)
+                
+                # Add delay for CTrader to avoid rate limiting and connection issues
+                if is_ctrader and i < len(self.config.pairs) - 1:
+                    delay_time = 3  # Increased delay to 3 seconds
+                    logger.debug(f"{data_manager_type} delay: waiting {delay_time} seconds before next pair...")
+                    time.sleep(delay_time)
+                    
             except Exception as e:
                 logger.error(f"Error backtesting {pair_str}: {e}")
+                # Add delay even on error for CTrader
+                if is_ctrader and i < len(self.config.pairs) - 1:
+                    time.sleep(2)
         
         return results
     
     def _backtest_single_pair(self, pair_str: str) -> Optional[Dict]:
-        """Backtest a single pair using vectorbt"""
+        """Backtest a single pair using vectorbt with improved CTrader handling"""
         try:
             s1, s2 = pair_str.split('-')
             
-            # Get historical data
-            data1 = self.data_manager.get_historical_data(s1, self.config.interval, 
-                                                         self.config.start_date, self.config.end_date)
-            data2 = self.data_manager.get_historical_data(s2, self.config.interval,
-                                                         self.config.start_date, self.config.end_date)
+            # For CTrader, try to batch the two symbol requests
+            data_manager_type = type(self.data_manager).__name__
+            is_ctrader = 'CTrader' in data_manager_type
+            
+            if is_ctrader:
+                # Batch request for both symbols to minimize connection overhead
+                try:
+                    logger.debug(f"Batch requesting data for {s1} and {s2}")
+                    batch_data = self.data_manager.get_historical_data(
+                        [s1, s2], self.config.interval, 
+                        self.config.start_date, self.config.end_date
+                    )
+                    
+                    if isinstance(batch_data, dict):
+                        data1 = batch_data.get(s1, pd.Series(dtype=float))
+                        data2 = batch_data.get(s2, pd.Series(dtype=float))
+                    else:
+                        logger.warning(f"Unexpected batch data type: {type(batch_data)}")
+                        data1 = data2 = pd.Series(dtype=float)
+                        
+                except Exception as e:
+                    logger.warning(f"{data_manager_type} batch request failed for {pair_str}: {e}, falling back to individual requests")
+                    # Fall back to individual requests
+                    data1 = self.data_manager.get_historical_data(s1, self.config.interval, 
+                                                                 self.config.start_date, self.config.end_date)
+                    data2 = self.data_manager.get_historical_data(s2, self.config.interval,
+                                                                 self.config.start_date, self.config.end_date)
+            else:
+                # For other data managers, use individual requests
+                data1 = self.data_manager.get_historical_data(s1, self.config.interval, 
+                                                             self.config.start_date, self.config.end_date)
+                data2 = self.data_manager.get_historical_data(s2, self.config.interval,
+                                                             self.config.start_date, self.config.end_date)
+            
+            # Safety check: ensure we have pandas Series, not dicts or other types
+            if not isinstance(data1, pd.Series):
+                if isinstance(data1, dict):
+                    # If it's a dict, try to get the symbol data
+                    data1 = data1.get(s1, pd.Series(dtype=float))
+                else:
+                    logger.warning(f"Unexpected data type for {s1}: {type(data1)}")
+                    data1 = pd.Series(dtype=float)
+                    
+            if not isinstance(data2, pd.Series):
+                if isinstance(data2, dict):
+                    # If it's a dict, try to get the symbol data
+                    data2 = data2.get(s2, pd.Series(dtype=float))
+                else:
+                    logger.warning(f"Unexpected data type for {s2}: {type(data2)}")
+                    data2 = pd.Series(dtype=float)
             
             if data1.empty or data2.empty:
                 logger.warning(f"No data for {pair_str}")
@@ -182,7 +254,8 @@ class VectorBTBacktester:
                 'trades': trades,
                 'equity_curve': equity_curve,
                 'metrics': metrics,
-                'data': aligned_data
+                'data': aligned_data,
+                'indicators': indicators  # Include indicators for plotting
             }
             
         except Exception as e:
@@ -329,17 +402,19 @@ class VectorBTBacktester:
     def _calculate_trading_costs(self, s1: str, s2: str, data: pd.DataFrame) -> pd.Series:
         """Calculate trading costs for each timestamp"""
         
-        if not self.data_manager.symbol_info_cache:
-            # Return minimal costs if no symbol info
-            return pd.Series(0.1, index=data.index)  # 0.1% default cost
-        
-        # Get symbol info
-        info1 = self.data_manager.symbol_info_cache.get(s1, {})
-        info2 = self.data_manager.symbol_info_cache.get(s2, {})
-        
-        # Calculate spread costs
-        spread1_pct = info1.get('spread', 2) * info1.get('point', 0.0001) / data['price1'] * 100
-        spread2_pct = info2.get('spread', 2) * info2.get('point', 0.0001) / data['price2'] * 100
+        # Check if data manager has symbol info cache (MT5 specific)
+        if hasattr(self.data_manager, 'symbol_info_cache') and self.data_manager.symbol_info_cache:
+            # Get symbol info
+            info1 = self.data_manager.symbol_info_cache.get(s1, {})
+            info2 = self.data_manager.symbol_info_cache.get(s2, {})
+            
+            # Calculate spread costs
+            spread1_pct = info1.get('spread', 2) * info1.get('point', 0.0001) / data['price1'] * 100
+            spread2_pct = info2.get('spread', 2) * info2.get('point', 0.0001) / data['price2'] * 100
+        else:
+            # Use default costs for data providers without symbol info cache (e.g., CTrader)
+            spread1_pct = pd.Series(0.05, index=data.index)  # 0.05% default spread
+            spread2_pct = pd.Series(0.05, index=data.index)  # 0.05% default spread
         
         # Calculate commission costs
         def is_stock_or_etf(symbol: str) -> bool:

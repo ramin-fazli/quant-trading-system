@@ -47,6 +47,8 @@ try:
     ProtoOAAccountAuthRes = OpenApiMessages_pb2.ProtoOAAccountAuthRes
     ProtoOASymbolsListReq = OpenApiMessages_pb2.ProtoOASymbolsListReq
     ProtoOASymbolsListRes = OpenApiMessages_pb2.ProtoOASymbolsListRes
+    ProtoOASymbolByIdReq = OpenApiMessages_pb2.ProtoOASymbolByIdReq
+    ProtoOASymbolByIdRes = OpenApiMessages_pb2.ProtoOASymbolByIdRes
     ProtoOAGetTrendbarsReq = OpenApiMessages_pb2.ProtoOAGetTrendbarsReq
     ProtoOAGetTrendbarsRes = OpenApiMessages_pb2.ProtoOAGetTrendbarsRes
     ProtoOAErrorRes = OpenApiMessages_pb2.ProtoOAErrorRes
@@ -136,8 +138,8 @@ class CTraderDataManager:
             return None
             
         digits = symbol_details['digits']
-        if not isinstance(digits, int) or digits < 0:
-            logger.error(f"Invalid digits value: {digits}")
+        if digits is None or not isinstance(digits, int) or digits < 0:
+            logger.error(f"Invalid or missing digits value: {digits}")
             return None
             
         # Divide by 100000 and round to symbol digits as per cTrader documentation
@@ -335,11 +337,13 @@ class CTraderDataManager:
             
             # Map symbol names to IDs and collect basic symbol details
             self.symbol_name_to_id = {}
+            self.symbol_id_to_name_map = {}  # Reverse mapping for lookups
             symbol_ids_for_details = []
             
             for symbol in response.symbol:
                 # Store both exact name and cleaned name mappings
                 self.symbol_name_to_id[symbol.symbolName] = symbol.symbolId
+                self.symbol_id_to_name_map[symbol.symbolId] = symbol.symbolName
                 # Also store cleaned versions (remove suffixes like .r, .m, etc)
                 clean_name = symbol.symbolName.split('.')[0]
                 if clean_name not in self.symbol_name_to_id:
@@ -349,17 +353,20 @@ class CTraderDataManager:
                 digits = getattr(symbol, 'digits', None)
                 pip_position = getattr(symbol, 'pipPosition', None)
                 
-                if digits is None:
-                    logger.error(f"Missing digits field for symbol {symbol.symbolName}")
-                    continue
-                if pip_position is None:
-                    logger.warning(f"Missing pipPosition for symbol {symbol.symbolName}")
-                    pip_position = -5  # Common default for forex pairs
+                # Check if we need detailed symbol information (no default values used)
+                needs_detailed_info = digits is None or pip_position is None
+                
+                # if digits is None:
+                #     logger.warning(f"Missing digits field for symbol {symbol.symbolName} - will request detailed info")
+                # if pip_position is None:
+                #     logger.warning(f"Missing pipPosition field for symbol {symbol.symbolName} - will request detailed info")
                 
                 self.symbol_details[symbol.symbolName] = {
                     'digits': digits,
                     'pip_position': pip_position,
-                    'symbol_id': symbol.symbolId
+                    'symbol_id': symbol.symbolId,
+                    'symbol_name': symbol.symbolName,
+                    'needs_detailed_info': needs_detailed_info
                 }
                 
                 # Also store for clean name
@@ -369,6 +376,9 @@ class CTraderDataManager:
             logger.info(f"Mapped {len(self.symbol_name_to_id)} symbol names to IDs")
             logger.info(f"Collected symbol details for {len(self.symbol_details)} symbols")
             
+            # Request detailed symbol information for target symbols that need it
+            self._request_detailed_symbol_info()
+            
             # Start requesting historical data for each symbol
             self._request_all_symbol_data()
             
@@ -376,11 +386,101 @@ class CTraderDataManager:
             # Process historical data response - exactly like working version
             self._process_historical_data(message)
             
+        elif message.payloadType == ProtoOASymbolByIdRes().payloadType:
+            # Process detailed symbol information response
+            self._process_detailed_symbol_info(message)
+            
         elif message.payloadType == ProtoOAErrorRes().payloadType:
             response = Protobuf.extract(message)
             logger.error(f"cTrader API Error: {response.description}")
             self.pending_requests -= 1
             self._check_completion()
+    
+    def _request_detailed_symbol_info(self):
+        """Request detailed symbol information for target symbols that need it"""
+        # Find target symbols that need detailed information
+        symbols_needing_details = []
+        for symbol in self.target_symbols:
+            symbol_details = self.symbol_details.get(symbol)
+            if symbol_details and symbol_details.get('needs_detailed_info', False):
+                symbols_needing_details.append(symbol)
+        
+        if not symbols_needing_details:
+            logger.info("All target symbols have sufficient details, proceeding with data requests")
+            return
+        
+        logger.info(f"Requesting detailed info for {len(symbols_needing_details)} symbols: {symbols_needing_details}")
+        
+        # Collect symbol IDs for detailed request
+        symbol_ids = []
+        for symbol in symbols_needing_details:
+            symbol_id = self._get_symbol_id(symbol)
+            if symbol_id:
+                symbol_ids.append(symbol_id)
+        
+        if symbol_ids:
+            # Request detailed symbol information
+            symbol_details_req = ProtoOASymbolByIdReq()
+            symbol_details_req.ctidTraderAccountId = int(CTRADER_ACCOUNT_ID)
+            symbol_details_req.symbolId.extend(symbol_ids)
+            
+            deferred = self.client.send(symbol_details_req)
+            deferred.addErrback(self._on_data_error)
+            deferred.addTimeout(30, reactor)
+        else:
+            logger.warning("No valid symbol IDs found for detailed requests")
+    
+    def _process_detailed_symbol_info(self, message):
+        """Process detailed symbol information response"""
+        try:
+            response = Protobuf.extract(message)
+            
+            if not hasattr(response, 'symbol') or len(response.symbol) == 0:
+                logger.warning("No detailed symbols received from cTrader API")
+                return
+            
+            logger.info(f"Processing detailed info for {len(response.symbol)} symbols")
+            
+            for symbol in response.symbol:
+                symbol_name = self.symbol_id_to_name_map.get(symbol.symbolId)
+                
+                if not symbol_name:
+                    # Try to find in target symbols
+                    for target_symbol in self.target_symbols:
+                        if self._get_symbol_id(target_symbol) == symbol.symbolId:
+                            symbol_name = target_symbol
+                            break
+                
+                if not symbol_name:
+                    logger.warning(f"Symbol ID {symbol.symbolId} not found in mappings")
+                    continue
+                
+                # Update symbol details with accurate information
+                if symbol_name in self.symbol_details:
+                    # Extract the required fields with proper validation
+                    digits = getattr(symbol, 'digits', None)
+                    pip_position = getattr(symbol, 'pipPosition', None)
+                    
+                    if digits is not None:
+                        self.symbol_details[symbol_name]['digits'] = digits
+                        logger.debug(f"Updated digits for {symbol_name}: {digits}")
+                    
+                    if pip_position is not None:
+                        self.symbol_details[symbol_name]['pip_position'] = pip_position
+                        logger.debug(f"Updated pipPosition for {symbol_name}: {pip_position}")
+                    
+                    # Mark as having detailed info
+                    self.symbol_details[symbol_name]['needs_detailed_info'] = False
+                    
+                    # Also update clean name version if it exists
+                    clean_name = symbol_name.split('.')[0]
+                    if clean_name in self.symbol_details and clean_name != symbol_name:
+                        self.symbol_details[clean_name].update(self.symbol_details[symbol_name])
+            
+            logger.info("Detailed symbol information processing completed")
+            
+        except Exception as e:
+            logger.error(f"Error processing detailed symbol info: {e}")
     
     def _request_all_symbol_data(self):
         """Request historical data for all target symbols using sequential pattern like pairs_trading_ctrader_v4.py"""
@@ -888,6 +988,9 @@ class CTraderDataManager:
         if trading_mode == 'live':
             logger.debug("Live trading context detected via TRADING_MODE environment variable")
             return True
+        elif trading_mode == 'backtest':
+            logger.debug("Backtest mode explicitly set via TRADING_MODE environment variable - not live trading")
+            return False
         
         # Check call stack for live trading indicators
         for frame_info in inspect.stack():
@@ -906,10 +1009,25 @@ class CTraderDataManager:
                 if 'live' in str(indicator).lower():
                     logger.debug(f"Live trading context detected in call stack: {indicator}")
                     return True
+                elif 'backtest' in str(indicator).lower():
+                    logger.debug(f"Backtest mode detected in call stack: {indicator} - not live trading")
+                    return False
             
             # Check if we're being called from live trading initialization code
             filename = frame_info.filename
             function_name = frame_info.function
+            
+            # Look for backtest patterns first (higher priority)
+            backtest_patterns = [
+                'backtest',
+                'run_enhanced_backtest',
+                'prepare_backtest_data'
+            ]
+            
+            for pattern in backtest_patterns:
+                if pattern in function_name.lower() or pattern in filename.lower():
+                    logger.debug(f"Backtest context detected via function/file pattern: {function_name} in {filename}")
+                    return False
             
             # Look for live trading patterns in function names and file paths
             live_patterns = [
@@ -925,10 +1043,16 @@ class CTraderDataManager:
                     logger.debug(f"Live trading context detected via function/file pattern: {function_name} in {filename}")
                     return True
             
-            # Check if main.py is in the stack (likely live trading initiation)
-            if filename.endswith('main.py') and 'trading' in function_name.lower():
-                logger.debug(f"Live trading context detected: {function_name} in main.py")
-                return True
+            # Check if main.py is in the stack - but be more specific about live trading
+            if filename.endswith('main.py'):
+                # More specific checks for live trading functions
+                if any(live_func in function_name.lower() for live_func in ['start_real_time_trading', 'start_live', '_collect_live_data']):
+                    logger.debug(f"Live trading context detected: {function_name} in main.py")
+                    return True
+                # If it's a backtest function, explicitly return False
+                elif any(backtest_func in function_name.lower() for backtest_func in ['run_enhanced_backtest', 'backtest']):
+                    logger.debug(f"Backtest context detected: {function_name} in main.py")
+                    return False
         
         logger.debug("No live trading context detected - safe to use traditional reactor mode")
         return False
@@ -1425,3 +1549,31 @@ class CTraderDataManager:
         """Handle timeout for async data collection"""
         logger.error("Async data collection timeout")
         self._finish_data_collection_async()
+    
+    def get_symbol_details_cache(self) -> dict:
+        """
+        Get the symbol details cache for sharing with other modules.
+        
+        Returns:
+            dict: Symbol details cache with digits, pipPosition, and other metadata
+        """
+        return self.symbol_details.copy()
+    
+    def share_symbol_details_with_broker(self, broker_instance):
+        """
+        Share symbol details with a broker instance to avoid duplicate API calls.
+        
+        Args:
+            broker_instance: CTrader broker instance that needs symbol details
+        """
+        if hasattr(broker_instance, 'symbol_details') and self.symbol_details:
+            # Update broker's symbol details with our data
+            broker_instance.symbol_details.update(self.symbol_details)
+            logger.info(f"Shared {len(self.symbol_details)} symbol details with broker")
+            
+            # Also share the name mappings
+            if hasattr(broker_instance, 'symbol_name_to_id') and self.symbol_name_to_id:
+                broker_instance.symbol_name_to_id.update(self.symbol_name_to_id)
+            
+            if hasattr(broker_instance, 'symbol_id_to_name_map') and self.symbol_id_to_name_map:
+                broker_instance.symbol_id_to_name_map.update(self.symbol_id_to_name_map)
