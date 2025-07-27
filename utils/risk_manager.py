@@ -247,16 +247,23 @@ class VolumeBalancer:
                                  symbol_details1: Dict[str, Any], symbol_details2: Dict[str, Any],
                                  max_position_size: float) -> Optional[Tuple[float, float, float, float]]:
         """
-        Calculate balanced volumes for a pair trade with comprehensive validation
+        Calculate balanced volumes for a pair trade using margin-based calculations with symbol leverage
         
         Args:
             symbol1, symbol2: Symbol names
             price1, price2: Current prices
-            symbol_details1, symbol_details2: Complete symbol details including lot_size and volume constraints
-            max_position_size: Maximum position size
+            symbol_details1, symbol_details2: Complete symbol details including lot_size, volume constraints, and leverage info
+            max_position_size: Maximum total margin used for the pair position (half margin for each leg)
             
         Returns:
             Tuple of (volume1, volume2, monetary_value1, monetary_value2) or None
+            
+        Notes:
+            - max_position_size is interpreted as total margin requirement for the pair
+            - Each leg uses half the margin (max_position_size / 2)
+            - Monetary value for each leg = margin * symbol_leverage
+            - Symbol leverage is extracted from available fields: leverageTiers, leverageInCents, maxLeverage, or defaults to 30x
+            - Volumes are calculated to achieve balanced monetary exposure using leverage
         """
         try:
             # Validate symbol details availability
@@ -281,10 +288,38 @@ class VolumeBalancer:
             logger.debug(f"  {symbol1}: price={price1:.5f}, min_volume={symbol_details1.get('min_volume') if 'min_volume' in symbol_details1 else 'NOT_SET'}, step_volume={symbol_details1.get('step_volume') if 'step_volume' in symbol_details1 else 'NOT_SET'}")
             logger.debug(f"  {symbol2}: price={price2:.5f}, min_volume={symbol_details2.get('min_volume') if 'min_volume' in symbol_details2 else 'NOT_SET'}, step_volume={symbol_details2.get('step_volume') if 'step_volume' in symbol_details2 else 'NOT_SET'}")
             
-            # Calculate target monetary value per leg (half of max position size for each leg)
-            target_monetary_value = max_position_size / 2
+            # Calculate target margin per leg (half of max position size for each leg)
+            # Note: We'll use this as an initial target, but will validate and adjust later
+            target_margin_per_leg = max_position_size / 2
             
-            logger.debug(f"  Target monetary value per leg: ${target_monetary_value:.2f}")
+            logger.debug(f"  Initial target margin per leg: ${target_margin_per_leg:.2f}")
+            logger.debug(f"  Total margin limit: ${max_position_size:.2f}")
+            
+            leverage1 = symbol_details1.get('symbol_leverage')
+            leverage2 = symbol_details2.get('symbol_leverage')
+
+            # Validate leverage data - NO defaults allowed, all leverage must be real API data
+            if leverage1 is None or leverage2 is None:
+                leverage1_source = symbol_details1.get('leverage_source', 'UNKNOWN')
+                leverage2_source = symbol_details2.get('leverage_source', 'UNKNOWN')
+                
+                logger.error(f"Cannot calculate volumes for {symbol1}-{symbol2} - missing real leverage data")
+                logger.error(f"  {symbol1}: leverage={leverage1}, source={leverage1_source}")
+                logger.error(f"  {symbol2}: leverage={leverage2}, source={leverage2_source}")
+                logger.error(f"  Trading requires actual leverage data from cTrader API")
+                logger.error(f"  Wait for leverage extraction to complete or check API connectivity")
+                return None
+            
+            # Validate leverage values are positive numbers
+            if not isinstance(leverage1, (int, float)) or leverage1 <= 0:
+                logger.error(f"Invalid leverage value for {symbol1}: {leverage1} (must be positive number)")
+                return None
+                
+            if not isinstance(leverage2, (int, float)) or leverage2 <= 0:
+                logger.error(f"Invalid leverage value for {symbol2}: {leverage2} (must be positive number)")
+                return None
+            
+            logger.debug(f"  Symbol leverages: {symbol1}={leverage1}x, {symbol2}={leverage2}x")
             
             # Extract and validate lot sizes from symbol details (contract sizes)
             if 'lot_size' not in symbol_details1:
@@ -312,10 +347,17 @@ class VolumeBalancer:
             
             logger.debug(f"  Contract sizes: {symbol1}={contract_size1}, {symbol2}={contract_size2}")
             
-            # Calculate required volumes for target monetary value
-            # Formula: volume = target_value / (price * contract_size)
-            volume1_raw = target_monetary_value / (price1 * contract_size1)
-            volume2_raw = target_monetary_value / (price2 * contract_size2)
+            # Calculate target monetary values from margin and leverage
+            # Formula: monetary_value = margin * leverage
+            target_monetary_value1 = target_margin_per_leg * leverage1
+            target_monetary_value2 = target_margin_per_leg * leverage2
+            
+            logger.debug(f"  Target monetary values: {symbol1}=${target_monetary_value1:.2f}, {symbol2}=${target_monetary_value2:.2f}")
+            
+            # Calculate required volumes for target monetary values
+            # Formula: volume = target_monetary_value / (price * contract_size)
+            volume1_raw = target_monetary_value1 / (price1 * contract_size1)
+            volume2_raw = target_monetary_value2 / (price2 * contract_size2)
             
             logger.debug(f"  Raw volumes: {symbol1}={volume1_raw:.6f}, {symbol2}={volume2_raw:.6f}")
             
@@ -353,6 +395,31 @@ class VolumeBalancer:
                 logger.error(f"Failed to extract volume constraints for {symbol1}-{symbol2}")
                 return None
             
+            # Early validation: Check if minimum volumes would exceed margin limit
+            min_vol1 = volume_constraints1['volume_min']
+            min_vol2 = volume_constraints2['volume_min']
+            min_monetary1 = min_vol1 * price1 * contract_size1
+            min_monetary2 = min_vol2 * price2 * contract_size2
+            min_margin1 = min_monetary1 / leverage1 if leverage1 > 0 else 0
+            min_margin2 = min_monetary2 / leverage2 if leverage2 > 0 else 0
+            min_total_margin = min_margin1 + min_margin2
+            
+            logger.debug(f"  Minimum volume validation for {symbol1}-{symbol2}:")
+            logger.debug(f"    Min volumes: {symbol1}={min_vol1:.6f}, {symbol2}={min_vol2:.6f}")
+            logger.debug(f"    Prices: {symbol1}=${price1:.2f}, {symbol2}=${price2:.2f}")
+            logger.debug(f"    Contract sizes: {symbol1}={contract_size1}, {symbol2}={contract_size2}")
+            logger.debug(f"    Leverages: {symbol1}={leverage1}x, {symbol2}={leverage2}x")
+            logger.debug(f"    Min margins: {symbol1}=${min_margin1:.2f}, {symbol2}=${min_margin2:.2f}")
+            logger.debug(f"    Min total margin: ${min_total_margin:.2f} vs limit: ${max_position_size:.2f}")
+            
+            if min_total_margin > max_position_size:
+                logger.error(f"❌ PAIR EXCLUDED: Minimum volume requirements for {symbol1}-{symbol2} exceed margin limit:")
+                logger.error(f"  Minimum volumes: {symbol1}={min_vol1:.6f} lots, {symbol2}={min_vol2:.6f} lots")
+                logger.error(f"  Minimum monetary values: {symbol1}=${min_monetary1:.2f}, {symbol2}=${min_monetary2:.2f}")
+                logger.error(f"  Minimum margin required: ${min_total_margin:.2f} > ${max_position_size:.2f} (limit)")
+                logger.error(f"  Consider increasing MAX_POSITION_SIZE to at least ${min_total_margin * 1.2:.0f} to trade this pair")
+                return None
+            
             volume1 = self._normalize_volume(volume1_raw, volume_constraints1)
             volume2 = self._normalize_volume(volume2_raw, volume_constraints2)
             
@@ -373,16 +440,68 @@ class VolumeBalancer:
             best_monetary1, best_monetary2 = monetary_value1, monetary_value2
             best_diff = abs(monetary_value1 - monetary_value2) / max(monetary_value1, monetary_value2)
             
-            # Try small adjustments to improve balance
+            # For leverage-based calculations, try to balance by adjusting one leg to match the other
+            # Find which leg should be adjusted to achieve better balance
+            if abs(monetary_value1 - monetary_value2) > 0:
+                # Calculate what volume would be needed to match monetary values
+                if monetary_value1 > monetary_value2:
+                    # Reduce volume1 to match monetary_value2
+                    target_volume1 = monetary_value2 / (price1 * contract_size1)
+                    test_volume1 = self._normalize_volume(target_volume1, volume_constraints1)
+                    if test_volume1 is not None:
+                        test_monetary1 = test_volume1 * price1 * contract_size1
+                        test_diff = abs(test_monetary1 - monetary_value2) / max(test_monetary1, monetary_value2)
+                        if test_diff < best_diff:
+                            best_volume1, best_volume2 = test_volume1, volume2
+                            best_monetary1, best_monetary2 = test_monetary1, monetary_value2
+                            best_diff = test_diff
+                            logger.debug(f"  Improved balance by adjusting volume1: diff={test_diff:.4f}")
+                else:
+                    # Reduce volume2 to match monetary_value1
+                    target_volume2 = monetary_value1 / (price2 * contract_size2)
+                    test_volume2 = self._normalize_volume(target_volume2, volume_constraints2)
+                    if test_volume2 is not None:
+                        test_monetary2 = test_volume2 * price2 * contract_size2
+                        test_diff = abs(monetary_value1 - test_monetary2) / max(monetary_value1, test_monetary2)
+                        if test_diff < best_diff:
+                            best_volume1, best_volume2 = volume1, test_volume2
+                            best_monetary1, best_monetary2 = monetary_value1, test_monetary2
+                            best_diff = test_diff
+                            logger.debug(f"  Improved balance by adjusting volume2: diff={test_diff:.4f}")
+                
+                # After achieving balance, try to scale up both volumes proportionally to better utilize margin
+                if best_diff <= self.monetary_value_tolerance:
+                    current_margin1 = best_monetary1 / leverage1 if leverage1 > 0 else 0
+                    current_margin2 = best_monetary2 / leverage2 if leverage2 > 0 else 0
+                    current_total_margin = current_margin1 + current_margin2
+                    
+                    if current_total_margin > 0 and current_total_margin < max_position_size * 0.9:  # If using less than 90% of available margin
+                        scale_factor = min(2.0, (max_position_size * 0.9) / current_total_margin)  # Don't scale beyond 2x or 90% of margin
+                        
+                        test_volume1 = self._normalize_volume(best_volume1 * scale_factor, volume_constraints1)
+                        test_volume2 = self._normalize_volume(best_volume2 * scale_factor, volume_constraints2)
+                        
+                        if test_volume1 is not None and test_volume2 is not None:
+                            test_monetary1 = test_volume1 * price1 * contract_size1
+                            test_monetary2 = test_volume2 * price2 * contract_size2
+                            test_margin1 = test_monetary1 / leverage1 if leverage1 > 0 else 0
+                            test_margin2 = test_monetary2 / leverage2 if leverage2 > 0 else 0
+                            test_total_margin = test_margin1 + test_margin2
+                            test_diff = abs(test_monetary1 - test_monetary2) / max(test_monetary1, test_monetary2)
+                            
+                            # Accept the scaled volumes if they maintain balance and don't exceed margin
+                            if test_diff <= self.monetary_value_tolerance and test_total_margin <= max_position_size:
+                                best_volume1, best_volume2 = test_volume1, test_volume2
+                                best_monetary1, best_monetary2 = test_monetary1, test_monetary2
+                                best_diff = test_diff
+                                logger.debug(f"  Scaled volumes by {scale_factor:.2f}x to better utilize margin: new_diff={test_diff:.4f}, new_margin=${test_total_margin:.2f}")
+            
+            # Try small adjustments to improve balance further
             for multiplier in [0.95, 0.98, 1.02, 1.05]:
                 try:
-                    # Adjust the larger volume down or smaller volume up for better balance
-                    if monetary_value1 > monetary_value2:
-                        test_volume1 = self._normalize_volume(volume1_raw * multiplier, volume_constraints1)
-                        test_volume2 = volume2
-                    else:
-                        test_volume1 = volume1
-                        test_volume2 = self._normalize_volume(volume2_raw * multiplier, volume_constraints2)
+                    # Adjust volumes proportionally while maintaining leverage-based calculations
+                    test_volume1 = self._normalize_volume(volume1_raw * multiplier, volume_constraints1)
+                    test_volume2 = self._normalize_volume(volume2_raw * multiplier, volume_constraints2)
                     
                     if test_volume1 is not None and test_volume2 is not None:
                         test_monetary1 = test_volume1 * price1 * contract_size1
@@ -404,12 +523,140 @@ class VolumeBalancer:
             # Final validation against monetary value tolerance
             final_diff_pct = abs(monetary_value1 - monetary_value2) / max(monetary_value1, monetary_value2)
             
+            # Calculate actual margin usage for verification
+            actual_margin1 = monetary_value1 / leverage1 if leverage1 > 0 else 0
+            actual_margin2 = monetary_value2 / leverage2 if leverage2 > 0 else 0
+            total_margin_used = actual_margin1 + actual_margin2
+            
+            # If margin exceeds limit, scale down proportionally with a safety buffer
+            if total_margin_used > max_position_size:
+                # Use a slightly more aggressive scale-down to account for volume step constraints
+                safety_factor = 0.9  # Target 90% of limit to ensure we stay under
+                scale_down_factor = (max_position_size * safety_factor) / total_margin_used
+                logger.warning(f"  Margin usage (${total_margin_used:.2f}) exceeds limit (${max_position_size:.2f}), scaling down by {scale_down_factor:.4f} with safety buffer")
+                
+                # Check if scaling would violate minimum volume constraints
+                min_vol1 = volume_constraints1['volume_min']
+                min_vol2 = volume_constraints2['volume_min']
+                scaled_vol1_test = volume1 * scale_down_factor
+                scaled_vol2_test = volume2 * scale_down_factor
+                
+                if scaled_vol1_test < min_vol1 or scaled_vol2_test < min_vol2:
+                    logger.warning(f"  Scaling would violate minimum volume constraints:")
+                    logger.warning(f"    {symbol1}: {scaled_vol1_test:.6f} < {min_vol1:.6f} (min)")
+                    logger.warning(f"    {symbol2}: {scaled_vol2_test:.6f} < {min_vol2:.6f} (min)")
+                    logger.error(f"Cannot scale volumes for {symbol1}-{symbol2} to fit within margin limit without violating minimum volume constraints")
+                    return None
+                
+                # Scale down volumes proportionally
+                scaled_volume1 = self._normalize_volume(volume1 * scale_down_factor, volume_constraints1)
+                scaled_volume2 = self._normalize_volume(volume2 * scale_down_factor, volume_constraints2)
+                
+                if scaled_volume1 is not None and scaled_volume2 is not None:
+                    # Recalculate with scaled volumes
+                    volume1, volume2 = scaled_volume1, scaled_volume2
+                    monetary_value1 = volume1 * price1 * contract_size1
+                    monetary_value2 = volume2 * price2 * contract_size2
+                    actual_margin1 = monetary_value1 / leverage1 if leverage1 > 0 else 0
+                    actual_margin2 = monetary_value2 / leverage2 if leverage2 > 0 else 0
+                    total_margin_used = actual_margin1 + actual_margin2
+                    
+                    # Recalculate final difference
+                    final_diff_pct = abs(monetary_value1 - monetary_value2) / max(monetary_value1, monetary_value2)
+                    logger.warning(f"  After scaling: margin=${total_margin_used:.2f}, diff={final_diff_pct:.4f}")
+                    
+                    # If still over limit after scaling with safety buffer, try more aggressive scaling
+                    if total_margin_used > max_position_size:
+                        aggressive_factor = 0.95  # Target 95% of limit
+                        more_aggressive_scale = (max_position_size * aggressive_factor) / (total_margin_used / scale_down_factor)  # relative to original
+                        
+                        # Check if more aggressive scaling would violate minimum volume constraints
+                        more_aggressive_vol1_test = volume1 * more_aggressive_scale / scale_down_factor
+                        more_aggressive_vol2_test = volume2 * more_aggressive_scale / scale_down_factor
+                        
+                        if more_aggressive_vol1_test < min_vol1 or more_aggressive_vol2_test < min_vol2:
+                            logger.warning(f"  More aggressive scaling would violate minimum volume constraints:")
+                            logger.warning(f"    {symbol1}: {more_aggressive_vol1_test:.6f} < {min_vol1:.6f} (min)")
+                            logger.warning(f"    {symbol2}: {more_aggressive_vol2_test:.6f} < {min_vol2:.6f} (min)")
+                            logger.error(f"Cannot reduce volumes for {symbol1}-{symbol2} further without violating minimum volume constraints")
+                            return None
+                        
+                        logger.warning(f"  Still over limit, trying more aggressive scaling: {more_aggressive_scale:.4f}")
+                        
+                        scaled_volume1 = self._normalize_volume(volume1 * more_aggressive_scale / scale_down_factor, volume_constraints1)
+                        scaled_volume2 = self._normalize_volume(volume2 * more_aggressive_scale / scale_down_factor, volume_constraints2)
+                        
+                        if scaled_volume1 is not None and scaled_volume2 is not None:
+                            volume1, volume2 = scaled_volume1, scaled_volume2
+                            monetary_value1 = volume1 * price1 * contract_size1
+                            monetary_value2 = volume2 * price2 * contract_size2
+                            actual_margin1 = monetary_value1 / leverage1 if leverage1 > 0 else 0
+                            actual_margin2 = monetary_value2 / leverage2 if leverage2 > 0 else 0
+                            total_margin_used = actual_margin1 + actual_margin2
+                            final_diff_pct = abs(monetary_value1 - monetary_value2) / max(monetary_value1, monetary_value2)
+                            logger.warning(f"  After aggressive scaling: margin=${total_margin_used:.2f}, diff={final_diff_pct:.4f}")
+            # Final validation: if margin still exceeds limit, force reduce volumes step by step
+            if total_margin_used > max_position_size:
+                logger.warning(f"  Final margin check: ${total_margin_used:.2f} > ${max_position_size:.2f}, forcing volume reduction")
+                
+                # Get minimum volume constraints for validation
+                min_vol1 = volume_constraints1['volume_min']
+                min_vol2 = volume_constraints2['volume_min']
+                
+                # Try reducing volumes in small steps until we're under the limit
+                reduction_steps = [0.98, 0.96, 0.94, 0.92, 0.90]
+                for reduction_factor in reduction_steps:
+                    # Check if reduction would violate minimum volume constraints
+                    test_vol1_raw = volume1 * reduction_factor
+                    test_vol2_raw = volume2 * reduction_factor
+                    
+                    if test_vol1_raw < min_vol1 or test_vol2_raw < min_vol2:
+                        logger.warning(f"  Reduction factor {reduction_factor:.2f} would violate minimum volume constraints:")
+                        logger.warning(f"    {symbol1}: {test_vol1_raw:.6f} < {min_vol1:.6f} (min)")
+                        logger.warning(f"    {symbol2}: {test_vol2_raw:.6f} < {min_vol2:.6f} (min)")
+                        continue
+                    
+                    test_volume1 = self._normalize_volume(test_vol1_raw, volume_constraints1)
+                    test_volume2 = self._normalize_volume(test_vol2_raw, volume_constraints2)
+                    
+                    if test_volume1 is not None and test_volume2 is not None:
+                        test_monetary1 = test_volume1 * price1 * contract_size1
+                        test_monetary2 = test_volume2 * price2 * contract_size2
+                        test_margin1 = test_monetary1 / leverage1 if leverage1 > 0 else 0
+                        test_margin2 = test_monetary2 / leverage2 if leverage2 > 0 else 0
+                        test_total_margin = test_margin1 + test_margin2
+                        
+                        if test_total_margin <= max_position_size:
+                            volume1, volume2 = test_volume1, test_volume2
+                            monetary_value1, monetary_value2 = test_monetary1, test_monetary2
+                            actual_margin1, actual_margin2 = test_margin1, test_margin2
+                            total_margin_used = test_total_margin
+                            final_diff_pct = abs(monetary_value1 - monetary_value2) / max(monetary_value1, monetary_value2)
+                            logger.warning(f"  Forced volume reduction by {reduction_factor:.2f}: margin=${total_margin_used:.2f}, diff={final_diff_pct:.4f}")
+                            break
+                else:
+                    logger.error(f"Could not reduce volumes for {symbol1}-{symbol2} to fit within margin limit without violating minimum volume constraints")
+                    return None
+            
             logger.debug(f"  Final monetary values: {symbol1}=${monetary_value1:.2f}, {symbol2}=${monetary_value2:.2f}")
+            logger.debug(f"  Actual margin usage: {symbol1}=${actual_margin1:.2f}, {symbol2}=${actual_margin2:.2f}, total=${total_margin_used:.2f}")
+            logger.debug(f"  Target margin was: ${max_position_size:.2f}")
             logger.debug(f"  Final difference: {final_diff_pct:.4f} vs tolerance: {self.monetary_value_tolerance:.4f}")
             
             if final_diff_pct > self.monetary_value_tolerance:
-                logger.warning(f"Monetary value difference ({final_diff_pct:.4f}) exceeds tolerance ({self.monetary_value_tolerance:.4f}) for {symbol1}-{symbol2}")
-                return None
+                # For leverage-based calculations, be more lenient with tolerance for very different leverages
+                # Check if the difference is due to leverage mismatch rather than calculation error
+                if leverage1 and leverage2 and abs(leverage1 - leverage2) / max(leverage1, leverage2) > 0.5:
+                    # Large leverage difference - use a more lenient tolerance
+                    lenient_tolerance = min(0.10, self.monetary_value_tolerance * 2.0)  # Max 10% or 2x normal tolerance
+                    if final_diff_pct <= lenient_tolerance:
+                        logger.debug(f"Accepting {final_diff_pct:.4f} difference due to large leverage difference ({leverage1}x vs {leverage2}x)")
+                    else:
+                        logger.warning(f"Monetary value difference ({final_diff_pct:.4f}) exceeds lenient tolerance ({lenient_tolerance:.4f}) for {symbol1}-{symbol2}")
+                        return None
+                else:
+                    logger.warning(f"Monetary value difference ({final_diff_pct:.4f}) exceeds tolerance ({self.monetary_value_tolerance:.4f}) for {symbol1}-{symbol2}")
+                    return None
             
             logger.debug(f"  Successfully calculated balanced volumes with {final_diff_pct:.4f} difference")
             return volume1, volume2, monetary_value1, monetary_value2

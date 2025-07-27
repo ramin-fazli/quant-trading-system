@@ -35,6 +35,7 @@ from strategies.base_strategy import BaseStrategy, PairsStrategyInterface
 from utils.risk_manager import RiskManager, RiskLimits, CurrencyConverter
 from utils.portfolio_manager import PortfolioManager, PriceProvider
 from utils.signal_processor import SignalProcessor, PairState, TradingSignal
+from utils.ctrader_leverage import get_leverage_extractor, extract_symbol_leverage, validate_leverage_requirements, get_leverage_validation_summary
 from brokers.base_broker import BaseBroker
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,8 @@ try:
     from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import *
     from ctrader_open_api.messages.OpenApiMessages_pb2 import *
     from ctrader_open_api.messages.OpenApiModelMessages_pb2 import *
+    # Import specific classes that might not be in * imports
+    from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAGetDynamicLeverageByIDReq
     from twisted.internet import reactor, defer
     
     # Import specific classes to handle import issues
@@ -191,6 +194,9 @@ class CTraderRealTimeTrader(BaseBroker):
         # Determine if this is a pairs trading strategy
         from strategies.base_strategy import PairsStrategyInterface
         self.is_pairs_strategy = isinstance(self.strategy, PairsStrategyInterface)
+        
+        # Initialize leverage extractor after authentication
+        self.leverage_extractor = None
     
     def _setup_ctrader_currency_converter(self):
         """Setup CTrader-specific currency converter"""
@@ -231,6 +237,34 @@ class CTraderRealTimeTrader(BaseBroker):
                 return self.account_currency
         
         self.currency_converter = CTraderCurrencyConverter(self.account_currency, self)
+    
+    def _initialize_leverage_extractor(self, shared_client=None):
+        """Initialize the leverage extractor for symbol leverage data"""
+        try:
+            # Use same credentials as the main trader
+            use_demo = os.getenv('CTRADER_HOST_TYPE', 'demo').lower() == 'demo'
+            
+            self.leverage_extractor = get_leverage_extractor(
+                client_id=self.client_id,
+                client_secret=self.client_secret,
+                account_id=self.account_id,
+                access_token=self.access_token,
+                use_demo=use_demo,
+                shared_client=shared_client  # Pass the authenticated client
+            )
+            
+            if self.leverage_extractor:
+                if shared_client:
+                    logger.info("✅ CTrader leverage extractor initialized with SHARED CLIENT (optimal)")
+                else:
+                    logger.info("✅ CTrader leverage extractor initialized with separate client")
+            else:
+                logger.warning("⚠️ Failed to initialize leverage extractor, symbols without valid leverage will be excluded")
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Leverage extractor initialization failed: {e}")
+            logger.warning("Symbols without valid leverage will be excluded from trading")
+            self.leverage_extractor = None
     
     # Implementation of abstract methods from BaseBroker
     
@@ -375,6 +409,183 @@ class CTraderRealTimeTrader(BaseBroker):
                     spreads[symbol] = spread
         
         return spreads
+    
+    def get_symbol_leverage(self, symbol: str) -> Optional[float]:
+        """
+        Get leverage information for a specific symbol.
+        
+        Args:
+            symbol: Symbol name to get leverage for
+            
+        Returns:
+            Maximum leverage value or None if not available
+        """
+        if symbol in self.symbol_details:
+            return self.symbol_details[symbol].get('symbol_leverage')
+        return None
+    
+    def get_symbols_leverage(self, symbols: List[str] = None) -> Dict[str, float]:
+        """
+        Get leverage information for multiple symbols.
+        
+        Args:
+            symbols: List of symbol names (all symbols if None)
+            
+        Returns:
+            Dictionary mapping symbol names to leverage values
+        """
+        if symbols is None:
+            symbols = list(self.symbol_details.keys())
+        
+        leverages = {}
+        for symbol in symbols:
+            leverage = self.get_symbol_leverage(symbol)
+            if leverage is not None:
+                leverages[symbol] = leverage
+        
+        return leverages
+    
+    def get_leverage_extractor_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics from the leverage extractor.
+        
+        Returns:
+            Dictionary with extraction statistics or empty dict if extractor not available
+        """
+        if self.leverage_extractor:
+            try:
+                return self.leverage_extractor.get_extraction_stats()
+            except Exception as e:
+                logger.warning(f"Error getting leverage extractor stats: {e}")
+                return {}
+        return {}
+    
+    def refresh_symbol_leverage(self, symbol: str, force_api_call: bool = False) -> Optional[float]:
+        """
+        Refresh leverage information for a specific symbol.
+        
+        Args:
+            symbol: Symbol name to refresh leverage for
+            force_api_call: If True, bypass cache and make fresh API call
+            
+        Returns:
+            Updated leverage value or None if failed
+        """
+        if symbol not in self.symbol_details:
+            logger.warning(f"Symbol {symbol} not found in symbol details")
+            return None
+        
+        symbol_details = self.symbol_details[symbol]
+        leverage_id = symbol_details.get('leverageId')
+        
+        if leverage_id is None:
+            logger.debug(f"No leverageId for symbol {symbol}")
+            return symbol_details.get('symbol_leverage')
+        
+        if self.leverage_extractor:
+            try:
+                # Clear cache if force_api_call is True
+                if force_api_call:
+                    self.leverage_extractor.cache.invalidate(leverage_id)
+                
+                leverage_info = self.leverage_extractor.get_leverage_sync(
+                    leverage_id=leverage_id,
+                    symbol=symbol,
+                    use_cache=not force_api_call,
+                    timeout=10
+                )
+                
+                if leverage_info:
+                    symbol_details['symbol_leverage'] = leverage_info.max_leverage
+                    symbol_details['leverage_info'] = leverage_info.to_dict()
+                    symbol_details['leverage_source'] = 'CTRADER_API_REFRESH'
+                    logger.info(f"Refreshed leverage for {symbol}: {leverage_info.max_leverage}:1")
+                    return leverage_info.max_leverage
+                else:
+                    logger.warning(f"Failed to refresh leverage for {symbol}")
+                    
+            except Exception as e:
+                logger.error(f"Error refreshing leverage for {symbol}: {e}")
+        
+        return symbol_details.get('symbol_leverage')
+    
+    def batch_refresh_leverage(self, symbols: List[str] = None, force_api_call: bool = False) -> Dict[str, Optional[float]]:
+        """
+        Refresh leverage information for multiple symbols in batch.
+        
+        Args:
+            symbols: List of symbol names (all symbols if None)
+            force_api_call: If True, bypass cache and make fresh API calls
+            
+        Returns:
+            Dictionary mapping symbol names to updated leverage values
+        """
+        if symbols is None:
+            symbols = [s for s in self.symbol_details.keys() 
+                      if self.symbol_details[s].get('leverageId') is not None]
+        
+        results = {}
+        
+        if not self.leverage_extractor:
+            logger.warning("No leverage extractor available for batch refresh")
+            for symbol in symbols:
+                results[symbol] = self.get_symbol_leverage(symbol)
+            return results
+        
+        try:
+            # Get leverage IDs for batch processing
+            leverage_ids = []
+            symbol_to_leverage_id = {}
+            
+            for symbol in symbols:
+                if symbol in self.symbol_details:
+                    leverage_id = self.symbol_details[symbol].get('leverageId')
+                    if leverage_id is not None:
+                        leverage_ids.append(leverage_id)
+                        symbol_to_leverage_id[leverage_id] = symbol
+            
+            if not leverage_ids:
+                logger.info("No symbols with leverage IDs found for batch refresh")
+                return results
+            
+            logger.info(f"Batch refreshing leverage for {len(leverage_ids)} symbols...")
+            
+            # Clear cache if force_api_call is True
+            if force_api_call:
+                for leverage_id in leverage_ids:
+                    self.leverage_extractor.cache.invalidate(leverage_id)
+            
+            # Batch get leverage information
+            leverage_results = self.leverage_extractor.batch_get_leverage(
+                leverage_ids=leverage_ids,
+                symbols=[symbol_to_leverage_id[lid] for lid in leverage_ids],
+                use_cache=not force_api_call,
+                timeout=60
+            )
+            
+            # Update symbol details with results
+            for leverage_id, leverage_info in leverage_results.items():
+                symbol = symbol_to_leverage_id[leverage_id]
+                
+                if leverage_info:
+                    self.symbol_details[symbol]['symbol_leverage'] = leverage_info.max_leverage
+                    self.symbol_details[symbol]['leverage_info'] = leverage_info.to_dict()
+                    self.symbol_details[symbol]['leverage_source'] = 'CTRADER_API_BATCH'
+                    results[symbol] = leverage_info.max_leverage
+                    logger.debug(f"Batch updated leverage for {symbol}: {leverage_info.max_leverage}:1")
+                else:
+                    results[symbol] = self.symbol_details[symbol].get('symbol_leverage')
+                    logger.warning(f"Batch leverage refresh failed for {symbol}")
+            
+            logger.info(f"Batch leverage refresh completed: {len([r for r in results.values() if r is not None])}/{len(symbols)} successful")
+            
+        except Exception as e:
+            logger.error(f"Error in batch leverage refresh: {e}")
+            # Return current values as fallback
+            for symbol in symbols:
+                results[symbol] = self.get_symbol_leverage(symbol)
+        
+        return results
     
     def _is_market_open(self, symbol: str) -> bool:
         """
@@ -977,6 +1188,12 @@ class CTraderRealTimeTrader(BaseBroker):
                     request.positionId = kwargs.get('position_id')
                     request.volume = kwargs.get('volume')
                     return request
+            elif request_type == 'GET_DYNAMIC_LEVERAGE_BY_ID':
+                if globals().get('ProtoOAGetDynamicLeverageByIDReq'):
+                    request = ProtoOAGetDynamicLeverageByIDReq()
+                    request.ctidTraderAccountId = kwargs.get('account_id')
+                    request.leverageId = kwargs.get('leverage_id')
+                    return request
                     
         except Exception as e:
             logger.error(f"Error creating {request_type} request: {e}")
@@ -1311,6 +1528,11 @@ class CTraderRealTimeTrader(BaseBroker):
                 logger.info("Account authenticated with cTrader")
                 # Extract account details for verification
                 response = Protobuf.extract(message)
+                
+                # Initialize leverage extractor with shared authenticated client
+                if not self.leverage_extractor:
+                    self._initialize_leverage_extractor(shared_client=self.client)
+                
                 if not self.symbols_initialized:  # Only request once
                     self._get_symbols_list()
                     
@@ -1321,6 +1543,16 @@ class CTraderRealTimeTrader(BaseBroker):
             elif (message.payloadType == MESSAGE_TYPES.get('SYMBOL_BY_ID_RES', 2117) or
                   message.payloadType == 2117):
                 self._process_symbol_details(message)
+                
+            elif (message.payloadType == 2178):  # GET_DYNAMIC_LEVERAGE_BY_ID_RES
+                # Handle leverage response directly
+                logger.info(f"📡 Received leverage response (type 2178), processing directly")
+                self._handle_leverage_response(message)
+                
+            elif (message.payloadType == 2142):  # ERROR_RES - check if subscription-related
+                # Handle error response directly and filter out subscription errors
+                logger.warning(f"📡 Received error response (type 2142), processing directly")
+                self._handle_error_response(message)
                 
             elif (message.payloadType == MESSAGE_TYPES.get('TRENDBAR_RES', 2138) or
                   message.payloadType == 2138):
@@ -1417,6 +1649,139 @@ class CTraderRealTimeTrader(BaseBroker):
             import traceback
             logger.error(traceback.format_exc())
     
+    def _handle_leverage_response(self, message):
+        """Handle leverage data response directly in broker"""
+        try:
+            leverage_response = Protobuf.extract(message)
+            logger.debug("Processing leverage data response")
+            
+            # Debug: Log the structure of the response
+            logger.debug(f"Leverage response type: {type(leverage_response)}")
+            logger.debug(f"Leverage response attributes: {[attr for attr in dir(leverage_response) if not attr.startswith('_')]}")
+            
+            if hasattr(leverage_response, 'leverage'):
+                leverage_data = leverage_response.leverage
+                leverage_id = getattr(leverage_data, 'leverageId', None)
+                
+                logger.debug(f"Leverage data type: {type(leverage_data)}")
+                logger.debug(f"Leverage data attributes: {[attr for attr in dir(leverage_data) if not attr.startswith('_')]}")
+                logger.debug(f"Leverage ID: {leverage_id}")
+                
+                if leverage_id is not None:
+                    # Find ALL symbols with matching leverageId and update leverage info
+                    symbols_updated = []
+                    for symbol_name, symbol_details in self.symbol_details.items():
+                        if symbol_details.get('leverageId') == leverage_id:
+                            # Extract leverage information directly
+                            leverage_info = self._extract_leverage_from_response(leverage_data, leverage_id)
+                            if leverage_info:
+                                symbol_details['symbol_leverage'] = leverage_info.get('max_leverage')
+                                symbol_details['leverage_source'] = 'CTRADER_API'
+                                symbol_details['leverage_tiers'] = leverage_info.get('tiers', [])
+                                symbol_details['leverage_updated_at'] = time.time()
+                                
+                                symbols_updated.append(symbol_name)
+                    
+                    if symbols_updated:
+                        max_leverage = leverage_info.get('max_leverage') if leverage_info else 0
+                        if len(symbols_updated) == 1:
+                            logger.info(f"✅ Updated leverage for {symbols_updated[0]}: {max_leverage}:1")
+                        else:
+                            logger.info(f"✅ Updated leverage for {len(symbols_updated)} symbols (ID {leverage_id}): {max_leverage}:1")
+                            for symbol in symbols_updated:
+                                logger.debug(f"  - {symbol}: {max_leverage}:1")
+                    else:
+                        logger.warning(f"Received leverage response for ID {leverage_id} but no matching symbol found")
+                        # Log all symbols and their leverage IDs for debugging
+                        logger.debug("Available symbols and leverage IDs:")
+                        for sym_name, sym_details in self.symbol_details.items():
+                            logger.debug(f"  {sym_name}: leverageId={sym_details.get('leverageId')}")
+                else:
+                    logger.error("Leverage ID not found in response")
+            else:
+                logger.error("No leverage data in response")
+                
+        except Exception as e:
+            logger.error(f"Error processing leverage response: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    def _extract_leverage_from_response(self, leverage_data, leverage_id: int) -> Dict[str, Any]:
+        """Extract leverage information from CTrader leverage data"""
+        try:
+            # Extract tiers
+            tiers = []
+            max_leverage = 0
+            
+            # Try both 'tiers' and 'tier' field names as seen in working script
+            tier_list = None
+            if hasattr(leverage_data, 'tiers'):
+                tier_list = leverage_data.tiers
+                logger.debug(f"Found {len(tier_list)} leverage tiers in 'tiers' field")
+            elif hasattr(leverage_data, 'tier'):
+                tier_list = leverage_data.tier
+                logger.debug(f"Found {len(tier_list)} leverage tiers in 'tier' field")
+            else:
+                logger.warning(f"No tier data found in leverage response for ID {leverage_id}")
+                return None
+            
+            for i, tier in enumerate(tier_list):
+                # Get raw leverage value (in cents according to working script)
+                raw_leverage = getattr(tier, 'leverage', 0)
+                # Convert from cents to actual leverage value
+                actual_leverage = raw_leverage / 100 if raw_leverage > 0 else 0
+                
+                tier_info = {
+                    'leverage': actual_leverage,
+                    'raw_leverage': raw_leverage,
+                    'volume': getattr(tier, 'volume', 0),
+                    'minVolume': getattr(tier, 'minVolume', 0),
+                    'maxVolume': getattr(tier, 'maxVolume', 0)
+                }
+                tiers.append(tier_info)
+                
+                # Track maximum leverage
+                max_leverage = max(max_leverage, actual_leverage)
+                
+                logger.debug(f"Tier {i+1}: {actual_leverage}:1 leverage (raw: {raw_leverage}), "
+                           f"volume: {tier_info['volume']}")
+            
+            logger.info(f"📊 Extracted {len(tiers)} tiers, max leverage: {max_leverage}:1")
+            
+            return {
+                'leverage_id': leverage_id,
+                'max_leverage': max_leverage,
+                'tiers': tiers,
+                'extracted_at': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"Error extracting leverage info: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return None
+    
+    def _handle_error_response(self, message):
+        """Handle error response and filter out subscription-related errors"""
+        try:
+            error_response = Protobuf.extract(message)
+            error_code = getattr(error_response, 'errorCode', None)
+            description = getattr(error_response, 'description', 'Unknown error')
+            
+            # Filter out subscription-related errors that are expected
+            if error_code == 'ALREADY_SUBSCRIBED':
+                logger.debug(f"Subscription error (expected): {error_code} - {description}")
+                return
+            
+            # Only log serious errors
+            if error_code in ['INVALID_REQUEST', 'ACCESS_DENIED', 'CH_NOT_FOUND']:
+                logger.error(f"CTrader API Error {error_code}: {description}")
+            else:
+                logger.warning(f"CTrader API Warning {error_code}: {description}")
+                
+        except Exception as e:
+            logger.error(f"Error processing error response: {e}")
+    
     def _process_symbols_list(self, message):
         """Process the symbols list and initialize trading pairs"""
         logger.info("Processing symbols list...")
@@ -1506,6 +1871,13 @@ class CTraderRealTimeTrader(BaseBroker):
                 # Verify this is a symbol we actually need
                 if symbol_name not in required_symbols:
                     continue
+                
+                # DEBUG: Log available fields in the symbol object
+                logger.debug(f"DEBUG: Symbol {symbol_name} available fields: {[field for field in dir(symbol) if not field.startswith('_')]}")
+                
+                # DEBUG: Direct check for leverageId using getattr (like working script)
+                direct_leverage_id = getattr(symbol, 'leverageId', None)
+                logger.info(f"DEBUG: Direct getattr leverageId for {symbol_name}: {direct_leverage_id}")
                 
                 # Extract detailed symbol information with proper error handling
                 symbol_details = {}
@@ -1638,10 +2010,25 @@ class CTraderRealTimeTrader(BaseBroker):
                 if hasattr(symbol, 'tradingMode'):
                     symbol_details['trading_mode'] = symbol.tradingMode
                 
+                # Extract and store leverage information DIRECTLY (like working script)
+                # Use the same approach as the working ctrader_leverage_script.py
+                leverage_id = getattr(symbol, 'leverageId', None)
+                if leverage_id is not None:
+                    symbol_details['leverageId'] = leverage_id
+                    logger.info(f"✅ Found leverageId for {symbol_name}: {leverage_id}")
+                else:
+                    logger.error(f"❌ No leverageId found for {symbol_name}")
+                
+                # Extract and store leverage information
+                self._extract_symbol_leverage(symbol_details)
+                
                 self.symbol_details[symbol_name] = symbol_details
                 symbols_processed += 1
 
             logger.info(f"✅ Successfully processed detailed information for {symbols_processed}/{len(required_symbols)} required symbols")
+            
+            # NOTE: Leverage validation summary will be logged after background extraction completes
+            # This prevents false warnings during startup when leverage extraction is still pending
             
             # Log summary market status 
             market_status = self.get_market_status_summary()
@@ -1679,6 +2066,127 @@ class CTraderRealTimeTrader(BaseBroker):
             if not hasattr(self, '_pair_states_initialized'):
                 logger.warning("Proceeding with basic symbol information due to detailed info processing error")
                 self._finalize_initialization()
+    
+    def _extract_symbol_leverage(self, symbol_details: Dict[str, Any]):
+        """
+        Extract and store leverage information for a symbol.
+        
+        Uses a simple, direct approach similar to the working ctrader_leverage_script.py
+        
+        Args:
+            symbol_details: Dictionary containing symbol details including leverageId
+        """
+        try:
+            symbol_name = symbol_details.get('symbol_name', 'UNKNOWN')
+            leverage_id = symbol_details.get('leverageId')
+            
+            if leverage_id is None:
+                logger.debug(f"No leverageId found for symbol {symbol_name} - skipping leverage extraction")
+                # Don't disable trading, just mark as no leverage data
+                symbol_details['leverage_source'] = 'NO_LEVERAGE_ID'
+                symbol_details['symbol_leverage'] = None
+                return
+            
+            # Validate leverage ID
+            if not isinstance(leverage_id, int) or leverage_id <= 0:
+                logger.warning(f"Invalid leverageId ({leverage_id}) for symbol {symbol_name}")
+                symbol_details['leverage_source'] = 'INVALID_LEVERAGE_ID'
+                symbol_details['symbol_leverage'] = None
+                return
+            
+            # For now, skip API extraction during initialization to avoid blocking
+            # The system will work without leverage data initially
+            logger.info(f"Symbol {symbol_name}: leverageId={leverage_id} (API extraction deferred)")
+            symbol_details['leverageId'] = leverage_id
+            symbol_details['leverage_source'] = 'PENDING_API_EXTRACTION'
+            symbol_details['symbol_leverage'] = None  # Will be updated later
+            
+            # Schedule background extraction after initialization
+            if not hasattr(self, '_pending_leverage_extractions'):
+                self._pending_leverage_extractions = []
+            self._pending_leverage_extractions.append((symbol_name, leverage_id))
+                
+        except Exception as e:
+            symbol_name = symbol_details.get('symbol_name', 'UNKNOWN')
+            logger.error(f"Error setting up leverage extraction for symbol {symbol_name}: {e}")
+            symbol_details['leverage_source'] = f'EXCEPTION: {str(e)}'
+            symbol_details['symbol_leverage'] = None
+    
+    def get_tradeable_symbols(self) -> List[str]:
+        """
+        Get list of symbols that have valid leverage and can be traded.
+        
+        Returns:
+            List of symbol names that can be safely traded
+        """
+        tradeable_symbols = []
+        
+        for symbol_name, symbol_details in self.symbol_details.items():
+            # Skip symbols that are explicitly disabled
+            if symbol_details.get('trading_disabled', False):
+                continue
+                
+            # Skip symbols with leverage errors
+            if 'leverage_error' in symbol_details:
+                continue
+                
+            # Validate leverage requirements
+            if validate_leverage_requirements(symbol_details):
+                tradeable_symbols.append(symbol_name)
+        
+        return tradeable_symbols
+    
+    def get_excluded_symbols(self) -> Dict[str, str]:
+        """
+        Get symbols that are excluded from trading due to leverage issues.
+        
+        Returns:
+            Dictionary mapping symbol names to exclusion reasons
+        """
+        excluded_symbols = {}
+        
+        for symbol_name, symbol_details in self.symbol_details.items():
+            # Check if symbol is disabled
+            if symbol_details.get('trading_disabled', False):
+                reason = symbol_details.get('leverage_error', 'TRADING_DISABLED')
+                excluded_symbols[symbol_name] = reason
+            elif 'leverage_error' in symbol_details:
+                excluded_symbols[symbol_name] = symbol_details['leverage_error']
+            elif not validate_leverage_requirements(symbol_details):
+                excluded_symbols[symbol_name] = 'INVALID_LEVERAGE'
+        
+        return excluded_symbols
+    
+    def is_symbol_tradeable(self, symbol: str) -> bool:
+        """
+        Check if a specific symbol can be traded (has valid leverage).
+        
+        Args:
+            symbol: Symbol name to check
+            
+        Returns:
+            True if symbol can be traded, False otherwise
+        """
+        if symbol not in self.symbol_details:
+            logger.warning(f"Symbol {symbol} not found in symbol details")
+            return False
+        
+        symbol_details = self.symbol_details[symbol]
+        
+        # Check if explicitly disabled
+        if symbol_details.get('trading_disabled', False):
+            return False
+        
+        # Check for leverage errors
+        if 'leverage_error' in symbol_details:
+            return False
+        
+        # Validate leverage requirements
+        return validate_leverage_requirements(symbol_details)
+    
+    def _get_leverage_validation_summary(self) -> Dict[str, Any]:
+        """Get summary of leverage validation results"""
+        return get_leverage_validation_summary(self.symbol_details)
     
     def _update_symbol_spreads(self, symbols: List[str] = None):
         """Calculate and update spread information for symbols using real-time bid/ask data"""
@@ -1788,6 +2296,9 @@ class CTraderRealTimeTrader(BaseBroker):
         # Subscribe to real-time data
         self._subscribe_to_data()
         
+        # Start background leverage extraction for pending symbols
+        self._start_background_leverage_extraction()
+        
         # Start the trading loop now that we have real symbols
         if not self.trading_started:
             logger.info("🚀 Starting real trading loop with live cTrader data")
@@ -1796,6 +2307,91 @@ class CTraderRealTimeTrader(BaseBroker):
         
         # Start periodic market status monitoring (every 5 minutes)
         reactor.callLater(300, self._periodic_market_status_check)
+    
+    def _start_background_leverage_extraction(self):
+        """Start simple background leverage extraction following the working script pattern"""
+        
+        # Check if we have any pending extractions
+        if not hasattr(self, '_pending_leverage_extractions') or not self._pending_leverage_extractions:
+            logger.info("✅ No pending leverage extractions")
+            return
+        
+        def extract_leverage_simple():
+            """Simple leverage extraction following the working script pattern"""
+            try:
+                logger.info(f"🔄 Starting simple leverage extraction for {len(self._pending_leverage_extractions)} symbols...")
+                
+                for symbol_name, leverage_id in self._pending_leverage_extractions:
+                    try:
+                        logger.info(f"📡 Requesting leverage for {symbol_name} (ID: {leverage_id})")
+                        
+                        # Create leverage request directly (like working script)
+                        leverage_request = self._create_protobuf_request('GET_DYNAMIC_LEVERAGE_BY_ID',
+                                                                       account_id=self.account_id,
+                                                                       leverage_id=leverage_id)
+                        
+                        if leverage_request:
+                            # Send request and store symbol info for response handling
+                            if not hasattr(self, '_leverage_requests_pending'):
+                                self._leverage_requests_pending = {}
+                            
+                            self._leverage_requests_pending[leverage_id] = {
+                                'symbol_name': symbol_name,
+                                'request_time': time.time()
+                            }
+                            
+                            deferred = self.client.send(leverage_request)
+                            logger.info(f"✅ Leverage request sent for {symbol_name} (ID: {leverage_id})")
+                            
+                            # Add small delay between requests to avoid overwhelming API
+                            time.sleep(0.1)
+                        else:
+                            logger.error(f"❌ Failed to create leverage request for {symbol_name}")
+                            
+                    except Exception as e:
+                        logger.error(f"❌ Error requesting leverage for {symbol_name}: {e}")
+                
+                logger.info("✅ Background leverage extraction requests completed")
+                
+            except Exception as e:
+                logger.error(f"❌ Error in background leverage extraction: {e}")
+        
+        def log_leverage_validation_summary():
+            """Log leverage validation summary after extraction has completed"""
+            try:
+                leverage_summary = self._get_leverage_validation_summary()
+                logger.info("="*60)
+                logger.info("LEVERAGE VALIDATION SUMMARY (POST-EXTRACTION)")
+                logger.info("="*60)
+                logger.info(f"📈 Leverage Validation: {leverage_summary['valid_leverage']}/{leverage_summary['total_symbols']} symbols valid")
+                
+                if leverage_summary['invalid_leverage'] > 0:
+                    logger.error(f"❌ {leverage_summary['invalid_leverage']} symbols excluded from trading due to leverage issues:")
+                    for symbol in leverage_summary['invalid_symbols']:
+                        error_detail = leverage_summary['error_details'].get(symbol, 'UNKNOWN_ERROR')
+                        logger.error(f"   {symbol}: {error_detail}")
+                
+                if leverage_summary['extraction_errors'] > 0:
+                    logger.warning(f"⚠️ {leverage_summary['extraction_errors']} symbols had leverage extraction errors")
+                elif leverage_summary['valid_leverage'] == leverage_summary['total_symbols']:
+                    logger.info("✅ All symbols have valid leverage data - trading system fully operational")
+                    
+                    # Additional check if trading signals can now be generated
+                    if self._are_all_leverages_ready():
+                        logger.info("🎯 TRADING SIGNALS ENABLED - All leverage data validated")
+                        logger.info("   System will now generate trading signals when opportunities arise")
+                    else:
+                        logger.warning("⚠️ Leverage validation passed but some data still pending")
+                
+                logger.info("="*60)
+            except Exception as e:
+                logger.error(f"Error logging leverage validation summary: {e}")
+        
+        # Start extraction in 5 seconds to allow system to stabilize
+        reactor.callLater(5, extract_leverage_simple)
+        
+        # Log leverage validation summary after extraction has had time to complete (15 seconds)
+        reactor.callLater(15, log_leverage_validation_summary)
     
     def _initialize_pair_states(self):
         """Initialize trading states based on strategy requirements"""
@@ -2880,8 +3476,8 @@ class CTraderRealTimeTrader(BaseBroker):
             
             if current_time - self._last_strategy_check[symbol_name] >= self._min_check_interval:
                 self._last_strategy_check[symbol_name] = current_time
-                # Check for trading signals (but throttled)
-                self._check_trading_signals_throttled()
+                # Check for trading signals (with leverage readiness check)
+                self._check_trading_signals()
     
     def _check_trading_signals_throttled(self):
         """Throttled version of trading signal check to reduce computational load"""
@@ -2915,6 +3511,11 @@ class CTraderRealTimeTrader(BaseBroker):
     def _check_pair_trading_signals(self, pair_str: str):
         """Check trading signals for a specific pair"""
         try:
+            # CRITICAL SAFETY CHECK: Ensure leverage data is ready for this specific pair
+            symbol1, symbol2 = pair_str.split('-')
+            if not self._are_all_leverages_ready([symbol1, symbol2]):
+                return
+                
             state = self.pair_states.get(pair_str)
             if not state:
                 return
@@ -3157,8 +3758,54 @@ class CTraderRealTimeTrader(BaseBroker):
                 elif state['symbol2'] == symbol_name:
                     state['price2'].append((timestamp, price))
     
+    def _are_all_leverages_ready(self, symbols: List[str] = None) -> bool:
+        """
+        Check if all required symbols have valid leverage data.
+        Returns False if any symbol still has pending leverage extraction.
+        
+        Args:
+            symbols: Optional list of specific symbols to check. If None, checks all required symbols.
+        """
+        try:
+            if symbols is None:
+                symbols = self.strategy.get_required_symbols()
+            
+            for symbol in symbols:
+                if symbol not in self.symbol_details:
+                    return False
+                
+                symbol_details = self.symbol_details[symbol]
+                
+                # Check if leverage extraction is still pending
+                leverage_source = symbol_details.get('leverage_source', 'UNKNOWN')
+                if leverage_source == 'PENDING_API_EXTRACTION':
+                    return False
+                
+                # Check if leverage data is actually available
+                leverage = symbol_details.get('symbol_leverage')
+                if leverage is None or leverage <= 0:
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error checking leverage readiness: {e}")
+            return False
+    
     def _check_trading_signals(self):
         """Check for trading signals using the configured strategy - now delegates to throttled version"""
+        # CRITICAL: Do not generate any signals until all required symbols have valid leverage data
+        if not self._are_all_leverages_ready():
+            # Only log this occasionally to avoid spam
+            if not hasattr(self, '_leverage_wait_log_counter'):
+                self._leverage_wait_log_counter = 0
+            
+            self._leverage_wait_log_counter += 1
+            if self._leverage_wait_log_counter % 60 == 0:  # Log every 60 seconds
+                logger.debug("⏳ Waiting for leverage extraction to complete before generating trading signals...")
+                self._leverage_wait_log_counter = 0
+            return
+        
         self._check_trading_signals_throttled()
     
     def _execute_pair_trade(self, pair_str: str, direction: str) -> bool:
@@ -3240,12 +3887,6 @@ class CTraderRealTimeTrader(BaseBroker):
         value_diff_pct = abs(monetary1 - monetary2) / max(monetary1, monetary2)
         if value_diff_pct > self.config.monetary_value_tolerance:
             logger.error(f"Monetary value difference ({value_diff_pct:.4f}) exceeds tolerance ({self.config.monetary_value_tolerance:.4f}) for {pair_str}")
-            return False
-        
-        # Check position size limits
-        total_monetary = monetary1 + monetary2
-        if total_monetary > self.config.max_position_size:
-            logger.error(f"Position size for {pair_str} ({total_monetary:.2f}) exceeds max_position_size ({self.config.max_position_size})")
             return False
         
         # Determine trade directions
@@ -3396,10 +4037,10 @@ class CTraderRealTimeTrader(BaseBroker):
             return False
         
         # Convert volume to cTrader centilots format
-        # if symbol == 'XRPUSD':
-        #     broker_volume = int(round(volume * 10000))
-        # else:
-        broker_volume = int(round(volume * 100))
+        if symbol == 'XRPUSD':
+            broker_volume = int(round(volume * 10000))
+        else:
+            broker_volume = int(round(volume * 100))
         
         # Ensure minimum volume
         broker_volume = max(broker_volume, 1)
@@ -5327,6 +5968,14 @@ class CTraderRealTimeTrader(BaseBroker):
                     logger.warning("No known disconnect method found for cTrader client")
             except Exception as e:
                 logger.warning(f"Error disconnecting cTrader client: {e}")
+        
+        # Shutdown leverage extractor
+        if self.leverage_extractor:
+            try:
+                self.leverage_extractor.shutdown()
+                logger.debug("Leverage extractor shutdown complete")
+            except Exception as e:
+                logger.warning(f"Error shutting down leverage extractor: {e}")
         
         logger.info("CTrader real-time trading stopped")
     
