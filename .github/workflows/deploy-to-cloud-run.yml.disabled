@@ -1,0 +1,391 @@
+name: Build and Deploy to Google Cloud Run
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      deploy_live:
+        description: 'Deploy live trading service'
+        required: false
+        default: 'true'
+        type: boolean
+      deploy_backtest:
+        description: 'Deploy backtest job'
+        required: false
+        default: 'true'
+        type: boolean
+      force_refresh:
+        description: 'Force refresh data on next backtest'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  GAR_LOCATION: us-central1
+  GAR_REPOSITORY: trading-system
+  GCP_REGION: us-central1
+  LIVE_SERVICE_NAME: trading-live
+  BACKTEST_JOB_NAME: trading-backtest-job
+
+jobs:
+  build-images:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      live-image: ${{ steps.images.outputs.live-image }}
+      backtest-image: ${{ steps.images.outputs.backtest-image }}
+      
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Configure Docker for Artifact Registry
+      run: |
+        gcloud auth configure-docker ${{ env.GAR_LOCATION }}-docker.pkg.dev
+
+    - name: Generate image tags
+      id: tags
+      run: |
+        # Base image path
+        BASE_PATH="${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}"
+        
+        # Generate tags based on context
+        if [[ "${{ github.ref_type }}" == "tag" ]]; then
+          TAG="${{ github.ref_name }}"
+        elif [[ "${{ github.ref_name }}" == "main" ]] || [[ "${{ github.ref_name }}" == "master" ]]; then
+          TAG="latest"
+        else
+          TAG="${{ github.ref_name }}-${{ github.sha }}"
+        fi
+        
+        LIVE_IMAGE="${BASE_PATH}/trading-live:${TAG}"
+        BACKTEST_IMAGE="${BASE_PATH}/trading-backtest:${TAG}"
+        
+        echo "live-tag=${TAG}" >> $GITHUB_OUTPUT
+        echo "live-image=${LIVE_IMAGE}" >> $GITHUB_OUTPUT
+        echo "backtest-image=${BACKTEST_IMAGE}" >> $GITHUB_OUTPUT
+        
+        echo "🏷️ Generated tags:"
+        echo "  Live: ${LIVE_IMAGE}"
+        echo "  Backtest: ${BACKTEST_IMAGE}"
+
+    - name: Build Live Trading Image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile.live
+        platforms: linux/amd64
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.tags.outputs.live-image }}
+        build-args: |
+          BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          VCS_REF=${{ github.sha }}
+          BUILD_VERSION=${{ steps.tags.outputs.live-tag }}
+        cache-from: type=gha,scope=live
+        cache-to: type=gha,mode=max,scope=live
+
+    - name: Build Backtest Job Image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile.backtest
+        platforms: linux/amd64
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.tags.outputs.backtest-image }}
+        build-args: |
+          BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          VCS_REF=${{ github.sha }}
+          BUILD_VERSION=${{ steps.tags.outputs.live-tag }}
+        cache-from: type=gha,scope=backtest
+        cache-to: type=gha,mode=max,scope=backtest
+
+    - name: Set outputs
+      id: images
+      run: |
+        echo "live-image=${{ steps.tags.outputs.live-image }}" >> $GITHUB_OUTPUT
+        echo "backtest-image=${{ steps.tags.outputs.backtest-image }}" >> $GITHUB_OUTPUT
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build-images
+    if: github.event_name != 'pull_request'
+    
+    steps:
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Configure Docker for Artifact Registry
+      run: |
+        gcloud auth configure-docker ${{ env.GAR_LOCATION }}-docker.pkg.dev
+
+    - name: Scan Live Trading Image
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ needs.build-images.outputs.live-image }}
+        format: 'sarif'
+        output: 'trivy-live-results.sarif'
+
+    - name: Upload Live Trading Scan Results
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: 'trivy-live-results.sarif'
+        category: 'live-trading-image'
+
+  deploy-live-service:
+    name: Deploy Live Trading Service
+    runs-on: ubuntu-latest
+    needs: [build-images, security-scan]
+    if: |
+      always() && 
+      needs.build-images.result == 'success' && 
+      (needs.security-scan.result == 'success' || needs.security-scan.result == 'skipped') &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
+      (github.event.inputs.deploy_live != 'false')
+    
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Deploy to Cloud Run
+      run: |
+        echo "🚀 Deploying Live Trading Service..."
+        echo "Image: ${{ needs.build-images.outputs.live-image }}"
+        
+        gcloud run deploy ${{ env.LIVE_SERVICE_NAME }} \
+          --image=${{ needs.build-images.outputs.live-image }} \
+          --platform=managed \
+          --region=${{ env.GCP_REGION }} \
+          --allow-unauthenticated \
+          --port=8080 \
+          --memory=2Gi \
+          --cpu=1 \
+          --min-instances=1 \
+          --max-instances=2 \
+          --timeout=3600 \
+          --set-env-vars="TRADING_MODE=live,DATA_PROVIDER=${{ vars.DATA_PROVIDER || 'ctrader' }},BROKER=${{ vars.BROKER || 'ctrader' }},LOG_LEVEL=${{ vars.LOG_LEVEL || 'INFO' }}" \
+          --update-secrets="/app/.env=trading-secrets:latest" \
+          --execution-environment=gen2 \
+          --service-account="${{ secrets.GCP_PROJECT_ID }}@appspot.gserviceaccount.com"
+
+    - name: Verify Live Service Deployment
+      run: |
+        echo "🔍 Verifying deployment..."
+        
+        # Get service URL
+        SERVICE_URL=$(gcloud run services describe ${{ env.LIVE_SERVICE_NAME }} \
+          --region=${{ env.GCP_REGION }} \
+          --format="value(status.url)")
+        
+        echo "Service URL: $SERVICE_URL"
+        
+        # Wait for service to be ready
+        echo "⏳ Waiting for service to be ready..."
+        sleep 30
+        
+        # Health check
+        for i in {1..5}; do
+          if curl -f "${SERVICE_URL}/health" -m 10; then
+            echo "✅ Service is healthy!"
+            break
+          else
+            echo "⚠️ Health check failed (attempt $i/5)"
+            if [ $i -eq 5 ]; then
+              echo "❌ Service failed to become healthy"
+              exit 1
+            fi
+            sleep 15
+          fi
+        done
+        
+        echo "🎉 Live Trading Service deployed successfully!"
+        echo "URL: $SERVICE_URL"
+
+  deploy-backtest-job:
+    name: Deploy Backtest Job
+    runs-on: ubuntu-latest
+    needs: [build-images, security-scan]
+    if: |
+      always() && 
+      needs.build-images.result == 'success' && 
+      (needs.security-scan.result == 'success' || needs.security-scan.result == 'skipped') &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') &&
+      (github.event.inputs.deploy_backtest != 'false')
+    
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Update Backtest Job Definition
+      run: |
+        echo "📝 Updating backtest job definition..."
+        
+        # Update the job YAML with new image
+        sed -i "s|image: gcr.io/PROJECT_ID/trading-backtest:latest|image: ${{ needs.build-images.outputs.backtest-image }}|g" deploy/trading-backtest-job.yaml
+        sed -i "s|PROJECT_ID|${{ secrets.GCP_PROJECT_ID }}|g" deploy/trading-backtest-job.yaml
+        
+        echo "Updated job definition:"
+        cat deploy/trading-backtest-job.yaml
+
+    - name: Deploy Backtest Job
+      run: |
+        echo "🚀 Deploying Backtest Job..."
+        
+        gcloud run jobs replace deploy/trading-backtest-job.yaml \
+          --region=${{ env.GCP_REGION }}
+
+    - name: Verify Backtest Job Deployment
+      run: |
+        echo "🔍 Verifying job deployment..."
+        
+        gcloud run jobs describe ${{ env.BACKTEST_JOB_NAME }} \
+          --region=${{ env.GCP_REGION }} \
+          --format="table(metadata.name,spec.template.spec.template.spec.containers[0].image,metadata.creationTimestamp)"
+        
+        echo "✅ Backtest Job updated successfully!"
+
+  update-scheduler:
+    name: Update Scheduler
+    runs-on: ubuntu-latest
+    needs: [deploy-backtest-job]
+    if: |
+      always() && 
+      needs.deploy-backtest-job.result == 'success' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    
+    steps:
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Update Daily Scheduler
+      run: |
+        echo "⏰ Updating daily scheduler..."
+        
+        # Check if scheduler exists
+        if gcloud scheduler jobs describe trading-backtest-daily --location=${{ env.GCP_REGION }} >/dev/null 2>&1; then
+          echo "📅 Scheduler exists, no update needed"
+        else
+          echo "📅 Creating daily scheduler..."
+          
+          FORCE_REFRESH_VALUE="${{ github.event.inputs.force_refresh || 'false' }}"
+          
+          gcloud scheduler jobs create http trading-backtest-daily \
+            --location=${{ env.GCP_REGION }} \
+            --schedule="0 6 * * *" \
+            --time-zone="UTC" \
+            --uri="https://${{ env.GCP_REGION }}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${{ secrets.GCP_PROJECT_ID }}/jobs/${{ env.BACKTEST_JOB_NAME }}:run" \
+            --http-method=POST \
+            --oauth-service-account-email="${{ secrets.GCP_PROJECT_ID }}@appspot.gserviceaccount.com" \
+            --headers="Content-Type=application/json" \
+            --message-body="{\"spec\":{\"template\":{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"env\":[{\"name\":\"FORCE_REFRESH\",\"value\":\"${FORCE_REFRESH_VALUE}\"}]}]}}}}}}"
+        fi
+        
+        echo "✅ Scheduler configuration complete"
+
+  deployment-summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [build-images, deploy-live-service, deploy-backtest-job, update-scheduler]
+    if: always()
+    
+    steps:
+    - name: Generate Deployment Summary
+      run: |
+        echo "# 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        echo "## 📊 Status" >> $GITHUB_STEP_SUMMARY
+        echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Build Images | ${{ needs.build-images.result == 'success' && '✅ Success' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Live Service | ${{ needs.deploy-live-service.result == 'success' && '✅ Deployed' || needs.deploy-live-service.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Backtest Job | ${{ needs.deploy-backtest-job.result == 'success' && '✅ Deployed' || needs.deploy-backtest-job.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Scheduler | ${{ needs.update-scheduler.result == 'success' && '✅ Updated' || needs.update-scheduler.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [[ "${{ needs.build-images.result }}" == "success" ]]; then
+          echo "## 🐳 Images Built" >> $GITHUB_STEP_SUMMARY
+          echo "- **Live Trading**: \`${{ needs.build-images.outputs.live-image }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Backtest Job**: \`${{ needs.build-images.outputs.backtest-image }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [[ "${{ needs.deploy-live-service.result }}" == "success" ]]; then
+          echo "## 🌐 Live Service" >> $GITHUB_STEP_SUMMARY
+          echo "- Service: \`${{ env.LIVE_SERVICE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Region: \`${{ env.GCP_REGION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Mode: \`live\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [[ "${{ needs.deploy-backtest-job.result }}" == "success" ]]; then
+          echo "## 📈 Backtest Job" >> $GITHUB_STEP_SUMMARY
+          echo "- Job: \`${{ env.BACKTEST_JOB_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Schedule: \`Daily at 6:00 AM UTC\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Manual trigger: \`gcloud run jobs execute ${{ env.BACKTEST_JOB_NAME }} --region=${{ env.GCP_REGION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "## 📋 Management Commands" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+        echo "# View live service logs" >> $GITHUB_STEP_SUMMARY
+        echo "gcloud logging read 'resource.type=cloud_run_revision AND resource.labels.service_name=${{ env.LIVE_SERVICE_NAME }}' --limit=50" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "# Run manual backtest" >> $GITHUB_STEP_SUMMARY
+        echo "gcloud run jobs execute ${{ env.BACKTEST_JOB_NAME }} --region=${{ env.GCP_REGION }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "# Check service status" >> $GITHUB_STEP_SUMMARY
+        echo "gcloud run services list --region=${{ env.GCP_REGION }}" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

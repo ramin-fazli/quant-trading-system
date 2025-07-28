@@ -66,18 +66,6 @@ def _load_pairs_from_env() -> List[str]:
             print(f"   💡 You can create this file with your trading pairs in JSON format")
     except Exception as e:
         print(f"⚠️  Error loading pairs from JSON file: {e}")
-    
-    # Third priority: Default pairs if nothing else works
-    default_pairs = [
-        'BTCUSD-ETHUSD',
-        'BTCUSD-SOLUSD', 
-        'ETHUSD-SOLUSD',
-        'BTCUSD-XRPUSD',
-        'ETHUSD-XRPUSD'
-    ]
-    print(f"⚠️  Using default trading pairs ({len(default_pairs)} pairs)")
-    print(f"   💡 Set TRADING_PAIRS environment variable or create config/pairs.json")
-    return default_pairs
 
 
 def _parse_mt5_login() -> Optional[int]:

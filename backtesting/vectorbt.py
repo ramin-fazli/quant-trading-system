@@ -11,7 +11,14 @@ import vectorbt as vbt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 from config import TradingConfig
-from data.mt5 import MT5DataManager
+from data.ctrader import CTraderDataManager
+try:
+    # Data providers
+    from data.mt5 import MT5DataManager
+    # Brokers
+    from brokers.mt5 import MT5RealTimeTrader
+except ImportError:
+    mt5 = None
 from strategies.pairs_trading import OptimizedPairsStrategy
 
 def get_mt5_config():
@@ -43,7 +50,7 @@ warnings.filterwarnings("ignore")
 class VectorBTBacktester:
     """High-performance vectorbt-based backtesting engine"""
     
-    def __init__(self, config: TradingConfig, data_manager: MT5DataManager):
+    def __init__(self, config: TradingConfig, data_manager: CTraderDataManager):
         self.config = config
         self.data_manager = data_manager
         self.strategy = OptimizedPairsStrategy(config, data_manager)

@@ -1,0 +1,62 @@
+FROM python:3.11-slim as base
+
+# Set environment variables for Python optimization
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/app
+
+# Install system dependencies (minimal for backtest)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    gcc \
+    g++ \
+    make \
+    libpq-dev \
+    pkg-config \
+    default-libmysqlclient-dev \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Create app user
+RUN groupadd -r app -g 1000 && useradd -r -g app -u 1000 -m -s /bin/bash app
+
+WORKDIR /app
+
+# Copy and install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create necessary directories
+RUN mkdir -p logs backtest_reports data state_fallback cache config && \
+    chown -R app:app /app && \
+    chmod -R 755 /app
+
+USER app
+
+# Backtest job startup script
+RUN echo '#!/bin/bash\n\
+set -e\n\
+echo "📈 Starting Backtest Job..."\n\
+echo "Data Provider: ${DATA_PROVIDER:-ctrader}"\n\
+echo "Broker: ${BROKER:-ctrader}"\n\
+echo "Force Refresh: ${FORCE_REFRESH:-false}"\n\
+\n\
+# Run backtest and exit when complete\n\
+if [ "${FORCE_REFRESH}" = "true" ]; then\n\
+    python -m scripts.pair_trading.main --mode backtest --data-provider ${DATA_PROVIDER:-ctrader} --broker ${BROKER:-ctrader} --force-refresh\n\
+else\n\
+    python -m scripts.pair_trading.main --mode backtest --data-provider ${DATA_PROVIDER:-ctrader} --broker ${BROKER:-ctrader}\n\
+fi\n\
+\n\
+echo "✅ Backtest completed successfully"\n\
+exit 0\n\
+' > /app/entrypoint.backtest.sh && chmod +x /app/entrypoint.backtest.sh
+
+ENTRYPOINT ["/app/entrypoint.backtest.sh"]

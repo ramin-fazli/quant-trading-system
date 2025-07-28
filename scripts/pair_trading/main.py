@@ -121,7 +121,6 @@ try:
     from brokers.mt5 import MT5RealTimeTrader
 except ImportError:
     mt5 = None
-    temp_logger.warning("MT5 module not available")
 
 try:
     from data.ctrader import CTraderDataManager
