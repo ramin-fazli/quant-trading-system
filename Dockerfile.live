@@ -5,7 +5,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    TRADING_MODE=live \
+    DATA_PROVIDER=ctrader \
+    BROKER=ctrader \
+    TRADING_PAIRS="XAUUSD-XAGUSD,XAUUSD-XPTUSD,XAUUSD-XPDUSD,XAUUSD-Copper,BTCUSD-ETHUSD,BTCUSD-SOLUSD,ETHUSD-SOLUSD,BTCUSD-XRPUSD,ETHUSD-XRPUSD" \
+    DASHBOARD_PORT=8050
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -36,8 +41,13 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
 # Copy application code
 COPY . .
 
-# Create necessary directories
+# Create necessary directories and default config files
 RUN mkdir -p logs backtest_reports data state_fallback cache config && \
+    echo '{"trading_pairs":["XAUUSD-XAGUSD","XAUUSD-XPTUSD","XAUUSD-XPDUSD","XAUUSD-Copper","BTCUSD-ETHUSD","BTCUSD-SOLUSD","ETHUSD-SOLUSD","BTCUSD-XRPUSD","ETHUSD-XRPUSD"]}' > config/pairs.json && \
+    echo '# Default environment variables for Docker deployment' > .env && \
+    echo 'TRADING_MODE=live' >> .env && \
+    echo 'DATA_PROVIDER=ctrader' >> .env && \
+    echo 'BROKER=ctrader' >> .env && \
     chown -R app:app /app && \
     chmod -R 755 /app
 
@@ -69,9 +79,9 @@ class HealthHandler(BaseHTTPRequestHandler):\n\
         else:\n\
             self.send_response(404)\n\
             self.end_headers()\n\
-server = HTTPServer((\"0.0.0.0\", 8080), HealthHandler)\n\
+server = HTTPServer((\"0.0.0.0\", 8050), HealthHandler)\n\
 threading.Thread(target=server.serve_forever, daemon=True).start()\n\
-print(\"Health endpoint started on :8080\")" &\n\
+print(\"Health endpoint started on :8050\")" &\n\
 \n\
 # Start the main trading application\n\
 exec python -m scripts.pair_trading.main --mode live --data-provider ${DATA_PROVIDER:-ctrader} --broker ${BROKER:-ctrader}\n\

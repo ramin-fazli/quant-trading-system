@@ -1246,6 +1246,9 @@ class CTraderRealTimeTrader(BaseBroker):
     def _setup_client(self) -> bool:
         """Setup cTrader API client with proper callbacks"""
         try:
+            # Setup global error handler for unhandled Twisted errors
+            self._setup_global_error_handler()
+            
             # Get host based on environment variable
             host_type = os.getenv('CTRADER_HOST_TYPE', 'Live').lower()
             if host_type == 'demo':
@@ -1271,6 +1274,32 @@ class CTraderRealTimeTrader(BaseBroker):
             logger.error(f"Error setting up cTrader client: {e}")
             return False
     
+    def _setup_global_error_handler(self):
+        """Setup global handler for unhandled Twisted deferred errors"""
+        try:
+            from twisted.internet import defer
+            from twisted.internet.defer import CancelledError, TimeoutError
+            
+            def global_error_handler(failure):
+                """Handle unhandled deferred errors globally"""
+                if isinstance(failure.value, (CancelledError, TimeoutError)):
+                    if not self.is_trading:
+                        # Expected during shutdown - suppress these
+                        return
+                    else:
+                        logger.debug(f"Unhandled timeout/cancellation during trading: {failure.type.__name__}")
+                else:
+                    logger.warning(f"Unhandled deferred error: {failure}")
+            
+            # Set global error handler if not already set
+            if not hasattr(defer, '_previous_unhandled_error_handler'):
+                defer._previous_unhandled_error_handler = defer._unhandledErrorHandler
+                defer.setUnhandledErrorHandler(global_error_handler)
+                logger.debug("Global deferred error handler installed")
+                
+        except Exception as e:
+            logger.warning(f"Failed to setup global error handler: {e}")
+    
     def _on_connected(self, client):
         """Callback when client connects to cTrader"""
         logger.info("Connected to cTrader API")
@@ -1285,8 +1314,19 @@ class CTraderRealTimeTrader(BaseBroker):
             threading.Timer(5.0, self._retry_connection).start()
     
     def _on_error(self, failure):
-        """Handle connection errors"""
-        logger.error(f"cTrader API error: {failure}")
+        """Handle connection errors with improved timeout and cancellation handling"""
+        from twisted.internet.defer import CancelledError, TimeoutError
+        
+        # Handle cancellation and timeout errors gracefully during shutdown
+        if isinstance(failure.value, (CancelledError, TimeoutError)):
+            if not self.is_trading:
+                # This is expected during shutdown - log at debug level
+                logger.debug(f"cTrader operation cancelled/timed out during shutdown: {failure.type.__name__}")
+                return
+            else:
+                logger.warning(f"cTrader operation timeout: {failure.type.__name__}")
+        else:
+            logger.error(f"cTrader API error: {failure}")
     
     def _retry_connection(self):
         """Retry connection to cTrader API"""
@@ -1545,13 +1585,31 @@ class CTraderRealTimeTrader(BaseBroker):
                 self._process_symbol_details(message)
                 
             elif (message.payloadType == 2178):  # GET_DYNAMIC_LEVERAGE_BY_ID_RES
-                # Handle leverage response directly
-                logger.info(f"📡 Received leverage response (type 2178), processing directly")
+                # Handle leverage response directly but limit logging
+                if not hasattr(self, '_leverage_response_count'):
+                    self._leverage_response_count = 0
+                self._leverage_response_count += 1
+                
+                # Only log every 10th leverage response to reduce spam
+                if self._leverage_response_count % 10 == 1 or self._leverage_response_count <= 5:
+                    logger.info(f"📡 Received leverage response (type 2178), processing directly [{self._leverage_response_count}]")
+                elif self._leverage_response_count % 50 == 0:
+                    logger.info(f"📡 Processed {self._leverage_response_count} leverage responses...")
+                
                 self._handle_leverage_response(message)
                 
             elif (message.payloadType == 2142):  # ERROR_RES - check if subscription-related
                 # Handle error response directly and filter out subscription errors
-                logger.warning(f"📡 Received error response (type 2142), processing directly")
+                if not hasattr(self, '_error_response_count'):
+                    self._error_response_count = 0
+                self._error_response_count += 1
+                
+                # Only log first few error responses to reduce spam
+                if self._error_response_count <= 5:
+                    logger.warning(f"📡 Received error response (type 2142), processing directly [{self._error_response_count}]")
+                elif self._error_response_count % 20 == 0:
+                    logger.warning(f"📡 Processed {self._error_response_count} error responses (logging reduced to prevent spam)")
+                
                 self._handle_error_response(message)
                 
             elif (message.payloadType == MESSAGE_TYPES.get('TRENDBAR_RES', 2138) or
@@ -1746,7 +1804,7 @@ class CTraderRealTimeTrader(BaseBroker):
                 logger.debug(f"Tier {i+1}: {actual_leverage}:1 leverage (raw: {raw_leverage}), "
                            f"volume: {tier_info['volume']}")
             
-            logger.info(f"📊 Extracted {len(tiers)} tiers, max leverage: {max_leverage}:1")
+            logger.debug(f"📊 Extracted {len(tiers)} tiers, max leverage: {max_leverage}:1")
             
             return {
                 'leverage_id': leverage_id,
@@ -5943,21 +6001,42 @@ class CTraderRealTimeTrader(BaseBroker):
             logger.error(f"Error checking exit conditions for {pair_str}: {e}")
 
     def stop_trading(self):
-        """Stop real-time trading"""
+        """Stop real-time trading with improved error handling"""
+        logger.info("Initiating CTrader trading shutdown...")
         self.is_trading = False
         
         # Wait for trading thread to stop
         if self.trading_thread and self.trading_thread.is_alive():
             logger.info("Waiting for trading thread to stop...")
             self.trading_thread.join(timeout=10)
+            if self.trading_thread.is_alive():
+                logger.warning("Trading thread did not stop within timeout")
         
-        # Unsubscribe from data
-        for symbol in list(self.subscribed_symbols):
-            self._unsubscribe_from_spots(symbol)
+        # Shutdown leverage extractor first to stop ongoing requests
+        if self.leverage_extractor:
+            try:
+                logger.info("Shutting down leverage extractor...")
+                self.leverage_extractor.shutdown()
+                logger.debug("Leverage extractor shutdown complete")
+            except Exception as e:
+                logger.warning(f"Error shutting down leverage extractor: {e}")
         
-        # Disconnect client - handle different disconnect methods
+        # Unsubscribe from data with error handling
+        if self.subscribed_symbols:
+            logger.info(f"Unsubscribing from {len(self.subscribed_symbols)} symbols...")
+            for symbol in list(self.subscribed_symbols):
+                try:
+                    self._unsubscribe_from_spots(symbol)
+                except Exception as e:
+                    logger.debug(f"Error unsubscribing from {symbol}: {e}")
+        
+        # Cancel any pending deferreds to prevent timeout errors
+        self._cancel_pending_requests()
+        
+        # Disconnect client with improved error handling
         if self.client:
             try:
+                logger.info("Disconnecting cTrader client...")
                 if hasattr(self.client, 'disconnect'):
                     self.client.disconnect()
                 elif hasattr(self.client, 'transport') and hasattr(self.client.transport, 'loseConnection'):
@@ -5966,21 +6045,57 @@ class CTraderRealTimeTrader(BaseBroker):
                     self.client.stopService()
                 else:
                     logger.warning("No known disconnect method found for cTrader client")
+                    
+                # Give a moment for clean disconnection
+                import time
+                time.sleep(0.5)
+                    
             except Exception as e:
                 logger.warning(f"Error disconnecting cTrader client: {e}")
         
-        # Shutdown leverage extractor
-        if self.leverage_extractor:
-            try:
-                self.leverage_extractor.shutdown()
-                logger.debug("Leverage extractor shutdown complete")
-            except Exception as e:
-                logger.warning(f"Error shutting down leverage extractor: {e}")
+        # Restore original error handler
+        self._cleanup_global_error_handler()
         
         logger.info("CTrader real-time trading stopped")
     
+    def _cleanup_global_error_handler(self):
+        """Restore original global error handler"""
+        try:
+            from twisted.internet import defer
+            if hasattr(defer, '_previous_unhandled_error_handler'):
+                defer.setUnhandledErrorHandler(defer._previous_unhandled_error_handler)
+                delattr(defer, '_previous_unhandled_error_handler')
+                logger.debug("Global deferred error handler restored")
+        except Exception as e:
+            logger.debug(f"Error restoring global error handler: {e}")
+    
+    def _cancel_pending_requests(self):
+        """Cancel pending requests to prevent timeout errors"""
+        try:
+            # Cancel execution requests
+            if hasattr(self, 'execution_requests'):
+                pending_count = len(self.execution_requests)
+                if pending_count > 0:
+                    logger.info(f"Cancelling {pending_count} pending execution requests...")
+                    for request_id in list(self.execution_requests.keys()):
+                        try:
+                            deferred = self.execution_requests.pop(request_id, None)
+                            if deferred and not deferred.called:
+                                deferred.cancel()
+                        except Exception as e:
+                            logger.debug(f"Error cancelling request {request_id}: {e}")
+            
+            # Clear other pending operations
+            if hasattr(self, 'pending_pair_trades'):
+                self.pending_pair_trades.clear()
+            if hasattr(self, 'pending_close_positions'):
+                self.pending_close_positions.clear()
+                
+        except Exception as e:
+            logger.warning(f"Error cancelling pending requests: {e}")
+    
     def _unsubscribe_from_spots(self, symbol):
-        """Unsubscribe from spot price updates"""
+        """Unsubscribe from spot price updates with improved error handling"""
         if symbol in self.symbols_map and symbol in self.subscribed_symbols:
             symbol_id = self.symbols_map[symbol]
             
@@ -5990,14 +6105,35 @@ class CTraderRealTimeTrader(BaseBroker):
             
             if request is None:
                 logger.error(f"Failed to create unsubscribe request for {symbol}")
+                # Still remove from subscribed symbols even if request failed
+                self.subscribed_symbols.discard(symbol)
                 return
             
             try:
                 deferred = self.client.send(request)
-                deferred.addErrback(lambda f: logger.debug(f"Unsubscribe error: {f}"))
+                
+                # Add error handling to prevent hanging during shutdown
+                def error_handler(failure):
+                    logger.debug(f"Unsubscribe error for {symbol}: {failure}")
+                    return None  # Ignore errors during shutdown
+                
+                deferred.addErrback(error_handler)
+                
+                # Add timeout using reactor.callLater to avoid hanging
+                def timeout_handler():
+                    if not deferred.called:
+                        logger.debug(f"Unsubscribe timeout for {symbol}, cancelling...")
+                        deferred.cancel()
+                
+                reactor.callLater(2.0, timeout_handler)
+                
                 self.subscribed_symbols.discard(symbol)
                 logger.debug(f"Unsubscribed from spot prices for {symbol}")
+                
             except Exception as e:
+                logger.debug(f"Error unsubscribing from {symbol}: {e}")
+                # Still remove from subscribed symbols even if unsubscribe failed
+                self.subscribed_symbols.discard(symbol)
                 logger.error(f"Error unsubscribing from {symbol}: {e}")
     
     def get_portfolio_status(self) -> Dict[str, Any]:
