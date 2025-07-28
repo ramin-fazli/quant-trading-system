@@ -1,6 +1,6 @@
 """
 Enhanced Pairs Trading System v3 with Configurable Data Provider and Broker
-===========================================================================
+============================================================================
 
 This script provides a comprehensive trading system that:
 - Allows selection of data provider (CTrader or MT5) for all data operations
