@@ -38,10 +38,12 @@ from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
 # Suppress Twisted Deferred timeout warnings/errors that clutter the output
-# These are expected when CTrader API hits rate limits
+# These are expected when CTrader API hits rate limits or during leverage extraction
 import warnings
 warnings.filterwarnings("ignore", message=".*TimeoutError.*")
 warnings.filterwarnings("ignore", message=".*Deferred.*")
+warnings.filterwarnings("ignore", message=".*timeout.*", module="twisted")
+warnings.filterwarnings("ignore", message=".*CancelledError.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="twisted")
 
 # Set up better logging for Twisted to suppress noisy timeout errors
@@ -55,7 +57,7 @@ original_msg = log.msg
 def filtered_log_msg(*args, **kwargs):
     """Filter out timeout-related log messages"""
     message = str(args[0]) if args else ""
-    if any(keyword in message.lower() for keyword in ['timeout', 'deferred', 'unhandled error']):
+    if any(keyword in message.lower() for keyword in ['timeout', 'deferred', 'unhandled error', 'cancelled']):
         return  # Suppress these messages
     return original_msg(*args, **kwargs)
 

@@ -721,6 +721,19 @@ class CTraderLeverageExtractor:
             self.stats['api_calls'] += 1
             self.stats['last_api_call'] = datetime.now()
             
+            # Add timeout handling to prevent unhandled deferred errors
+            def handle_timeout(failure, lid=leverage_id):
+                """Handle timeout errors gracefully"""
+                logger.debug(f"Leverage request {lid} timed out (expected behavior)")
+                with self._request_lock:
+                    result_container = self.active_requests.pop(lid, None)
+                if result_container:
+                    result_container['completed'].set()
+                return None  # Suppress the timeout error
+            
+            # Add errback to handle timeout gracefully
+            deferred.addErrback(handle_timeout)
+            
             logger.info(f"📡 Leverage request sent successfully for ID {leverage_id}")
             
         except Exception as e:

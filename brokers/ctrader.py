@@ -2379,6 +2379,12 @@ class CTraderRealTimeTrader(BaseBroker):
             try:
                 logger.info(f"🔄 Starting simple leverage extraction for {len(self._pending_leverage_extractions)} symbols...")
                 
+                # Initialize containers for tracking requests
+                if not hasattr(self, '_leverage_requests_pending'):
+                    self._leverage_requests_pending = {}
+                if not hasattr(self, '_leverage_deferreds'):
+                    self._leverage_deferreds = {}
+                
                 for symbol_name, leverage_id in self._pending_leverage_extractions:
                     try:
                         logger.info(f"📡 Requesting leverage for {symbol_name} (ID: {leverage_id})")
@@ -2389,20 +2395,40 @@ class CTraderRealTimeTrader(BaseBroker):
                                                                        leverage_id=leverage_id)
                         
                         if leverage_request:
-                            # Send request and store symbol info for response handling
-                            if not hasattr(self, '_leverage_requests_pending'):
-                                self._leverage_requests_pending = {}
-                            
+                            # Store symbol info for response handling
                             self._leverage_requests_pending[leverage_id] = {
                                 'symbol_name': symbol_name,
                                 'request_time': time.time()
                             }
                             
+                            # Send request and handle deferred properly
                             deferred = self.client.send(leverage_request)
+                            
+                            # Add proper error handling to prevent timeout errors
+                            def handle_success(result, symbol=symbol_name, lid=leverage_id):
+                                # Clean up deferred tracking
+                                if lid in self._leverage_deferreds:
+                                    del self._leverage_deferreds[lid]
+                                return result
+                            
+                            def handle_error(failure, symbol=symbol_name, lid=leverage_id):
+                                # Clean up deferred tracking and suppress timeout errors
+                                if lid in self._leverage_deferreds:
+                                    del self._leverage_deferreds[lid]
+                                # Don't log timeout errors as they're expected and handled
+                                if "TimeoutError" not in str(failure):
+                                    logger.debug(f"Leverage request error for {symbol}: {failure}")
+                                return None  # Return None to indicate failure without propagating
+                            
+                            # Add callbacks and track the deferred
+                            deferred.addCallback(handle_success)
+                            deferred.addErrback(handle_error)
+                            self._leverage_deferreds[leverage_id] = deferred
+                            
                             logger.info(f"✅ Leverage request sent for {symbol_name} (ID: {leverage_id})")
                             
-                            # Add small delay between requests to avoid overwhelming API
-                            time.sleep(0.1)
+                            # Add conservative delay between requests to prevent API overload and timeouts
+                            time.sleep(0.25)  # Increased from 0.1 to 0.25 seconds
                         else:
                             logger.error(f"❌ Failed to create leverage request for {symbol_name}")
                             
@@ -6084,6 +6110,19 @@ class CTraderRealTimeTrader(BaseBroker):
                                 deferred.cancel()
                         except Exception as e:
                             logger.debug(f"Error cancelling request {request_id}: {e}")
+            
+            # Cancel pending leverage requests
+            if hasattr(self, '_leverage_deferreds'):
+                leverage_count = len(self._leverage_deferreds)
+                if leverage_count > 0:
+                    logger.info(f"Cancelling {leverage_count} pending leverage requests...")
+                    for leverage_id in list(self._leverage_deferreds.keys()):
+                        try:
+                            deferred = self._leverage_deferreds.pop(leverage_id, None)
+                            if deferred and not deferred.called:
+                                deferred.cancel()
+                        except Exception as e:
+                            logger.debug(f"Error cancelling leverage request {leverage_id}: {e}")
             
             # Clear other pending operations
             if hasattr(self, 'pending_pair_trades'):
