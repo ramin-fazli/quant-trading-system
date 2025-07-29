@@ -65,7 +65,9 @@ sudo apt-get install -y \
     lsb-release \
     ufw \
     fail2ban \
-    logrotate
+    logrotate \
+    cron \
+    bc
 
 # Install Docker
 if ! command -v docker &> /dev/null; then
@@ -288,7 +290,18 @@ sudo chmod +x /usr/local/bin/trading-system-monitor.sh
 
 # Set up cron job for monitoring
 log "⏰ Setting up monitoring cron job..."
-(crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/trading-system-monitor.sh") | crontab -
+
+# Ensure cron service is running
+sudo systemctl enable cron
+sudo systemctl start cron
+
+# Add monitoring cron job with error handling
+if command -v crontab &> /dev/null; then
+    (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/bin/trading-system-monitor.sh") | crontab -
+    success "Monitoring cron job added successfully"
+else
+    error "crontab command not found, skipping cron job setup"
+fi
 
 # Create health check script
 log "🏥 Creating health check script..."
@@ -432,11 +445,17 @@ EOF
 sudo chmod +x /usr/local/bin/trading-system-backup.sh
 
 # Set up daily backup cron job
-(crontab -l 2>/dev/null; echo "0 2 * * * /usr/local/bin/trading-system-backup.sh") | crontab -
+log "📅 Setting up daily backup cron job..."
+if command -v crontab &> /dev/null; then
+    (crontab -l 2>/dev/null; echo "0 2 * * * /usr/local/bin/trading-system-backup.sh") | crontab -
+    success "Backup cron job added successfully"
+else
+    error "crontab command not found, skipping backup cron job setup"
+fi
 
 # Install additional monitoring tools
 log "📊 Installing monitoring tools..."
-sudo apt-get install -y iostat iotop nethogs
+sudo apt-get install -y sysstat iotop nethogs
 
 # Create startup script
 log "🚀 Creating startup script..."
