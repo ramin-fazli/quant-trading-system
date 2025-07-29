@@ -5,7 +5,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    TRADING_MODE=live \
+    DATA_PROVIDER=ctrader \
+    BROKER=ctrader \
+    TRADING_PAIRS="XAUUSD-XAGUSD,XAUUSD-XPTUSD,XAUUSD-XPDUSD,XAUUSD-Copper,BTCUSD-ETHUSD,BTCUSD-SOLUSD,ETHUSD-SOLUSD,BTCUSD-XRPUSD,ETHUSD-XRPUSD" \
+    DASHBOARD_PORT=8050
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -38,6 +43,11 @@ COPY . .
 
 # Create necessary directories and default config files
 RUN mkdir -p logs backtest_reports data state_fallback cache config && \
+    echo '{"trading_pairs":["XAUUSD-XAGUSD","XAUUSD-XPTUSD","XAUUSD-XPDUSD","XAUUSD-Copper","BTCUSD-ETHUSD","BTCUSD-SOLUSD","ETHUSD-SOLUSD","BTCUSD-XRPUSD","ETHUSD-XRPUSD"]}' > config/pairs.json && \
+    echo '# Default environment variables for Docker deployment' > .env && \
+    echo 'TRADING_MODE=live' >> .env && \
+    echo 'DATA_PROVIDER=ctrader' >> .env && \
+    echo 'BROKER=ctrader' >> .env && \
     chown -R app:app /app && \
     chmod -R 755 /app
 
