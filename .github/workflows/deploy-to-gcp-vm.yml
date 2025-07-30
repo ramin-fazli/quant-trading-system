@@ -379,6 +379,19 @@ jobs:
             echo '[]' | sudo tee /opt/trading-system/pairs_config/pairs.json > /dev/null
         fi
         
+        # Fix permissions for mounted volumes
+        echo "🔧 Setting proper permissions for mounted directories..."
+        sudo chown -R 1000:1000 /opt/trading-system/logs
+        sudo chown -R 1000:1000 /opt/trading-system/data
+        sudo chown -R 1000:1000 /opt/trading-system/backtest_reports
+        sudo chown -R 1000:1000 /opt/trading-system/cache
+        sudo chown -R 1000:1000 /opt/trading-system/pairs_config
+        sudo chmod -R 755 /opt/trading-system/logs
+        sudo chmod -R 755 /opt/trading-system/data
+        sudo chmod -R 755 /opt/trading-system/backtest_reports
+        sudo chmod -R 755 /opt/trading-system/cache
+        sudo chmod -R 755 /opt/trading-system/pairs_config
+        
         # Start new container
         echo "🚀 Starting new service..."
         $USE_SUDO docker run -d \
