@@ -190,7 +190,7 @@ jobs:
         SERVICE_NAME="${{ env.SERVICE_NAME }}"
         
         # Create application directory with proper structure
-        sudo mkdir -p /opt/trading-system/{logs,data,backtest_reports,cache,config}
+        sudo mkdir -p /opt/trading-system/{logs,data,backtest_reports,cache,pairs_config}
         cd /opt/trading-system
         
         # Ensure current user is in docker group and refresh group membership
@@ -369,9 +369,9 @@ jobs:
         fi
         
         # Ensure config directory and pairs.json exist
-        if [ ! -f "/opt/trading-system/config/pairs.json" ]; then
+        if [ ! -f "/opt/trading-system/pairs_config/pairs.json" ]; then
             echo "⚠️ Pairs configuration file not found, creating empty fallback..."
-            echo '[]' | sudo tee /opt/trading-system/config/pairs.json > /dev/null
+            echo '[]' | sudo tee /opt/trading-system/pairs_config/pairs.json > /dev/null
         fi
         
         # Start new container
@@ -383,10 +383,9 @@ jobs:
           -p 8080:8080 \
           --env-file /opt/trading-system/.env \
           -v /opt/trading-system/logs:/app/logs \
-          -v /opt/trading-system/data:/app/data \
           -v /opt/trading-system/backtest_reports:/app/backtest_reports \
           -v /opt/trading-system/cache:/app/cache \
-          -v /opt/trading-system/config:/app/config \
+          -v /opt/trading-system/pairs_config:/app/pairs_config \
           --memory=4g \
           --cpus=2 \
           --log-driver=json-file \
@@ -461,7 +460,7 @@ jobs:
         gcloud compute ssh ${{ env.VM_NAME }} \
           --zone=${{ env.VM_ZONE }} \
           --project=${{ secrets.GCP_PROJECT_ID }} \
-          --command="chmod +x ~/deploy.sh && ~/deploy.sh && sudo mv ~/trading-system.env /opt/trading-system/.env && sudo mv ~/pairs.json /opt/trading-system/config/pairs.json && sudo chown -R \$USER:\$USER /opt/trading-system && chmod +x ~/start-container.sh && cd /opt/trading-system && ~/start-container.sh"
+          --command="chmod +x ~/deploy.sh && ~/deploy.sh && sudo mv ~/trading-system.env /opt/trading-system/.env && sudo mv ~/pairs.json /opt/trading-system/pairs_config/pairs.json && sudo chown -R \$USER:\$USER /opt/trading-system && chmod +x ~/start-container.sh && cd /opt/trading-system && ~/start-container.sh"
 
     - name: Post-deployment verification
       run: |
