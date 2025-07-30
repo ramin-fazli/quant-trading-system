@@ -193,22 +193,44 @@ jobs:
         sudo mkdir -p /opt/trading-system
         cd /opt/trading-system
         
-        # Authenticate Docker with GCP
+        # Ensure current user is in docker group and refresh group membership
+        sudo usermod -aG docker $USER
+        sudo usermod -aG docker ubuntu 2>/dev/null || true
+        
+        # Authenticate Docker with GCP (use sudo if needed)
         echo "🔐 Authenticating Docker with GCP..."
-        gcloud auth configure-docker ${{ env.GAR_LOCATION }}-docker.pkg.dev --quiet
+        if docker info >/dev/null 2>&1; then
+            gcloud auth configure-docker ${{ env.GAR_LOCATION }}-docker.pkg.dev --quiet
+        else
+            echo "Using sudo for Docker commands due to permission issues..."
+            sudo -u root bash -c "gcloud auth configure-docker ${{ env.GAR_LOCATION }}-docker.pkg.dev --quiet"
+        fi
         
-        # Pull latest image
+        # Pull latest image (with fallback to sudo)
         echo "📥 Pulling latest Docker image..."
-        docker pull "$IMAGE_NAME"
+        if docker info >/dev/null 2>&1; then
+            docker pull "$IMAGE_NAME"
+        else
+            sudo docker pull "$IMAGE_NAME"
+        fi
         
-        # Stop existing container if running
+        # Stop existing container if running (with fallback to sudo)
         echo "🛑 Stopping existing service..."
-        docker stop "$SERVICE_NAME" 2>/dev/null || true
-        docker rm "$SERVICE_NAME" 2>/dev/null || true
+        if docker info >/dev/null 2>&1; then
+            docker stop "$SERVICE_NAME" 2>/dev/null || true
+            docker rm "$SERVICE_NAME" 2>/dev/null || true
+        else
+            sudo docker stop "$SERVICE_NAME" 2>/dev/null || true
+            sudo docker rm "$SERVICE_NAME" 2>/dev/null || true
+        fi
         
-        # Clean up old images (keep last 3)
+        # Clean up old images (keep last 3) (with fallback to sudo)
         echo "🧹 Cleaning up old images..."
-        docker images "${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}" --format "table {{.Repository}}:{{.Tag}}\t{{.CreatedAt}}" | tail -n +2 | head -n -3 | awk '{print $1}' | xargs -r docker rmi || true
+        if docker info >/dev/null 2>&1; then
+            docker images "${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}" --format "table {{.Repository}}:{{.Tag}}\t{{.CreatedAt}}" | tail -n +2 | head -n -3 | awk '{print $1}' | xargs -r docker rmi || true
+        else
+            sudo docker images "${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}" --format "table {{.Repository}}:{{.Tag}}\t{{.CreatedAt}}" | tail -n +2 | head -n -3 | awk '{print $1}' | xargs -r sudo docker rmi || true
+        fi
         
         echo "🎉 Deployment completed successfully!"
         EOF
@@ -320,9 +342,16 @@ jobs:
         SERVICE_NAME="${{ env.SERVICE_NAME }}"
         IMAGE_NAME="${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest"
         
+        # Determine if we need to use sudo for docker commands
+        USE_SUDO=""
+        if ! docker info >/dev/null 2>&1; then
+            echo "Using sudo for Docker commands due to permission issues..."
+            USE_SUDO="sudo"
+        fi
+        
         # Start new container
         echo "🚀 Starting new service..."
-        docker run -d \
+        $USE_SUDO docker run -d \
           --name "$SERVICE_NAME" \
           --restart unless-stopped \
           -p 8050:8050 \
@@ -343,12 +372,12 @@ jobs:
         echo "🔍 Verifying deployment..."
         sleep 10
         
-        if docker ps | grep -q "$SERVICE_NAME"; then
+        if $USE_SUDO docker ps | grep -q "$SERVICE_NAME"; then
           echo "✅ Service is running successfully!"
-          docker logs --tail 20 "$SERVICE_NAME"
+          $USE_SUDO docker logs --tail 20 "$SERVICE_NAME"
         else
           echo "❌ Service failed to start!"
-          docker logs "$SERVICE_NAME"
+          $USE_SUDO docker logs "$SERVICE_NAME"
           exit 1
         fi
         
@@ -365,10 +394,10 @@ jobs:
         
         # Display service info
         echo "📊 Service Information:"
-        echo "Container ID: $(docker ps -q -f name=$SERVICE_NAME)"
+        echo "Container ID: $($USE_SUDO docker ps -q -f name=$SERVICE_NAME)"
         echo "Image: $IMAGE_NAME"
-        echo "Status: $(docker inspect -f '{{.State.Status}}' $SERVICE_NAME)"
-        echo "Started: $(docker inspect -f '{{.State.StartedAt}}' $SERVICE_NAME)"
+        echo "Status: $($USE_SUDO docker inspect -f '{{.State.Status}}' $SERVICE_NAME)"
+        echo "Started: $($USE_SUDO docker inspect -f '{{.State.StartedAt}}' $SERVICE_NAME)"
         EOF
         
         chmod +x start-container.sh
