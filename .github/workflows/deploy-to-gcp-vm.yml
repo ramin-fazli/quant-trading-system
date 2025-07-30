@@ -327,10 +327,15 @@ jobs:
         echo "CTRADER_HOST_TYPE=${{ secrets.CTRADER_HOST_TYPE }}" >> .env
         
         # Add trading pairs - use secret if provided, otherwise use default pairs
-        if [ -n "${{ secrets.TRADING_PAIRS }}" ]; then
-          echo "TRADING_PAIRS=${{ secrets.TRADING_PAIRS }}" >> .env
+        TRADING_PAIRS_VALUE="${{ secrets.TRADING_PAIRS }}"
+        if [ -n "$TRADING_PAIRS_VALUE" ] && [ "$TRADING_PAIRS_VALUE" != "" ] && [ "$TRADING_PAIRS_VALUE" != "null" ]; then
+          # Clean the trading pairs value (remove brackets, quotes, whitespace, etc.)
+          CLEANED_PAIRS=$(echo "$TRADING_PAIRS_VALUE" | tr -d '\n\r\t ' | sed 's/^\[//g' | sed 's/\]$//g' | sed 's/"//g' | sed 's/,/,/g')
+          echo "TRADING_PAIRS=$CLEANED_PAIRS" >> .env
+          echo "Using custom trading pairs: $CLEANED_PAIRS"
         else
-          echo "TRADING_PAIRS=BTCUSD-ETHUSD,BTCUSD-SOLUSD,ETHUSD-SOLUSD" >> .env
+          echo "TRADING_PAIRS=V.US-MA.US" >> .env
+          echo "Using default trading pairs: V.US-MA.US"
         fi
         
         # Add state management secrets
