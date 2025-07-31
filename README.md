@@ -1,463 +1,490 @@
-# Enhanced Pairs Trading System
+# Enhanced Pairs Trading System v3
 
-A comprehensive quantitative trading system that integrates real-time data from CTrader, executes trades through MetaTrader 5, performs advanced backtesting with vectorbt, stores data in InfluxDB, and provides a beautiful web dashboard for monitoring and analysis.
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Docker](https://img.shields.io/badge/Docker-Enabled-2496ED)](https://www.docker.com/)
 
-## 🚀 Features
+## 🛠️ Built With
 
-### Core Trading System
-- **Multi-Source Data Integration**: Real-time and historical data from CTrader
-- **Automated Execution**: Trade execution through MetaTrader 5
-- **Advanced Backtesting**: Powered by vectorbt for comprehensive strategy testing
-- **Time-Series Database**: InfluxDB integration for efficient data storage and retrieval
-- **Real-Time Dashboard**: Interactive web interface with live updates
-- **Label-Based Position Tracking**: Isolate script trades from manual trades and other scripts
+<div align="center">
 
-### Dashboard Features
-- **Live Market Data**: Real-time price feeds and market updates
-- **Interactive Charts**: Advanced Plotly.js visualizations
-- **Portfolio Monitoring**: Track positions, PnL, and performance metrics
-- **Backtest Analysis**: Detailed backtest results with downloadable Excel reports
-- **Pairs Analysis**: Correlation analysis and pair selection tools
-- **Risk Management**: Real-time risk monitoring and alerts
+![InfluxDB](https://img.shields.io/badge/InfluxDB-22ADF6?style=for-the-badge&logo=InfluxDB&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/postgresql-4169e1?style=for-the-badge&logo=postgresql&logoColor=white)
+![Flask](https://img.shields.io/badge/flask-%23000.svg?style=for-the-badge&logo=flask&logoColor=white)
+![Redis](https://img.shields.io/badge/redis-%23DD0031.svg?style=for-the-badge&logo=redis&logoColor=white)
+![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?style=for-the-badge&logo=docker&logoColor=white)
+![MetaTrader 5](https://img.shields.io/badge/MetaTrader%205-1C1C1C?style=for-the-badge)
+![cTrader](https://img.shields.io/badge/cTrader-00A651?style=for-the-badge)
 
-### Technical Capabilities
-- **WebSocket Streaming**: Real-time data updates via Socket.IO
-- **Multi-Mode Operation**: Backtest, real-time, and hybrid modes
-- **Excel Reporting**: Automated generation of detailed Excel reports
-- **Scalable Architecture**: Modular design for easy extension
-- **Comprehensive Logging**: Detailed logging for debugging and monitoring
+</div>
+
+A modular quantitative trading system that provides complete flexibility in selecting data providers and execution brokers independently. Build sophisticated pairs trading strategies with enterprise-grade reliability and performance.
+
+## 🎯 Key Features
+
+### ✅ Independent Provider Selection
+- **Data Provider**: Choose between `ctrader` or `mt5` for historical and real-time market data
+- **Execution Broker**: Choose between `ctrader` or `mt5` for trade execution  
+- **Mix & Match**: Use any combination (e.g., cTrader data with MT5 execution)
+
+### ✅ Real-Time Trading Capabilities
+- **MT5 Real-Time Trading**: Complete implementation with MetaTrader5 API
+- **cTrader Real-Time Trading**: Full implementation with cTrader Open API
+- **Advanced Risk Management**: Portfolio-level and pair-level drawdown protection
+- **Position Management**: Automated position sizing and balanced exposure
+
+### ✅ Intelligent Data Management
+- **Smart Caching**: Automatic gap detection and intelligent pre-fetching
+- **InfluxDB Integration**: Store and retrieve historical data with enterprise-grade time-series database
+- **Data Quality Validation**: Comprehensive data quality checks and reporting
+- **Multi-Provider Support**: Seamless switching between data providers
+
+### ✅ Enterprise-Grade Architecture
+- **Containerized Deployment**: Docker & Docker Compose support
+- **State Management**: Robust state persistence with automatic recovery
+- **Comprehensive Monitoring**: Real-time dashboard with WebSocket updates
+- **Production Ready**: CI/CD pipeline with AWS deployment automation
+
+## � Quick Start
+
+### Option 1: Automated Setup (Recommended)
+
+1. **Clone and Setup**:
+   ```bash
+   git clone https://github.com/ramin-fazli/quant.git
+   cd pair_trading_system
+   python setup_v3.py
+   ```
+
+2. **Configure Environment**:
+   ```bash
+   cp .env.development .env
+   # Edit .env with your API credentials
+   ```
+
+3. **Run Your First Backtest**:
+   ```bash
+   python scripts/pair_trading/main.py --data-provider ctrader --broker ctrader --mode backtest
+   ```
+
+### Option 2: Docker Deployment
+
+1. **Docker Compose (Development)**:
+   ```bash
+   export ENV_SUFFIX=.development
+   docker-compose up --build
+   ```
+
+2. **Production Deployment**:
+   ```bash
+   export ENV_SUFFIX=.production
+   docker-compose up --build -d
+   ```
 
 ## 📋 Prerequisites
 
 - **Python 3.8+**
-- **InfluxDB 2.0+**
-- **MetaTrader 5** (with API access enabled)
-- **CTrader API** credentials
-
-## 🛠️ Installation
-
-### Quick Setup
-
-1. **Clone and Navigate**:
-   ```bash
-   cd pair_trading_system
-   ```
-
-2. **Run Setup Script**:
-   ```bash
-   python setup.py
-   ```
-
-The setup script will automatically:
-- Install all Python dependencies
-- Create necessary directories
-- Generate configuration files
-- Validate the installation
-
-### Manual Installation
-
-If you prefer manual installation:
-
-1. **Install Dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-2. **Install Additional Packages**:
-   ```bash
-   pip install pandas numpy MetaTrader5 vectorbt flask flask-cors flask-socketio plotly influxdb-client requests openpyxl xlsxwriter python-dotenv schedule python-socketio aiohttp asyncio-mqtt psutil
-   ```
+- **InfluxDB 2.0+** (or use Docker)
+- **MetaTrader 5** (optional - for MT5 provider)
+- **cTrader Account** (optional - for cTrader provider)
+- **Docker & Docker Compose** (for containerized deployment)
 
 ## ⚙️ Configuration
 
-### 1. Environment Variables
+### Environment Variables
 
-Edit `.env.enhanced` with your credentials:
+Create a `.env` file based on `.env.development`:
 
 ```env
-# InfluxDB Settings
-INFLUXDB_URL=http://localhost:8086
-INFLUXDB_TOKEN=your_influxdb_token_here
-INFLUXDB_ORG=trading_org
-INFLUXDB_BUCKET=trading_data
-
-# CTrader Settings
-CTRADER_API_KEY=your_ctrader_api_key_here
-CTRADER_ACCOUNT_ID=your_ctrader_account_id_here
-CTRADER_BASE_URL=https://api.ctrader.com
-
-# MT5 Settings
+# MT5 Configuration
 MT5_LOGIN=your_mt5_login
 MT5_PASSWORD=your_mt5_password
 MT5_SERVER=your_mt5_server
 
-# Dashboard Settings
-DASHBOARD_HOST=localhost
-DASHBOARD_PORT=5000
-DASHBOARD_DEBUG=False
+# cTrader Configuration
+CTRADER_CLIENT_ID=your_client_id
+CTRADER_CLIENT_SECRET=your_client_secret
+CTRADER_ACCESS_TOKEN=your_access_token
+CTRADER_ACCOUNT_ID=your_account_id
 
-# CTrader Label Settings (New Feature!)
-CTRADER_TRADING_LABEL=PairsTradingBot
+# InfluxDB Configuration
+INFLUXDB_URL=http://localhost:8086
+INFLUXDB_TOKEN=your_influxdb_token
+INFLUXDB_ORG=trading-org
+INFLUXDB_BUCKET=trading-data
 
-# Trading Mode
+# Trading Configuration
 TRADING_MODE=backtest
+MAX_POSITION_SIZE=10000
+MAX_OPEN_POSITIONS=10
 ```
 
-### 2. Trading Configuration
+### Trading Parameters
 
-Edit `config/trading_config.json`:
+Configure strategy parameters in `config/trading_config.json`:
 
 ```json
 {
-    "risk_management": {
-        "max_position_size": 0.02,
-        "max_portfolio_risk": 0.10,
-        "stop_loss_pct": 0.05,
-        "take_profit_pct": 0.10
-    },
-    "trading_hours": {
-        "start_hour": 9,
-        "end_hour": 17,
-        "timezone": "UTC"
-    },
-    "data_sources": {
-        "mt5": {
-            "enabled": true,
-            "symbols": ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"]
-        },
-        "ctrader": {
-            "enabled": true,
-            "api_key": "your_ctrader_api_key",
-            "account_id": "your_account_id"
-        }
-    }
+  "data_provider": "ctrader",
+  "broker": "ctrader", 
+  "pairs": ["EURUSD-GBPUSD", "AAPL.US-MSFT.US"],
+  "interval": "M15",
+  "z_entry": 2.0,
+  "z_exit": 0.5,
+  "risk_management": {
+    "max_position_size": 0.02,
+    "max_portfolio_risk": 0.10,
+    "stop_loss_pct": 0.05,
+    "take_profit_pct": 0.10
+  }
 }
 ```
 
-### 3. Pairs Configuration
+## � Usage
 
-Edit `config/pairs.json`:
+### Command Line Interface
 
-```json
-{
-    "pairs": [
-        {
-            "symbol1": "EURUSD",
-            "symbol2": "GBPUSD",
-            "lookback_period": 60,
-            "entry_threshold": 2.0,
-            "exit_threshold": 0.5,
-            "enabled": true
-        }
-    ]
-}
-```
-
-## 🚀 Usage
-
-### Running the System
-
-#### Backtest Mode
 ```bash
-set TRADING_MODE=backtest && python enhanced_main.py
+# Basic usage - CTrader data and execution
+python scripts/pair_trading/main.py
+
+# Specify providers explicitly
+python scripts/pair_trading/main.py --data-provider ctrader --broker ctrader --mode backtest
+
+# Mix providers - CTrader data with MT5 execution
+python scripts/pair_trading/main.py --data-provider ctrader --broker mt5 --mode backtest
+
+# Live trading with CTrader
+python scripts/pair_trading/main.py --data-provider ctrader --broker ctrader --mode live
+
+# Force refresh all data (ignore cache)
+python scripts/pair_trading/main.py --force-refresh
 ```
 
-#### Real-time Mode
-```bash
-set TRADING_MODE=realtime && python enhanced_main.py
-```
+### Supported Provider Combinations
 
-#### Hybrid Mode
-```bash
-set TRADING_MODE=hybrid && python enhanced_main.py
-```
+| Data Provider | Execution Broker | Use Case |
+|---------------|------------------|----------|
+| `ctrader` | `ctrader` | Pure cTrader environment |
+| `mt5` | `mt5` | Pure MT5 environment |
+| `ctrader` | `mt5` | cTrader data with MT5 execution |
+| `mt5` | `ctrader` | MT5 data with cTrader execution |
 
-### Accessing the Dashboard
+### Dashboard Access
 
-Open your browser and navigate to:
+After starting the system, access the web dashboard at:
 ```
 http://localhost:5000
 ```
 
-### Dashboard Pages
-
+**Available Pages:**
 - **Overview** (`/`): Main dashboard with key metrics
-- **Backtest Results** (`/backtest`): Detailed backtest analysis
 - **Live Trading** (`/live`): Real-time trading monitoring
 - **Portfolio** (`/portfolio`): Portfolio overview and positions
-- **Pairs Analysis** (`/pairs`): Correlation analysis and pair selection
+- **Backtest Results** (`/backtest`): Detailed backtest analysis
 - **Reports** (`/reports`): Download Excel reports
-- **Settings** (`/settings`): System configuration
 
-## 📊 System Architecture
+## 🏗️ Architecture
+
+### System Overview
 
 ```
-Enhanced Pairs Trading System
+Enhanced Pairs Trading System v3
 ├── Data Sources
-│   ├── CTrader API (Historical & Real-time)
-│   └── MetaTrader 5 (Execution & Market Data)
+│   ├── cTrader API (Historical & Real-time)
+│   └── MetaTrader 5 (Historical & Real-time)
 ├── Data Storage
-│   └── InfluxDB (Time-series Database)
+│   ├── InfluxDB (Time-series Database)
+│   └── Redis (Caching & State Management)
 ├── Processing Engine
-│   ├── Strategy Engine
-│   ├── Risk Management
-│   └── Order Management
+│   ├── Strategy Engine (Configurable Strategies)
+│   ├── Risk Management (Portfolio & Pair Level)
+│   └── Order Management (Multi-Broker Support)
 ├── Backtesting
-│   └── vectorbt Integration
+│   └── VectorBT Integration (High-Performance)
 ├── Web Dashboard
-│   ├── Flask Server
-│   ├── WebSocket Streaming
-│   └── Interactive Charts
-└── Reporting
-    └── Excel Report Generation
+│   ├── Flask Server with WebSocket Streaming
+│   └── Interactive Charts & Real-time Updates
+└── Deployment
+    ├── Docker Containers
+    └── CI/CD Pipeline (GitHub Actions → AWS)
 ```
+
+### Core Components
+
+- **EnhancedTradingSystemV3**: Main orchestrator managing all components
+- **Data Managers**: Provider-specific data handling (cTrader/MT5)
+- **Real-Time Traders**: Live trading implementations for each broker
+- **State Management**: Robust state persistence with automatic recovery
+- **Dashboard Integration**: Real-time visualization and monitoring
 
 ## 📁 Project Structure
 
 ```
 pair_trading_system/
-├── enhanced_main.py              # Main system orchestrator
-├── setup.py                      # Installation script
-├── requirements.txt              # Python dependencies
-├── .env.enhanced                 # Environment configuration
-├── config/                       # Configuration files
+├── scripts/pair_trading/
+│   └── main.py                    # Main system entry point
+├── setup_v3.py                    # Automated setup script
+├── docker-compose.yml             # Container orchestration
+├── .env.development               # Development environment template
+├── .env.production                # Production environment template
+├── config/                        # Configuration files
 │   ├── trading_config.json
 │   └── pairs.json
-├── dashboard/                    # Web dashboard
+├── dashboard/                     # Web dashboard
 │   ├── dashboard_manager.py
-│   ├── web_server.py
-│   ├── websocket_handler.py
-│   ├── chart_generator.py
-│   ├── data_adapter.py
-│   ├── templates/               # HTML templates
-│   └── static/                  # CSS, JS, images
-├── brokers/                      # Broker integrations
-│   └── mt5.py
-├── data/                         # Data handling
-│   ├── ctrader.py
-│   └── mt5.py
-├── strategies/                   # Trading strategies
-├── backtesting/                  # Backtesting modules
-│   └── vectorbt.py
-├── reporting/                    # Report generation
+│   ├── templates/                 # HTML templates
+│   └── static/                    # CSS, JS, assets
+├── data/                          # Data handling modules
+│   ├── ctrader_data_manager.py
+│   └── mt5_data_manager.py
+├── brokers/                       # Broker integrations
+│   ├── ctrader_trader.py
+│   └── mt5_trader.py
+├── strategies/                    # Trading strategies
+│   └── optimized_pairs_strategy.py
+├── backtesting/                   # Backtesting modules
+│   └── vectorbt_backtester.py
+├── utils/                         # Utility modules
+│   ├── state_manager.py          # State persistence
+│   ├── unified_state_manager.py   # Advanced state management
+│   └── influxdb_manager.py        # Database operations
+├── reporting/                     # Report generation
 │   └── report_generator.py
-├── backtest_reports/            # Generated Excel reports
-└── logs/                        # System logs
+├── backtest_reports/              # Generated reports
+├── logs/                          # System logs
+└── docs/                          # Documentation
 ```
 
-## 🔧 Advanced Configuration
-
-### InfluxDB Setup
-
-1. **Install InfluxDB**:
-   ```bash
-   # Windows
-   winget install InfluxData.InfluxDB
-
-   # Linux/Mac
-   curl -sL https://repos.influxdata.com/influxdb.key | sudo apt-key add -
-   ```
-
-2. **Create Organization and Bucket**:
-   ```bash
-   influx setup
-   influx org create -n trading_org
-   influx bucket create -n trading_data -o trading_org
-   ```
-
-### MetaTrader 5 Setup
-
-1. **Enable API Trading**:
-   - Open MetaTrader 5
-   - Go to Tools → Options → Expert Advisors
-   - Check "Allow algorithmic trading"
-   - Check "Allow DLL imports"
-
-2. **Install Python Package**:
-   ```bash
-   pip install MetaTrader5
-   ```
-
-### CTrader API Setup
-
-1. **Get API Credentials**:
-   - Register at [CTrader Developer Portal](https://connect.ctrader.com/)
-   - Create new application
-   - Note down API key and account ID
-
-## 📈 Usage Examples
-
-### Basic Backtesting
-
-```python
-from enhanced_main import EnhancedTradingSystem
-
-# Initialize system
-system = EnhancedTradingSystem(mode='backtest')
-
-# Run backtest
-results = system.run_backtest(
-    start_date='2023-01-01',
-    end_date='2023-12-31',
-    pairs=['EURUSD-GBPUSD', 'AUDUSD-NZDUSD']
-)
-
-# Generate report
-system.generate_excel_report(results)
-```
-
-### Real-time Trading
-
-```python
-from enhanced_main import EnhancedTradingSystem
-
-# Initialize system
-system = EnhancedTradingSystem(mode='realtime')
-
-# Start real-time trading
-system.start_realtime_trading()
-```
-
-### Dashboard Integration
-
-```python
-from dashboard.dashboard_manager import DashboardManager
-
-# Start dashboard
-dashboard = DashboardManager()
-dashboard.start()
-```
-
-## 📋 API Endpoints
-
-### REST API
-
-- `GET /api/status` - System status
-- `GET /api/backtest/summary` - Backtest summary
-- `GET /api/backtest/pairs` - Backtest pairs data
-- `GET /api/live/data` - Live market data
-- `GET /api/portfolio` - Portfolio data
-- `GET /api/reports` - Available reports
-- `GET /api/download/report/<filename>` - Download report
-- `DELETE /api/reports/<filename>` - Delete report
-
-### WebSocket Events
-
-- `connect` - Client connection
-- `disconnect` - Client disconnection
-- `market_data` - Real-time market data
-- `trade_update` - Trade execution updates
-- `portfolio_update` - Portfolio changes
-
-## 🚨 Risk Management
+## � Risk Management
 
 ### Built-in Risk Controls
 
-- **Position Sizing**: Automatic position size calculation
-- **Portfolio Risk**: Maximum portfolio exposure limits
-- **Stop Loss**: Automatic stop loss orders
-- **Take Profit**: Profit-taking mechanisms
-- **Correlation Monitoring**: Real-time correlation tracking
+- **Position Sizing**: Automatic position size calculation based on account balance
+- **Portfolio Risk**: Maximum portfolio exposure limits with automatic suspension
+- **Drawdown Protection**: Portfolio-level and pair-level drawdown monitoring
+- **Correlation Monitoring**: Real-time correlation tracking between pairs
+- **Stop Loss/Take Profit**: Configurable percentage-based risk controls
 
 ### Configuration
 
-Risk parameters are configured in `config/trading_config.json`:
+Risk parameters in `config/trading_config.json`:
 
 ```json
 {
     "risk_management": {
-        "max_position_size": 0.02,      // 2% max position size
-        "max_portfolio_risk": 0.10,     // 10% max portfolio risk
-        "stop_loss_pct": 0.05,          // 5% stop loss
-        "take_profit_pct": 0.10,        // 10% take profit
-        "max_correlation": 0.8,         // Max pair correlation
-        "min_liquidity": 1000000        // Min daily volume
+        "max_position_size": 0.02,           // 2% max position size
+        "max_portfolio_risk": 0.10,          // 10% max portfolio risk
+        "stop_loss_pct": 0.05,               // 5% stop loss
+        "take_profit_pct": 0.10,             // 10% take profit
+        "max_drawdown": 0.15,                // 15% max drawdown
+        "position_timeout_hours": 24         // Auto-close after 24h
     }
 }
 ```
 
-## 📊 Performance Monitoring
+## � Advanced Features
 
-### Key Metrics
+### Intelligent Data Management
 
-- **Return Metrics**: Total return, annualized return, Sharpe ratio
-- **Risk Metrics**: Maximum drawdown, volatility, VaR
-- **Trade Metrics**: Win rate, profit factor, average trade
-- **Portfolio Metrics**: Correlation, beta, alpha
+- **Smart Caching**: Automatic gap detection and intelligent pre-fetching
+- **Data Quality Validation**: Comprehensive quality checks with detailed reporting
+- **Gap Detection**: Identifies and fills missing data periods automatically
+- **Force Refresh**: Override cache when needed for data integrity
 
-### Real-time Monitoring
+### State Management
 
-The dashboard provides real-time monitoring of:
-- Open positions and PnL
-- Risk exposure by pair
-- Strategy performance
-- Market data quality
-- System health metrics
+- **Persistent State**: Robust state persistence with automatic recovery
+- **State Versioning**: Complete audit trail of all state changes
+- **Cross-Session Recovery**: Seamlessly resume operations after restarts
+- **Backup & Restore**: Automated backup creation and restoration
+
+### Performance Optimization
+
+- **Vectorized Calculations**: High-performance NumPy/Pandas operations
+- **Efficient Data Structures**: Optimized storage with InfluxDB
+- **Async Operations**: Non-blocking API calls where possible
+- **Memory Management**: Intelligent buffering and cleanup
+
+## � Production Deployment
+
+### CI/CD Pipeline
+
+The system includes automated deployment to AWS EC2:
+
+1. **Setup GitHub Secrets**:
+   ```
+   EC2_HOST=your-ec2-ip
+   EC2_USER=ubuntu
+   EC2_PRIVATE_KEY=your-private-key
+   DOCKER_USERNAME=your-docker-username
+   DOCKER_PASSWORD=your-docker-password
+   ```
+
+2. **Automatic Deployment**:
+   - Push to `main` branch triggers deployment
+   - ~3-5 minute deployment time
+   - Automatic health checks and rollback
+
+3. **Manual Deployment**:
+   ```bash
+   # SSH to EC2 instance
+   ssh -i your-key.pem ubuntu@your-ec2-ip
+   
+   # Run setup script
+   curl -sSL https://raw.githubusercontent.com/ramin-fazli/quant/main/scripts/setup-ec2.sh | bash
+   ```
+
+### Docker Production Setup
+
+```bash
+# Production deployment with persistent volumes
+export ENV_SUFFIX=.production
+docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+# Scale services
+docker-compose up --scale trading-system=2 -d
+
+# Monitor logs
+docker-compose logs -f trading-system
+```
 
 ## 🐛 Troubleshooting
 
 ### Common Issues
 
-1. **InfluxDB Connection Error**:
-   ```
-   Error: Failed to connect to InfluxDB
-   Solution: Check INFLUXDB_URL and INFLUXDB_TOKEN in .env.enhanced
-   ```
+**InfluxDB Connection Error**:
+```bash
+# Check InfluxDB status
+docker-compose logs influxdb
 
-2. **MT5 Connection Failed**:
-   ```
-   Error: MT5 initialization failed
-   Solution: Ensure MT5 is running and API trading is enabled
-   ```
+# Verify credentials
+echo $INFLUXDB_TOKEN
+```
 
-3. **CTrader API Error**:
-   ```
-   Error: Unauthorized CTrader API access
-   Solution: Verify CTRADER_API_KEY and CTRADER_ACCOUNT_ID
-   ```
+**MT5 Connection Failed**:
+```bash
+# Ensure MT5 terminal is running
+# Check credentials in .env file
+# Verify "Allow algorithmic trading" is enabled
+```
+
+**cTrader API Error**:
+```bash
+# Verify API credentials
+echo $CTRADER_CLIENT_ID
+echo $CTRADER_ACCESS_TOKEN
+
+# Check API permissions at cTrader Developer Portal
+```
+
+**Data Quality Issues**:
+```bash
+# Run data coverage analysis
+python data_management_demo.py
+
+# Force refresh to bypass cache
+python scripts/pair_trading/main.py --force-refresh
+```
 
 ### Debug Mode
 
-Enable debug mode by setting:
+Enable comprehensive debugging:
 ```env
-DASHBOARD_DEBUG=True
 LOG_LEVEL=DEBUG
+DASHBOARD_DEBUG=True
 ```
 
 ### Log Files
 
-Check log files in the `logs/` directory:
-- `trading_system.log` - Main system logs
-- `dashboard.log` - Dashboard-specific logs
-- `error.log` - Error logs
+- `logs/enhanced_pairs_trading_v3.log` - Main system log
+- `logs/pairs_trading.log` - Strategy-specific log
+- `logs/mt5.log` - MT5 operations
+- `logs/ctrader.log` - cTrader operations
 
-## 📝 License
+## � Performance Metrics
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+### Backtesting Results
+
+The system provides comprehensive performance analysis:
+
+- **Return Metrics**: Total return, annualized return, Sharpe ratio
+- **Risk Metrics**: Maximum drawdown, volatility, VaR
+- **Trade Metrics**: Win rate, profit factor, average trade duration
+- **Portfolio Metrics**: Correlation, beta, alpha
+
+### Real-time Monitoring
+
+Live dashboard features:
+- **Portfolio Status**: Real-time P&L, positions, exposure
+- **System Health**: Connection status for all providers
+- **Trade History**: Recent trades with provider attribution
+- **Risk Monitoring**: Live drawdown and exposure tracking
 
 ## 🤝 Contributing
 
 1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
+2. Create a feature branch: `git checkout -b feature/amazing-feature`
+3. Make your changes and add tests
+4. Commit: `git commit -m 'Add amazing feature'`
+5. Push: `git push origin feature/amazing-feature`
+6. Submit a pull request
+
+### Development Setup
+
+```bash
+# Clone for development
+git clone https://github.com/ramin-fazli/quant.git
+cd pair_trading_system
+
+# Install development dependencies
+pip install -r requirements-dev.txt
+
+# Run tests
+python -m pytest tests/
+
+# Run with development environment
+cp .env.development .env
+python scripts/pair_trading/main.py --mode backtest
+```
+
+## 📄 License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
+## 🔄 Version History
+
+### v3.0.0 (Current)
+- ✅ Independent data provider and broker selection
+- ✅ cTrader real-time trading implementation  
+- ✅ Enhanced state management with versioning
+- ✅ Intelligent data management with gap detection
+- ✅ Production-ready Docker deployment
+- ✅ CI/CD pipeline with AWS integration
+
+### v2.0.0
+- Multi-provider data integration
+- Advanced backtesting with VectorBT
+- Real-time dashboard with WebSocket updates
+- InfluxDB integration for time-series data
+
+### v1.0.0
+- Basic pairs trading strategy
+- MT5 integration
+- Simple backtesting framework
 
 ## 📞 Support
 
-For support and questions:
-- Check the troubleshooting section
-- Review log files for errors
-- Open an issue on GitHub
+- **Documentation**: Check the `docs/` directory for detailed guides
+- **Issues**: Open an issue on GitHub for bugs or feature requests
+- **Discussions**: Use GitHub Discussions for questions and community support
 
-## 🔄 Updates
+## ⚠️ Disclaimer
 
-To update the system:
-1. Pull latest changes
-2. Run `python setup.py` to update dependencies
-3. Review configuration changes
-4. Restart the system
+**This software is for educational and research purposes only. Trading involves significant financial risk and this system should only be used with virtual/demo accounts initially. Always thoroughly test strategies before deploying real capital. The developers assume no responsibility for any financial losses incurred through the use of this software.**
 
 ---
 
-**⚠️ Important Disclaimer**: This system is for educational and research purposes. Always test with demo accounts before using real money. Trading involves significant risk of loss.
+**Built with ❤️ for the quantitative trading community**
+
+*Enhanced Pairs Trading System v3.0 - Production Ready • Modular • Scalable*
