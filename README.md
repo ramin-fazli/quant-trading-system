@@ -1,4 +1,4 @@
-# Enhanced Pairs Trading System v3
+# Enhanced Quantitative Trading System
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
@@ -53,7 +53,7 @@ A modular quantitative trading system that provides complete flexibility in sele
    ```bash
    git clone https://github.com/ramin-fazli/quant.git
    cd pair_trading_system
-   python setup_v3.py
+   python setup.py
    ```
 
 2. **Configure Environment**:
@@ -189,7 +189,7 @@ http://localhost:5000
 ### System Overview
 
 ```
-Enhanced Pairs Trading System v3
+Enhanced Quantitative Trading System
 ├── Data Sources
 │   ├── cTrader API (Historical & Real-time)
 │   └── MetaTrader 5 (Historical & Real-time)
@@ -212,7 +212,7 @@ Enhanced Pairs Trading System v3
 
 ### Core Components
 
-- **EnhancedTradingSystemV3**: Main orchestrator managing all components
+- **EnhancedTradingSystem**: Main orchestrator managing all components
 - **Data Managers**: Provider-specific data handling (cTrader/MT5)
 - **Real-Time Traders**: Live trading implementations for each broker
 - **State Management**: Robust state persistence with automatic recovery
@@ -224,7 +224,7 @@ Enhanced Pairs Trading System v3
 pair_trading_system/
 ├── scripts/pair_trading/
 │   └── main.py                    # Main system entry point
-├── setup_v3.py                    # Automated setup script
+├── setup.py                    # Automated setup script
 ├── docker-compose.yml             # Container orchestration
 ├── .env.development               # Development environment template
 ├── .env.production                # Production environment template
@@ -397,7 +397,7 @@ DASHBOARD_DEBUG=True
 
 ### Log Files
 
-- `logs/enhanced_pairs_trading_v3.log` - Main system log
+- `logs/enhanced_pairs_trading.log` - Main system log
 - `logs/pairs_trading.log` - Strategy-specific log
 - `logs/mt5.log` - MT5 operations
 - `logs/ctrader.log` - cTrader operations
@@ -487,4 +487,4 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 
 **Built with ❤️ for the quantitative trading community**
 
-*Enhanced Pairs Trading System v3.0 - Production Ready • Modular • Scalable*
+*Enhanced Quantitative Trading System - Production Ready • Modular • Scalable*

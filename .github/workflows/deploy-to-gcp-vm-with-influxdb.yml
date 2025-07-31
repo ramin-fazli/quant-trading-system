@@ -1,0 +1,838 @@
+# Deploy Trading System to GCP VM
+# 
+# Required GitHub Secrets:
+# - GCP_SA_KEY: Service account key JSON for GCP authentication
+# - GCP_PROJECT_ID: Google Cloud Project ID
+# - INFLUXDB_USERNAME: InfluxDB admin username for self-hosted setup
+# - INFLUXDB_PASSWORD: InfluxDB admin password for self-hosted setup
+# - INFLUXDB_ORG: InfluxDB organization name
+# - INFLUXDB_BUCKET: InfluxDB bucket name
+# - MT5_LOGIN: MetaTrader 5 login (optional)
+# - MT5_PASSWORD: MetaTrader 5 password (optional)
+# - MT5_SERVER: MetaTrader 5 server (optional)
+# - CTRADER_CLIENT_ID: cTrader API client ID
+# - CTRADER_CLIENT_SECRET: cTrader API client secret
+# - CTRADER_ACCESS_TOKEN: cTrader API access token
+# - CTRADER_ACCOUNT_ID: cTrader account ID
+# - CTRADER_HOST_TYPE: cTrader host type (demo/live)
+# - TELEGRAM_BOT_TOKEN: Telegram bot token for notifications (optional)
+# - TELEGRAM_CHAT_ID: Telegram chat ID for notifications (optional)
+# - TRADING_PAIRS: Trading pairs configuration (optional, will use config/pairs.json if not set)
+
+name: Deploy Trading System to GCP VM
+
+on:
+  push:
+    branches: [ version/2.3 ]
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Force deployment even if no changes'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  GAR_LOCATION: us-east4
+  GAR_REPOSITORY: trading-system
+  IMAGE_NAME: trading-system
+  VM_ZONE: us-east4-c
+  VM_NAME: instance-20250729-190934
+  SERVICE_NAME: trading-system
+
+jobs:
+  # Job 1: Build and push to Artifact Registry (optimized)
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+      actions: read
+
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.tags }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        platforms: linux/amd64
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        version: latest
+
+    - name: Configure Docker for Artifact Registry
+      run: |
+        gcloud auth configure-docker ${{ env.GAR_LOCATION }}-docker.pkg.dev --quiet
+
+    - name: Create Artifact Registry repository (if needed)
+      run: |
+        gcloud artifacts repositories create ${{ env.GAR_REPOSITORY }} \
+          --repository-format=docker \
+          --location=${{ env.GAR_LOCATION }} \
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --description="Trading system Docker images" 2>/dev/null || true
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest
+
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile.live
+        platforms: linux/amd64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        build-args: |
+          BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          VCS_REF=${{ github.sha }}
+          BUILD_VERSION=${{ github.ref_name }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Security scan with Trivy
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+      continue-on-error: true
+
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v3
+      if: false  # Disabled - Enable Code Scanning in repo settings to use this
+      with:
+        sarif_file: 'trivy-results.sarif'
+      continue-on-error: true
+
+    - name: Upload security scan results as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: trivy-scan-results
+        path: trivy-results.sarif
+        retention-days: 30
+      continue-on-error: true
+
+  # Job 2: Deploy to GCP VM
+  deploy-to-vm:
+    name: Deploy to GCP VM
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/version/2.3' || github.event_name == 'workflow_dispatch'
+
+    steps:
+    - name: Checkout deployment scripts
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: |
+          scripts/
+          docker-compose.yml
+          .env.example
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Configure firewall rules
+      run: |
+        echo "🔥 Configuring firewall rules for trading system..."
+        
+        # Create firewall rule for dashboard (port 80) if it doesn't exist
+        if ! gcloud compute firewall-rules describe allow-trading-dashboard --project=${{ secrets.GCP_PROJECT_ID }} >/dev/null 2>&1; then
+          echo "Creating firewall rule for dashboard (port 80)..."
+          gcloud compute firewall-rules create allow-trading-dashboard \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --allow tcp:80 \
+            --source-ranges 0.0.0.0/0 \
+            --description "Allow access to trading system dashboard" \
+            --target-tags trading-system
+        else
+          echo "✅ Dashboard firewall rule already exists"
+        fi
+        
+        # Create firewall rule for HTTPS (port 443) if it doesn't exist
+        if ! gcloud compute firewall-rules describe allow-trading-https --project=${{ secrets.GCP_PROJECT_ID }} >/dev/null 2>&1; then
+          echo "Creating firewall rule for HTTPS (port 443)..."
+          gcloud compute firewall-rules create allow-trading-https \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --allow tcp:443 \
+            --source-ranges 0.0.0.0/0 \
+            --description "Allow HTTPS access to trading system dashboard" \
+            --target-tags trading-system
+        else
+          echo "✅ HTTPS firewall rule already exists"
+        fi
+        
+        # Create firewall rule for API (port 8080) if it doesn't exist
+        if ! gcloud compute firewall-rules describe allow-trading-api --project=${{ secrets.GCP_PROJECT_ID }} >/dev/null 2>&1; then
+          echo "Creating firewall rule for API (port 8080)..."
+          gcloud compute firewall-rules create allow-trading-api \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --allow tcp:8080 \
+            --source-ranges 0.0.0.0/0 \
+            --description "Allow access to trading system API" \
+            --target-tags trading-system
+        else
+          echo "✅ API firewall rule already exists"
+        fi
+        
+        # Apply network tags to the VM (this is safe to run multiple times)
+        echo "🏷️ Applying network tags to VM..."
+        gcloud compute instances add-tags ${{ env.VM_NAME }} \
+          --zone=${{ env.VM_ZONE }} \
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --tags trading-system
+        
+        echo "✅ Firewall configuration completed"
+
+    - name: Verify VM exists and is running
+      run: |
+        echo "🔍 Checking VM status..."
+        VM_STATUS=$(gcloud compute instances describe ${{ env.VM_NAME }} \
+          --zone=${{ env.VM_ZONE }} \
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --format="value(status)")
+        
+        if [ "$VM_STATUS" != "RUNNING" ]; then
+          echo "⚠️ VM is not running (status: $VM_STATUS)"
+          if [ "$VM_STATUS" = "TERMINATED" ]; then
+            echo "🚀 Starting VM..."
+            gcloud compute instances start ${{ env.VM_NAME }} \
+              --zone=${{ env.VM_ZONE }} \
+              --project=${{ secrets.GCP_PROJECT_ID }}
+            
+            # Wait for VM to be ready
+            echo "⏳ Waiting for VM to be ready..."
+            sleep 30
+          fi
+        fi
+        
+        echo "✅ VM is ready for deployment"
+
+    - name: Create deployment script
+      run: |
+        cat > deploy.sh << 'EOF'
+        #!/bin/bash
+        set -e
+        
+        echo "🚀 Starting deployment on VM..."
+        
+        # Set variables
+        IMAGE_NAME="${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest"
+        SERVICE_NAME="${{ env.SERVICE_NAME }}"
+        
+        # Create application directory with proper structure
+        sudo mkdir -p /opt/trading-system/{logs,data,backtest_reports,cache,pairs_config,influxdb-data,influxdb-config}
+        cd /opt/trading-system
+        
+        # Ensure current user is in docker group and refresh group membership
+        sudo usermod -aG docker $USER
+        sudo usermod -aG docker ubuntu 2>/dev/null || true
+        
+        # Authenticate Docker with GCP (use sudo if needed)
+        echo "🔐 Authenticating Docker with GCP..."
+        if docker info >/dev/null 2>&1; then
+            gcloud auth configure-docker ${{ env.GAR_LOCATION }}-docker.pkg.dev --quiet
+        else
+            echo "Using sudo for Docker commands due to permission issues..."
+            sudo -u root bash -c "gcloud auth configure-docker ${{ env.GAR_LOCATION }}-docker.pkg.dev --quiet"
+        fi
+        
+        # Pull latest image (with fallback to sudo)
+        echo "📥 Pulling latest Docker image..."
+        if docker info >/dev/null 2>&1; then
+            docker pull "$IMAGE_NAME"
+        else
+            sudo docker pull "$IMAGE_NAME"
+        fi
+        
+        # Stop existing container if running (with fallback to sudo)
+        echo "🛑 Stopping existing service..."
+        if docker info >/dev/null 2>&1; then
+            docker stop "$SERVICE_NAME" 2>/dev/null || true
+            docker rm "$SERVICE_NAME" 2>/dev/null || true
+        else
+            sudo docker stop "$SERVICE_NAME" 2>/dev/null || true
+            sudo docker rm "$SERVICE_NAME" 2>/dev/null || true
+        fi
+        
+        # Clean up old images (keep last 3) - FIXED VERSION
+        echo "🧹 Cleaning up old local images..."
+        if docker info >/dev/null 2>&1; then
+            # List images, sort by created date, keep only the 3 most recent, delete the rest
+            OLD_IMAGES=$(docker images "${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}" --format "{{.ID}} {{.CreatedAt}}" | sort -k2 -r | tail -n +4 | awk '{print $1}')
+            if [ -n "$OLD_IMAGES" ]; then
+                echo "Removing old images: $OLD_IMAGES"
+                echo "$OLD_IMAGES" | xargs -r docker rmi -f || true
+            else
+                echo "No old images to remove"
+            fi
+        else
+            # Same logic with sudo
+            OLD_IMAGES=$(sudo docker images "${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}" --format "{{.ID}} {{.CreatedAt}}" | sort -k2 -r | tail -n +4 | awk '{print $1}')
+            if [ -n "$OLD_IMAGES" ]; then
+                echo "Removing old images: $OLD_IMAGES"
+                echo "$OLD_IMAGES" | xargs -r sudo docker rmi -f || true
+            else
+                echo "No old images to remove"
+            fi
+        fi
+        
+        # Also clean up dangling images
+        echo "🧹 Cleaning up dangling images..."
+        if docker info >/dev/null 2>&1; then
+            docker image prune -f || true
+        else
+            sudo docker image prune -f || true
+        fi
+        
+        echo "🎉 Deployment completed successfully!"
+        EOF
+        
+        chmod +x deploy.sh
+
+    - name: Create environment file
+      run: |
+        cat > .env << 'EOF'
+        # === Production Environment Configuration ===
+        ENVIRONMENT=production
+        LOG_LEVEL=INFO
+        
+        # === Port Configuration ===
+        DASHBOARD_PORT=8050
+        API_PORT=8000
+        INFLUXDB_PORT=8086
+        REDIS_PORT=6379
+        
+        # === Dashboard Configuration ===
+        DASHBOARD_HOST=0.0.0.0
+        DASHBOARD_DEBUG=false
+        DASHBOARD_THREADED=true
+        
+        # === Trading Mode Configuration ===
+        TRADING_MODE=live
+        
+        # === Trading Strategy Configuration ===
+        DATA_PROVIDER=ctrader
+        BROKER=ctrader
+        TRADING_INTERVAL=M15
+        TRADING_START_DATE=2025-06-28
+        
+        # === Strategy Parameters ===
+        Z_ENTRY=2.0
+        Z_EXIT=0.5
+        Z_PERIOD=100
+        MIN_DISTANCE=0
+        MIN_VOLATILITY=0
+        ENABLE_ADF=false
+        MAX_ADF_PVAL=0.05
+        ADF_PERIOD=100
+        ENABLE_JOHANSEN=false
+        JOHANSEN_CRIT_LEVEL=95
+        ENABLE_CORRELATION=false
+        MIN_CORR=0.7
+        CORR_PERIOD=100
+        ENABLE_VOL_RATIO=false
+        VOL_RATIO_MAX=2
+        DYNAMIC_Z=false
+        
+        # === Risk Management Parameters ===
+        TAKE_PROFIT_PERC=5
+        STOP_LOSS_PERC=5
+        TRAILING_STOP_PERC=10
+        COOLDOWN_BARS=0
+        MAX_POSITION_SIZE=500
+        MAX_OPEN_POSITIONS=10
+        MAX_MONETARY_EXPOSURE=100000
+        MONETARY_VALUE_TOLERANCE=0.05
+        MAX_COMMISSION_PERC=0.2
+        COMMISSION_FIXED=0.02
+        SLIPPAGE_POINTS=3
+        MAX_PAIR_DRAWDOWN_PERC=5
+        MAX_PORTFOLIO_DRAWDOWN_PERC=10
+        INITIAL_PORTFOLIO_VALUE=100000.0
+        
+        # === System Parameters ===
+        USE_MULTIPROCESSING=true
+        MAX_WORKERS=8
+        REALTIME_TRADING=true
+        
+        # === Notification Settings ===
+        ENABLE_TRADE_ALERTS=true
+        ENABLE_SYSTEM_ALERTS=true
+        ENABLE_PERFORMANCE_ALERTS=true
+        
+        # === State Management Database Configuration ===
+        TRADING_STATE_DB_TYPE=influxdb
+        TRADING_STATE_ENABLE_VALIDATION=true
+        TRADING_STATE_ENABLE_FILE_FALLBACK=true
+        TRADING_STATE_LOG_LEVEL=WARNING
+        
+        # === API Configuration ===
+        TRADING_STATE_API_ENABLED=true
+        TRADING_STATE_API_HOST=0.0.0.0
+        TRADING_STATE_API_PORT=8000
+        EOF
+        
+        # Add secrets to environment file (Local InfluxDB Configuration - Username/Password Auth)
+        echo "INFLUXDB_URL=http://influxdb:8086" >> .env
+        echo "INFLUXDB_USERNAME=${{ secrets.INFLUXDB_USERNAME }}" >> .env
+        echo "INFLUXDB_PASSWORD=${{ secrets.INFLUXDB_PASSWORD }}" >> .env
+        echo "INFLUXDB_ORG=${{ secrets.INFLUXDB_ORG }}" >> .env
+        echo "INFLUXDB_BUCKET=${{ secrets.INFLUXDB_BUCKET }}" >> .env
+        echo "CTRADER_CLIENT_ID=${{ secrets.CTRADER_CLIENT_ID }}" >> .env
+        echo "CTRADER_CLIENT_SECRET=${{ secrets.CTRADER_CLIENT_SECRET }}" >> .env
+        echo "CTRADER_ACCESS_TOKEN=${{ secrets.CTRADER_ACCESS_TOKEN }}" >> .env
+        echo "CTRADER_ACCOUNT_ID=${{ secrets.CTRADER_ACCOUNT_ID }}" >> .env
+        echo "CTRADER_HOST_TYPE=${{ secrets.CTRADER_HOST_TYPE }}" >> .env
+        
+        # Add trading pairs - use secret if provided, otherwise use default pairs
+        TRADING_PAIRS_VALUE="${{ secrets.TRADING_PAIRS }}"
+        if [ -n "$TRADING_PAIRS_VALUE" ] && [ "$TRADING_PAIRS_VALUE" != "" ] && [ "$TRADING_PAIRS_VALUE" != "null" ]; then
+          # Clean the trading pairs value (remove brackets, quotes, whitespace, etc.)
+          CLEANED_PAIRS=$(echo "$TRADING_PAIRS_VALUE" | tr -d '\n\r\t ' | sed 's/^\[//g' | sed 's/\]$//g' | sed 's/"//g' | sed 's/,/,/g')
+          echo "TRADING_PAIRS=$CLEANED_PAIRS" >> .env
+          echo "Using custom trading pairs: $CLEANED_PAIRS"
+        else
+          echo "TRADING_PAIRS=V.US-MA.US" >> .env
+          echo "Using default trading pairs: V.US-MA.US"
+        fi
+        
+        # Add state management secrets (Local InfluxDB with username/password)
+        echo "TRADING_STATE_INFLUXDB_URL=http://influxdb:8086" >> .env
+        echo "TRADING_STATE_INFLUXDB_USERNAME=${{ secrets.INFLUXDB_USERNAME }}" >> .env
+        echo "TRADING_STATE_INFLUXDB_PASSWORD=${{ secrets.INFLUXDB_PASSWORD }}" >> .env
+        echo "TRADING_STATE_INFLUXDB_ORG=${{ secrets.INFLUXDB_ORG }}" >> .env
+        echo "TRADING_STATE_INFLUXDB_BUCKET=${{ secrets.INFLUXDB_BUCKET }}" >> .env
+
+    - name: Create trading pairs configuration file
+      run: |
+        # Create empty pairs.json file as fallback
+        cat > pairs.json << 'EOF'
+        []
+        EOF
+
+    - name: Create container start script
+      run: |
+        cat > start-container.sh << 'EOF'
+        #!/bin/bash
+        set -e
+        
+        SERVICE_NAME="${{ env.SERVICE_NAME }}"
+        IMAGE_NAME="${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}:latest"
+        
+        # Determine if we need to use sudo for docker commands
+        USE_SUDO=""
+        if ! docker info >/dev/null 2>&1; then
+            echo "Using sudo for Docker commands due to permission issues..."
+            USE_SUDO="sudo"
+        fi
+        
+        # Ensure .env file exists in the correct location
+        if [ ! -f "/opt/trading-system/.env" ]; then
+            echo "❌ Environment file not found at /opt/trading-system/.env"
+            exit 1
+        fi
+        
+        # Ensure config directory and pairs.json exist
+        if [ ! -f "/opt/trading-system/pairs_config/pairs.json" ]; then
+            echo "⚠️ Pairs configuration file not found, creating empty fallback..."
+            echo '[]' | sudo tee /opt/trading-system/pairs_config/pairs.json > /dev/null
+        fi
+        
+        # Fix permissions for mounted volumes
+        echo "🔧 Setting proper permissions for mounted directories..."
+        sudo chown -R 1000:1000 /opt/trading-system/logs
+        sudo chown -R 1000:1000 /opt/trading-system/data
+        sudo chown -R 1000:1000 /opt/trading-system/backtest_reports
+        sudo chown -R 1000:1000 /opt/trading-system/cache
+        sudo chown -R 1000:1000 /opt/trading-system/pairs_config
+        sudo chmod -R 755 /opt/trading-system/logs
+        sudo chmod -R 755 /opt/trading-system/data
+        sudo chmod -R 755 /opt/trading-system/backtest_reports
+        sudo chmod -R 755 /opt/trading-system/cache
+        sudo chmod -R 755 /opt/trading-system/pairs_config
+        
+        # Create InfluxDB data directories
+        echo "📁 Creating InfluxDB directories..."
+        sudo mkdir -p /opt/trading-system/influxdb-data
+        sudo mkdir -p /opt/trading-system/influxdb-config
+        sudo chown -R 1000:1000 /opt/trading-system/influxdb-data
+        sudo chown -R 1000:1000 /opt/trading-system/influxdb-config
+        sudo chmod -R 755 /opt/trading-system/influxdb-data
+        sudo chmod -R 755 /opt/trading-system/influxdb-config
+        
+        # Start InfluxDB container first
+        echo "📊 Starting InfluxDB container..."
+        $USE_SUDO docker run -d \
+          --name "influxdb" \
+          --restart unless-stopped \
+          -p 8086:8086 \
+          -v /opt/trading-system/influxdb-data:/var/lib/influxdb2 \
+          -v /opt/trading-system/influxdb-config:/etc/influxdb2 \
+          -e DOCKER_INFLUXDB_INIT_MODE=setup \
+          -e DOCKER_INFLUXDB_INIT_USERNAME=${{ secrets.INFLUXDB_USERNAME }} \
+          -e DOCKER_INFLUXDB_INIT_PASSWORD=${{ secrets.INFLUXDB_PASSWORD }} \
+          -e DOCKER_INFLUXDB_INIT_ORG=${{ secrets.INFLUXDB_ORG }} \
+          -e DOCKER_INFLUXDB_INIT_BUCKET=${{ secrets.INFLUXDB_BUCKET }} \
+          --memory=512m \
+          --cpus=1 \
+          --log-driver=json-file \
+          --log-opt max-size=50m \
+          --log-opt max-file=3 \
+          influxdb:2.7-alpine
+        
+        # Wait for InfluxDB to be ready
+        echo "⏳ Waiting for InfluxDB to initialize..."
+        sleep 15
+        
+        # Start new container
+        echo "🚀 Starting new service..."
+        $USE_SUDO docker run -d \
+          --name "$SERVICE_NAME" \
+          --restart unless-stopped \
+          -p 80:8050 \
+          -p 443:8050 \
+          -p 8080:8080 \
+          --link influxdb:influxdb \
+          --env-file /opt/trading-system/.env \
+          -v /opt/trading-system/logs:/app/logs \
+          -v /opt/trading-system/backtest_reports:/app/backtest_reports \
+          -v /opt/trading-system/cache:/app/cache \
+          -v /opt/trading-system/pairs_config:/app/pairs_config \
+          --memory=2g \
+          --cpus=2 \
+          --log-driver=json-file \
+          --log-opt max-size=100m \
+          --log-opt max-file=5 \
+          "$IMAGE_NAME"
+        
+        # Verify deployment
+        echo "🔍 Verifying deployment..."
+        sleep 15
+        
+        if $USE_SUDO docker ps | grep -q "$SERVICE_NAME"; then
+          echo "✅ Container is running successfully!"
+          
+          # Check container health
+          CONTAINER_STATUS=$($USE_SUDO docker inspect -f '{{.State.Status}}' "$SERVICE_NAME")
+          echo "📊 Container status: $CONTAINER_STATUS"
+          
+          if [ "$CONTAINER_STATUS" = "running" ]; then
+            echo "✅ Container is healthy"
+            echo "📋 Recent logs:"
+            $USE_SUDO docker logs --tail 20 "$SERVICE_NAME"
+          else
+            echo "❌ Container is not in running state"
+            $USE_SUDO docker logs "$SERVICE_NAME"
+            exit 1
+          fi
+        else
+          echo "❌ Service failed to start!"
+          $USE_SUDO docker logs "$SERVICE_NAME"
+          exit 1
+        fi
+        
+        # Health check
+        echo "🏥 Performing health check..."
+        for i in {1..8}; do
+          if timeout 5 curl -f http://localhost/health >/dev/null 2>&1; then
+            echo "✅ Health check passed!"
+            break
+          fi
+          if [ $i -eq 8 ]; then
+            echo "❌ Health check failed after 8 attempts"
+            echo "📋 Container status:"
+            $USE_SUDO docker ps --filter name="$SERVICE_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+            echo "📋 Recent logs:"
+            $USE_SUDO docker logs --tail 20 "$SERVICE_NAME"
+            exit 1
+          fi
+          echo "⏳ Waiting for service to be ready... ($i/8)"
+          sleep 8
+        done
+        
+        # Display service info
+        echo "📊 Service Information:"
+        echo "Container ID: $($USE_SUDO docker ps -q -f name=$SERVICE_NAME)"
+        echo "Image: $IMAGE_NAME"
+        echo "Status: $($USE_SUDO docker inspect -f '{{.State.Status}}' $SERVICE_NAME)"
+        echo "Started: $($USE_SUDO docker inspect -f '{{.State.StartedAt}}' $SERVICE_NAME)"
+        EOF
+        
+        chmod +x start-container.sh
+
+    - name: Deploy to VM via SSH
+      timeout-minutes: 15
+      run: |
+        # Add VM to known hosts with timeout
+        timeout 30 gcloud compute ssh ${{ env.VM_NAME }} \
+          --zone=${{ env.VM_ZONE }} \
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --command="echo 'SSH connection test successful'" \
+          --ssh-flag="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
+        
+        # Copy deployment script to VM
+        gcloud compute scp deploy.sh ${{ env.VM_NAME }}:~/deploy.sh \
+          --zone=${{ env.VM_ZONE }} \
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --scp-flag="-o ConnectTimeout=10"
+        
+        # Copy environment file to VM
+        gcloud compute scp .env ${{ env.VM_NAME }}:~/trading-system.env \
+          --zone=${{ env.VM_ZONE }} \
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --scp-flag="-o ConnectTimeout=10"
+        
+        # Copy pairs configuration to VM
+        gcloud compute scp pairs.json ${{ env.VM_NAME }}:~/pairs.json \
+          --zone=${{ env.VM_ZONE }} \
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --scp-flag="-o ConnectTimeout=10"
+        
+        # Copy container start script to VM
+        gcloud compute scp start-container.sh ${{ env.VM_NAME }}:~/start-container.sh \
+          --zone=${{ env.VM_ZONE }} \
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --scp-flag="-o ConnectTimeout=10"
+        
+        # Execute deployment on VM with timeout
+        timeout 600 gcloud compute ssh ${{ env.VM_NAME }} \
+          --zone=${{ env.VM_ZONE }} \
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --ssh-flag="-o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=3" \
+          --command="chmod +x ~/deploy.sh && ~/deploy.sh && sudo mv ~/trading-system.env /opt/trading-system/.env && sudo mv ~/pairs.json /opt/trading-system/pairs_config/pairs.json && sudo chown -R \$USER:\$USER /opt/trading-system && chmod +x ~/start-container.sh && cd /opt/trading-system && ~/start-container.sh"
+
+    - name: VM Docker cleanup
+      run: |
+        echo "🧹 Performing Docker cleanup on VM..."
+        gcloud compute ssh ${{ env.VM_NAME }} \
+          --zone=${{ env.VM_ZONE }} \
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --ssh-flag="-o ConnectTimeout=10" \
+          --command="
+            echo 'Current images before cleanup:';
+            docker images | grep trading-system || true;
+            echo '';
+            echo 'Cleaning up old trading-system images (keeping latest 3)...';
+            
+            # Get image IDs of old images (skip the latest 3)
+            OLD_IMAGES=\$(docker images us-east4-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/trading-system/trading-system --format '{{.ID}} {{.CreatedAt}}' | sort -k2 -r | tail -n +4 | awk '{print \$1}');
+            
+            if [ -n \"\$OLD_IMAGES\" ]; then
+              echo \"Removing images: \$OLD_IMAGES\";
+              echo \"\$OLD_IMAGES\" | xargs -r docker rmi -f || true;
+              echo 'Old images removed successfully';
+            else
+              echo 'No old images to remove';
+            fi;
+            
+            echo '';
+            echo 'Cleaning up dangling images...';
+            docker image prune -f || true;
+            
+            echo '';
+            echo 'Final cleanup - removing unused images...';
+            docker system prune -f || true;
+            
+            echo '';
+            echo 'Images after cleanup:';
+            docker images | grep trading-system || echo 'No trading-system images found';
+            
+            echo '';
+            echo 'Disk usage:';
+            df -h /var/lib/docker 2>/dev/null || df -h / | grep -v tmpfs | head -2;
+          " || echo "Cleanup completed with some warnings"
+
+    - name: Post-deployment verification
+      timeout-minutes: 5
+      run: |
+        # Get VM external IP
+        VM_IP=$(gcloud compute instances describe ${{ env.VM_NAME }} \
+          --zone=${{ env.VM_ZONE }} \
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
+        
+        echo "🌐 VM External IP: $VM_IP"
+        
+        # Quick firewall rules verification
+        echo "🔥 Verifying firewall configuration..."
+        VM_TAGS=$(gcloud compute instances describe ${{ env.VM_NAME }} \
+          --zone=${{ env.VM_ZONE }} \
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --format="value(tags.items[])")
+        echo "📋 VM Network Tags: $VM_TAGS"
+        
+        # Quick firewall rules check with timeout
+        DASHBOARD_RULE_EXISTS=$(timeout 10 gcloud compute firewall-rules describe allow-trading-dashboard --project=${{ secrets.GCP_PROJECT_ID }} --format="value(name)" 2>/dev/null || echo "")
+        API_RULE_EXISTS=$(timeout 10 gcloud compute firewall-rules describe allow-trading-api --project=${{ secrets.GCP_PROJECT_ID }} --format="value(name)" 2>/dev/null || echo "")
+        
+        if [ -n "$DASHBOARD_RULE_EXISTS" ]; then
+          echo "✅ Dashboard firewall rule exists"
+        else
+          echo "❌ Dashboard firewall rule missing"
+        fi
+        
+        if [ -n "$API_RULE_EXISTS" ]; then
+          echo "✅ API firewall rule exists"
+        else
+          echo "❌ API firewall rule missing"
+        fi
+        
+        # Optimized external health check with shorter timeouts
+        echo "🔍 External health check (quick)..."
+        HEALTH_CHECK_SUCCESS=false
+        
+        for i in {1..6}; do
+          # Use shorter timeout (5 seconds instead of default 30+)
+          if timeout 5 curl -f "http://$VM_IP/health" >/dev/null 2>&1; then
+            echo "✅ External health check passed!"
+            echo "🎯 Dashboard URL: http://$VM_IP"
+            echo "🎯 API URL: http://$VM_IP:8080"
+            HEALTH_CHECK_SUCCESS=true
+            break
+          fi
+          echo "⏳ Waiting for external access... ($i/6)"
+          sleep 10
+        done
+        
+        # Only do troubleshooting if health check failed
+        if [ "$HEALTH_CHECK_SUCCESS" = "false" ]; then
+          echo "❌ External health check failed after 6 attempts"
+          echo "🔍 Quick troubleshooting..."
+          
+          # Quick container status check with timeout
+          echo "   - Checking container status..."
+          timeout 30 gcloud compute ssh ${{ env.VM_NAME }} \
+            --zone=${{ env.VM_ZONE }} \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --ssh-flag="-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3" \
+            --command="docker ps --filter name=trading-system --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'" || echo "   - SSH connection timed out"
+          
+          # Quick log check with timeout  
+          echo "   - Checking recent logs..."
+          timeout 30 gcloud compute ssh ${{ env.VM_NAME }} \
+            --zone=${{ env.VM_ZONE }} \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --ssh-flag="-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3" \
+            --command="docker logs --tail 10 trading-system 2>/dev/null || echo 'Container logs unavailable'" || echo "   - Log retrieval timed out"
+          
+          echo ""
+          echo "🔍 Manual verification steps:"
+          echo "   1. Check container: gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.VM_ZONE }} --command='docker ps'"
+          echo "   2. Check logs: gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.VM_ZONE }} --command='docker logs trading-system'"
+          echo "   3. Test locally: gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.VM_ZONE }} --command='curl http://localhost/health'"
+          echo "   4. Check firewall: gcloud compute firewall-rules list --filter='name:allow-trading*'"
+        fi
+
+    - name: Notify deployment status
+      if: always()
+      run: |
+        # Get VM external IP
+        VM_IP=$(gcloud compute instances describe ${{ env.VM_NAME }} \
+          --zone=${{ env.VM_ZONE }} \
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --format="value(networkInterfaces[0].accessConfigs[0].natIP)")
+        
+        if [ "${{ job.status }}" = "success" ]; then
+          echo "✅ Deployment completed successfully!"
+          echo "📊 Service Status: Active"
+          echo "🔗 Dashboard URL: http://$VM_IP"
+          echo "🔗 Dashboard HTTPS: https://$VM_IP (if SSL configured)"
+          echo "🔗 API URL: http://$VM_IP:8080"
+          echo "🔗 Health Check: http://$VM_IP/health"
+          echo ""
+          echo "🔥 Firewall Rules:"
+          echo "   - allow-trading-dashboard: Port 80 (HTTP)"
+          echo "   - allow-trading-https: Port 443 (HTTPS)"
+          echo "   - allow-trading-api: Port 8080 (API)"
+          echo ""
+          echo "🏷️ VM Network Tags: trading-system"
+        else
+          echo "❌ Deployment failed!"
+          echo "📋 Check the logs above for details"
+          echo "🔍 Common issues:"
+          echo "   - Firewall rules not applied"
+          echo "   - Container startup failed"
+          echo "   - Network connectivity issues"
+        fi
+
+  # Job 3: Cleanup (optional)
+  cleanup:
+    name: Cleanup Old Resources
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy-to-vm]
+    if: success() && github.ref == 'refs/heads/version/2.3'
+    
+    steps:
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Cleanup old images
+      run: |
+        echo "🧹 Cleaning up old Docker images in Artifact Registry..."
+        
+        # Get list of images with proper sorting
+        IMAGES_TO_DELETE=$(gcloud artifacts docker images list \
+          ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }} \
+          --sort-by="~CREATE_TIME" \
+          --format="value(IMAGE)" | tail -n +6)  # Keep latest 5 instead of 10
+        
+        if [ -n "$IMAGES_TO_DELETE" ]; then
+          echo "Images to delete:"
+          echo "$IMAGES_TO_DELETE"
+          echo ""
+          
+          echo "$IMAGES_TO_DELETE" | while read image; do
+            if [ -n "$image" ]; then
+              echo "Deleting: $image"
+              gcloud artifacts docker images delete "$image" --quiet || echo "Failed to delete $image"
+            fi
+          done
+        else
+          echo "No old images to delete"
+        fi
+        
+        echo "✅ Artifact Registry cleanup completed"
+        
+        # Show remaining images
+        echo "📊 Remaining images in registry:"
+        gcloud artifacts docker images list \
+          ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }} \
+          --sort-by="~CREATE_TIME" \
+          --limit=10
