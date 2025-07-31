@@ -2,10 +2,10 @@ name: Build and Push to Google Artifact Registry
 
 on:
   push:
-    branches: [ version/2.2 ]
+    branches: [ version/2.3 ]
     tags: [ 'v*' ]
   pull_request:
-    branches: [ version/2.2 ]
+    branches: [ version/2.3 ]
   workflow_dispatch:
 
 env:
@@ -121,7 +121,7 @@ jobs:
         
         if [ "${{ github.ref_type }}" = "tag" ]; then
           echo "🎉 Release build for tag: ${{ github.ref_name }}"
-        elif [ "${{ github.ref_name }}" = "version/2.2" ]; then
+        elif [ "${{ github.ref_name }}" = "version/2.3" ]; then
           echo "🔧 Version 2.2 branch build"
         fi
 
@@ -129,7 +129,7 @@ jobs:
     name: Update Deployment
     runs-on: ubuntu-latest
     needs: build-and-push
-    if: github.ref == 'refs/heads/version/2.2'
+    if: github.ref == 'refs/heads/version/2.3'
     
     steps:
     - name: Checkout code

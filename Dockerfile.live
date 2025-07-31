@@ -57,23 +57,8 @@ echo "Environment: ${TRADING_MODE:-live}"\n\
 echo "Data Provider: ${DATA_PROVIDER:-ctrader}"\n\
 echo "Broker: ${BROKER:-ctrader}"\n\
 \n\
-# Health check endpoint for Cloud Run\n\
-python -c "from http.server import HTTPServer, BaseHTTPRequestHandler\n\
-import threading, time\n\
-class HealthHandler(BaseHTTPRequestHandler):\n\
-    def do_GET(self):\n\
-        if self.path == \"/health\":\n\
-            self.send_response(200)\n\
-            self.end_headers()\n\
-            self.wfile.write(b\"OK\")\n\
-        else:\n\
-            self.send_response(404)\n\
-            self.end_headers()\n\
-server = HTTPServer((\"0.0.0.0\", 8050), HealthHandler)\n\
-threading.Thread(target=server.serve_forever, daemon=True).start()\n\
-print(\"Health endpoint started on :8050\")" &\n\
-\n\
-# Start the main trading application\n\
+# Start the main trading application with dashboard\n\
+# The main script will handle both dashboard and health endpoint on port 8050\n\
 exec python -m scripts.pair_trading.main --mode live --data-provider ${DATA_PROVIDER:-ctrader} --broker ${BROKER:-ctrader}\n\
 ' > /app/entrypoint.live.sh && chmod +x /app/entrypoint.live.sh
 

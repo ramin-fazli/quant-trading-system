@@ -75,12 +75,7 @@ try:
     # Find .env file in project root
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
     env_path = os.path.join(project_root, '.env')
-    
-    if os.path.exists(env_path):
-        load_dotenv(env_path)
-        # print(f"✅ Loaded environment variables from: {env_path}")
-    else:
-        print(f"⚠️  .env file not found at: {env_path}")
+
         
 except ImportError:
     print("⚠️  python-dotenv not installed. Install with: pip install python-dotenv")

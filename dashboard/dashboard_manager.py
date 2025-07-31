@@ -368,7 +368,8 @@ class DashboardManager:
                 self.app,
                 host=self.config.host,
                 port=self.config.port,
-                debug=False
+                debug=False,
+                allow_unsafe_werkzeug=True  # Allow production deployment
             )
         else:
             self.app.run(

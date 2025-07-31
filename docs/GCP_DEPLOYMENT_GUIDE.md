@@ -99,7 +99,7 @@ Navigate to your GitHub repository → Settings → Secrets and variables → Ac
    ```bash
    git add .
    git commit -m "Deploy to GCP VM"
-   git push origin version/2.2
+   git push origin version/2.3
    ```
 
 2. **Monitor deployment:**
@@ -227,7 +227,7 @@ DISK_TYPE="pd-ssd"
 ## 🔄 Updating the System
 
 ### Automatic Updates
-- Push to `version/2.2` branch triggers automatic deployment
+- Push to `version/2.3` branch triggers automatic deployment
 - No downtime deployment with health checks
 - Automatic rollback on deployment failure
 
