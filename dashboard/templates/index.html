@@ -1,0 +1,509 @@
+{% extends "base.html" %}
+
+{% block page_title %}Dashboard Overview{% endblock %}
+
+{% block content %}
+<div class="row">
+    <!-- Key Metrics Cards -->
+    <div class="col-md-3 mb-4">
+        <div class="metric-card p-3">
+            <div class="d-flex justify-content-between align-items-center">
+                <div>
+                    <div class="metric-label">Portfolio Value</div>
+                    <div class="metric-value" id="portfolio-value">$--</div>
+                    <small class="text-muted" id="portfolio-change">--</small>
+                </div>
+                <div class="text-primary">
+                    <i class="fas fa-wallet fa-2x"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-3 mb-4">
+        <div class="metric-card p-3">
+            <div class="d-flex justify-content-between align-items-center">
+                <div>
+                    <div class="metric-label">Total Return</div>
+                    <div class="metric-value" id="total-return">--%</div>
+                    <small class="text-muted">Since inception</small>
+                </div>
+                <div class="text-success">
+                    <i class="fas fa-chart-line fa-2x"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-3 mb-4">
+        <div class="metric-card p-3">
+            <div class="d-flex justify-content-between align-items-center">
+                <div>
+                    <div class="metric-label">Sharpe Ratio</div>
+                    <div class="metric-value" id="sharpe-ratio">--</div>
+                    <small class="text-muted">Risk-adjusted return</small>
+                </div>
+                <div class="text-info">
+                    <i class="fas fa-balance-scale fa-2x"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-3 mb-4">
+        <div class="metric-card p-3">
+            <div class="d-flex justify-content-between align-items-center">
+                <div>
+                    <div class="metric-label">Max Drawdown</div>
+                    <div class="metric-value" id="max-drawdown">--%</div>
+                    <small class="text-muted">Peak to trough</small>
+                </div>
+                <div class="text-warning">
+                    <i class="fas fa-arrow-down fa-2x"></i>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Portfolio Equity Curve -->
+    <div class="col-lg-8 mb-4">
+        <div class="chart-container">
+            <h5><i class="fas fa-chart-area"></i> Portfolio Equity Curve</h5>
+            <div id="equity-curve-chart" style="height: 400px;">
+                <div class="loading">
+                    <i class="fas fa-spinner fa-spin"></i>
+                    Loading equity curve...
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Performance Summary -->
+    <div class="col-lg-4 mb-4">
+        <div class="chart-container">
+            <h5><i class="fas fa-chart-pie"></i> Performance Summary</h5>
+            <div class="row">
+                <div class="col-12 mb-3">
+                    <div class="d-flex justify-content-between">
+                        <span>Total Trades:</span>
+                        <strong id="total-trades">--</strong>
+                    </div>
+                </div>
+                <div class="col-12 mb-3">
+                    <div class="d-flex justify-content-between">
+                        <span>Win Rate:</span>
+                        <strong id="win-rate" class="positive">--%</strong>
+                    </div>
+                </div>
+                <div class="col-12 mb-3">
+                    <div class="d-flex justify-content-between">
+                        <span>Profit Factor:</span>
+                        <strong id="profit-factor">--</strong>
+                    </div>
+                </div>
+                <div class="col-12 mb-3">
+                    <div class="d-flex justify-content-between">
+                        <span>Avg Trade Return:</span>
+                        <strong id="avg-trade-return">--%</strong>
+                    </div>
+                </div>
+                <div class="col-12 mb-3">
+                    <div class="d-flex justify-content-between">
+                        <span>Active Pairs:</span>
+                        <strong id="overview-active-pairs">--</strong>
+                    </div>
+                </div>
+                <div class="col-12 mb-3">
+                    <div class="d-flex justify-content-between">
+                        <span>Profitable Pairs:</span>
+                        <strong id="profitable-pairs" class="positive">--</strong>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Top Performing Pairs -->
+    <div class="col-lg-6 mb-4">
+        <div class="data-table">
+            <div class="p-3 border-bottom">
+                <h5><i class="fas fa-trophy"></i> Top Performing Pairs</h5>
+            </div>
+            <div class="table-responsive">
+                <table class="table table-hover mb-0">
+                    <thead>
+                        <tr>
+                            <th>Pair</th>
+                            <th>Return %</th>
+                            <th>Sharpe</th>
+                            <th>Trades</th>
+                        </tr>
+                    </thead>
+                    <tbody id="top-pairs-table">
+                        <tr>
+                            <td colspan="4" class="text-center text-muted">Loading...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Recent Activity -->
+    <div class="col-lg-6 mb-4">
+        <div class="data-table">
+            <div class="p-3 border-bottom">
+                <h5><i class="fas fa-clock"></i> Recent Activity</h5>
+            </div>
+            <div class="p-3">
+                <div id="recent-activity">
+                    <div class="text-center text-muted">
+                        <i class="fas fa-history"></i><br>
+                        No recent activity
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Risk Metrics -->
+    <div class="col-lg-6 mb-4">
+        <div class="chart-container">
+            <h5><i class="fas fa-shield-alt"></i> Risk Metrics</h5>
+            <div id="risk-radar-chart" style="height: 300px;">
+                <div class="loading">
+                    <i class="fas fa-spinner fa-spin"></i>
+                    Loading risk metrics...
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Performance Distribution -->
+    <div class="col-lg-6 mb-4">
+        <div class="chart-container">
+            <h5><i class="fas fa-chart-bar"></i> Returns Distribution</h5>
+            <div id="performance-distribution-chart" style="height: 300px;">
+                <div class="loading">
+                    <i class="fas fa-spinner fa-spin"></i>
+                    Loading distribution...
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- System Status -->
+    <div class="col-lg-12 mb-4">
+        <div class="data-table">
+            <div class="p-3 border-bottom">
+                <h5><i class="fas fa-server"></i> System Status</h5>
+            </div>
+            <div class="p-3">
+                <div class="row">
+                    <div class="col-md-3">
+                        <div class="text-center">
+                            <div class="status-indicator" id="data-status"></div>
+                            <div class="small">Data Connection</div>
+                            <div class="small text-muted" id="data-status-text">--</div>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="text-center">
+                            <div class="status-indicator" id="broker-status"></div>
+                            <div class="small">Broker Connection</div>
+                            <div class="small text-muted" id="broker-status-text">--</div>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="text-center">
+                            <div class="status-indicator" id="trading-status"></div>
+                            <div class="small">Trading Engine</div>
+                            <div class="small text-muted" id="trading-status-text">--</div>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="text-center">
+                            <div class="status-indicator" id="websocket-status-indicator"></div>
+                            <div class="small">WebSocket</div>
+                            <div class="small text-muted" id="websocket-status-text">--</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+    // Page-specific variables
+    let equityChart = null;
+    let riskRadarChart = null;
+    let distributionChart = null;
+
+    // Initialize page
+    document.addEventListener('DOMContentLoaded', function() {
+        loadOverviewData();
+        subscribeToUpdates('backtest');
+        subscribeToUpdates('live');
+        subscribeToUpdates('portfolio');
+        subscribeToUpdates('status');
+    });
+
+    // Load initial overview data
+    async function loadOverviewData() {
+        try {
+            // Load backtest summary
+            const backtestData = await fetchAPI('/backtest/summary');
+            if (backtestData) {
+                updateOverviewMetrics(backtestData);
+            }
+            
+            // Load top pairs
+            const pairsData = await fetchAPI('/backtest/pairs?per_page=10');
+            if (pairsData && pairsData.pairs) {
+                updateTopPairsTable(pairsData.pairs);
+            }
+            
+            // Load charts
+            const chartsData = await fetchAPI('/backtest/charts');
+            if (chartsData) {
+                updateEquityCurveChart(chartsData.equity_curve);
+                updateRiskRadarChart(chartsData.risk_radar);
+                updateDistributionChart(chartsData.performance_distribution);
+            }
+            
+        } catch (error) {
+            console.error('Failed to load overview data:', error);
+            showAlert({
+                level: 'danger',
+                title: 'Error',
+                message: 'Failed to load dashboard data'
+            });
+        }
+    }
+
+    // Update overview metrics
+    function updateOverviewMetrics(data) {
+        const portfolioMetrics = data.portfolio_metrics || {};
+        const summary = data.summary || {};
+        
+        // Portfolio value (mock calculation)
+        const portfolioValue = 100000 * (1 + (portfolioMetrics.total_return || 0) / 100);
+        document.getElementById('portfolio-value').textContent = formatCurrency(portfolioValue);
+        
+        // Total return
+        const totalReturn = portfolioMetrics.total_return || 0;
+        const returnEl = document.getElementById('total-return');
+        returnEl.textContent = formatPercent(totalReturn);
+        returnEl.className = `metric-value ${getColorClass(totalReturn)}`;
+        
+        // Sharpe ratio
+        document.getElementById('sharpe-ratio').textContent = formatNumber(portfolioMetrics.sharpe_ratio);
+        
+        // Max drawdown
+        const maxDD = portfolioMetrics.max_drawdown || 0;
+        const ddEl = document.getElementById('max-drawdown');
+        ddEl.textContent = formatPercent(Math.abs(maxDD));
+        ddEl.className = `metric-value ${maxDD < 0 ? 'negative' : ''}`;
+        
+        // Performance summary
+        document.getElementById('total-trades').textContent = portfolioMetrics.total_trades || '--';
+        
+        const winRate = portfolioMetrics.win_rate || 0;
+        const winRateEl = document.getElementById('win-rate');
+        winRateEl.textContent = formatPercent(winRate);
+        winRateEl.className = getColorClass(winRate - 50); // Above 50% is good
+        
+        document.getElementById('profit-factor').textContent = formatNumber(portfolioMetrics.profit_factor);
+        document.getElementById('avg-trade-return').textContent = formatPercent(summary.avg_return_per_pair);
+        document.getElementById('overview-active-pairs').textContent = summary.total_pairs || '--';
+        document.getElementById('profitable-pairs').textContent = summary.profitable_pairs || '--';
+    }
+
+    // Update top pairs table
+    function updateTopPairsTable(pairs) {
+        const tbody = document.getElementById('top-pairs-table');
+        
+        if (!pairs || pairs.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted">No data available</td></tr>';
+            return;
+        }
+        
+        const rows = pairs.slice(0, 10).map(pair => {
+            const metrics = pair.metrics || {};
+            const returnValue = metrics.total_return || 0;
+            const returnClass = getColorClass(returnValue);
+            
+            return `
+                <tr>
+                    <td><strong>${metrics.pair || '--'}</strong></td>
+                    <td class="${returnClass}">${formatPercent(returnValue)}</td>
+                    <td>${formatNumber(metrics.sharpe_ratio)}</td>
+                    <td>${metrics.total_trades || '--'}</td>
+                </tr>
+            `;
+        }).join('');
+        
+        tbody.innerHTML = rows;
+    }
+
+    // Update equity curve chart
+    function updateEquityCurveChart(equityData) {
+        const chartDiv = document.getElementById('equity-curve-chart');
+        
+        if (!equityData || equityData.length === 0) {
+            chartDiv.innerHTML = '<div class="text-center text-muted p-4">No equity curve data available</div>';
+            return;
+        }
+        
+        try {
+            const timestamps = equityData.map(point => point.timestamp);
+            const values = equityData.map(point => point.value);
+            
+            const trace = {
+                x: timestamps,
+                y: values,
+                type: 'scatter',
+                mode: 'lines',
+                name: 'Portfolio Value',
+                line: { color: '#007bff', width: 2 }
+            };
+            
+            const layout = {
+                title: false,
+                xaxis: { title: 'Date' },
+                yaxis: { title: 'Portfolio Value' },
+                margin: { l: 50, r: 50, t: 20, b: 50 },
+                showlegend: false
+            };
+            
+            Plotly.newPlot(chartDiv, [trace], layout, { responsive: true });
+            
+        } catch (error) {
+            console.error('Failed to create equity curve chart:', error);
+            chartDiv.innerHTML = '<div class="text-center text-muted p-4">Failed to load equity curve</div>';
+        }
+    }
+
+    // Update risk radar chart
+    function updateRiskRadarChart(riskData) {
+        const chartDiv = document.getElementById('risk-radar-chart');
+        
+        if (!riskData || typeof riskData !== 'object') {
+            chartDiv.innerHTML = '<div class="text-center text-muted p-4">No risk data available</div>';
+            return;
+        }
+        
+        try {
+            // Create radar chart data
+            const categories = Object.keys(riskData);
+            const values = Object.values(riskData);
+            
+            const trace = {
+                type: 'scatterpolar',
+                r: values,
+                theta: categories,
+                fill: 'toself',
+                name: 'Risk Profile'
+            };
+            
+            const layout = {
+                polar: {
+                    radialaxis: {
+                        visible: true,
+                        range: [0, 100]
+                    }
+                },
+                margin: { l: 50, r: 50, t: 20, b: 50 },
+                showlegend: false
+            };
+            
+            Plotly.newPlot(chartDiv, [trace], layout, { responsive: true });
+            
+        } catch (error) {
+            console.error('Failed to create risk radar chart:', error);
+            chartDiv.innerHTML = '<div class="text-center text-muted p-4">Failed to load risk metrics</div>';
+        }
+    }
+
+    // Update performance distribution chart
+    function updateDistributionChart(distributionData) {
+        const chartDiv = document.getElementById('performance-distribution-chart');
+        
+        if (!distributionData || !distributionData.returns) {
+            chartDiv.innerHTML = '<div class="text-center text-muted p-4">No distribution data available</div>';
+            return;
+        }
+        
+        try {
+            const trace = {
+                x: distributionData.returns,
+                type: 'histogram',
+                nbinsx: 20,
+                name: 'Returns Distribution'
+            };
+            
+            const layout = {
+                title: false,
+                xaxis: { title: 'Return %' },
+                yaxis: { title: 'Frequency' },
+                margin: { l: 50, r: 50, t: 20, b: 50 },
+                showlegend: false
+            };
+            
+            Plotly.newPlot(chartDiv, [trace], layout, { responsive: true });
+            
+        } catch (error) {
+            console.error('Failed to create distribution chart:', error);
+            chartDiv.innerHTML = '<div class="text-center text-muted p-4">Failed to load distribution</div>';
+        }
+    }
+
+    // Handle backtest data updates
+    function updateBacktestDisplay(data) {
+        if (data.portfolio_metrics) {
+            updateOverviewMetrics(data);
+        }
+        
+        if (data.pairs) {
+            updateTopPairsTable(data.pairs);
+        }
+        
+        if (data.charts) {
+            if (data.charts.equity_curve) {
+                updateEquityCurveChart(data.charts.equity_curve.data);
+            }
+            if (data.charts.risk_radar) {
+                updateRiskRadarChart(data.charts.risk_radar.data);
+            }
+            if (data.charts.performance_distribution) {
+                updateDistributionChart(data.charts.performance_distribution.data);
+            }
+        }
+    }
+
+    // Handle live data updates
+    function updateLiveDisplay(data) {
+        // Update real-time metrics if available
+        if (data.portfolio) {
+            updateQuickStats(data.portfolio);
+        }
+    }
+
+    // Handle portfolio updates
+    function updatePortfolioDisplay(data) {
+        // Update portfolio-specific displays
+        updateQuickStats(data.portfolio || data);
+    }
+</script>
+{% endblock %}

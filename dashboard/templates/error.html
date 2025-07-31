@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+
+{% block page_title %}Error{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8 col-lg-6">
+        <div class="text-center">
+            <div class="mb-4">
+                <i class="fas fa-exclamation-triangle fa-5x text-warning"></i>
+            </div>
+            
+            <h1 class="display-4 mb-3">{{ error_code or '500' }}</h1>
+            <h2 class="mb-4">{{ error_title or 'Something went wrong' }}</h2>
+            
+            <div class="alert alert-warning" role="alert">
+                <strong>Error Details:</strong><br>
+                {{ error_message or 'An unexpected error occurred. Please try again later.' }}
+            </div>
+            
+            <div class="mb-4">
+                <a href="/" class="btn btn-primary btn-lg me-3">
+                    <i class="fas fa-home"></i> Go to Dashboard
+                </a>
+                <button onclick="window.history.back()" class="btn btn-secondary btn-lg">
+                    <i class="fas fa-arrow-left"></i> Go Back
+                </button>
+            </div>
+            
+            {% if error_code == '404' %}
+            <div class="alert alert-info" role="alert">
+                <h5>Looking for something specific?</h5>
+                <p>Try navigating to one of these sections:</p>
+                <div class="row mt-3">
+                    <div class="col-md-6">
+                        <a href="/" class="btn btn-outline-primary btn-sm w-100 mb-2">
+                            <i class="fas fa-tachometer-alt"></i> Overview
+                        </a>
+                        <a href="/backtest" class="btn btn-outline-primary btn-sm w-100 mb-2">
+                            <i class="fas fa-history"></i> Backtest Results
+                        </a>
+                        <a href="/live" class="btn btn-outline-primary btn-sm w-100 mb-2">
+                            <i class="fas fa-broadcast-tower"></i> Live Trading
+                        </a>
+                    </div>
+                    <div class="col-md-6">
+                        <a href="/portfolio" class="btn btn-outline-primary btn-sm w-100 mb-2">
+                            <i class="fas fa-briefcase"></i> Portfolio
+                        </a>
+                        <a href="/pairs" class="btn btn-outline-primary btn-sm w-100 mb-2">
+                            <i class="fas fa-link"></i> Pairs Analysis
+                        </a>
+                        <a href="/settings" class="btn btn-outline-primary btn-sm w-100 mb-2">
+                            <i class="fas fa-cog"></i> Settings
+                        </a>
+                    </div>
+                </div>
+            </div>
+            {% endif %}
+            
+            {% if error_traceback and config.debug %}
+            <div class="mt-4">
+                <details class="text-start">
+                    <summary class="btn btn-outline-danger btn-sm">
+                        <i class="fas fa-bug"></i> Show Technical Details
+                    </summary>
+                    <div class="mt-3">
+                        <pre class="bg-dark text-light p-3 rounded"><code>{{ error_traceback }}</code></pre>
+                    </div>
+                </details>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+<div class="row mt-5">
+    <div class="col-12">
+        <div class="chart-container">
+            <h5><i class="fas fa-info-circle"></i> System Status</h5>
+            <div class="row">
+                <div class="col-md-3">
+                    <div class="metric-card p-3">
+                        <div class="metric-value" id="system-status">Checking...</div>
+                        <div class="metric-label">System Health</div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="metric-card p-3">
+                        <div class="metric-value" id="error-timestamp">{{ moment().format('HH:mm:ss') if moment else '--' }}</div>
+                        <div class="metric-label">Error Time</div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="metric-card p-3">
+                        <div class="metric-value" id="user-agent">{{ request.headers.get('User-Agent', 'Unknown')[:20] + '...' if request.headers.get('User-Agent') else 'Unknown' }}</div>
+                        <div class="metric-label">Browser</div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="metric-card p-3">
+                        <div class="metric-value" id="request-path">{{ request.path if request else '/' }}</div>
+                        <div class="metric-label">Requested Path</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        checkSystemStatus();
+    });
+
+    async function checkSystemStatus() {
+        try {
+            const response = await fetch('/api/status');
+            if (response.ok) {
+                document.getElementById('system-status').textContent = 'Online';
+                document.getElementById('system-status').className = 'metric-value text-success';
+            } else {
+                document.getElementById('system-status').textContent = 'Issues';
+                document.getElementById('system-status').className = 'metric-value text-warning';
+            }
+        } catch (error) {
+            document.getElementById('system-status').textContent = 'Offline';
+            document.getElementById('system-status').className = 'metric-value text-danger';
+        }
+    }
+</script>
+{% endblock %}

@@ -133,7 +133,8 @@ cache/
 # Reports (generated)
 reports/
 backtest_reports/
-*.html
+reports/*.html
+backtest_reports/*.html
 *.xlsx
 !examples/sample_reports/
 

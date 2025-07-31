@@ -1,0 +1,708 @@
+{% extends "base.html" %}
+
+{% block page_title %}Backtest Results{% endblock %}
+
+{% block content %}
+<div class="row">
+    <!-- Backtest Summary -->
+    <div class="col-lg-12 mb-4">
+        <div class="chart-container">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+                <h4><i class="fas fa-chart-line"></i> Backtest Summary</h4>
+                <div class="btn-group">
+                    <button class="btn btn-outline-primary btn-sm" onclick="refreshBacktestData()">
+                        <i class="fas fa-sync-alt"></i> Refresh
+                    </button>
+                    <button class="btn btn-outline-secondary btn-sm" onclick="exportResults()">
+                        <i class="fas fa-download"></i> Export
+                    </button>
+                </div>
+            </div>
+            
+            <div class="row">
+                <div class="col-md-2">
+                    <div class="metric-card p-3 h-100">
+                        <div class="metric-label">Total Return</div>
+                        <div class="metric-value" id="bt-total-return">--%</div>
+                    </div>
+                </div>
+                <div class="col-md-2">
+                    <div class="metric-card p-3 h-100">
+                        <div class="metric-label">Sharpe Ratio</div>
+                        <div class="metric-value" id="bt-sharpe-ratio">--</div>
+                    </div>
+                </div>
+                <div class="col-md-2">
+                    <div class="metric-card p-3 h-100">
+                        <div class="metric-label">Max Drawdown</div>
+                        <div class="metric-value" id="bt-max-drawdown">--%</div>
+                    </div>
+                </div>
+                <div class="col-md-2">
+                    <div class="metric-card p-3 h-100">
+                        <div class="metric-label">Total Trades</div>
+                        <div class="metric-value" id="bt-total-trades">--</div>
+                    </div>
+                </div>
+                <div class="col-md-2">
+                    <div class="metric-card p-3 h-100">
+                        <div class="metric-label">Win Rate</div>
+                        <div class="metric-value" id="bt-win-rate">--%</div>
+                    </div>
+                </div>
+                <div class="col-md-2">
+                    <div class="metric-card p-3 h-100">
+                        <div class="metric-label">Profit Factor</div>
+                        <div class="metric-value" id="bt-profit-factor">--</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Portfolio Equity & Drawdown -->
+    <div class="col-lg-8 mb-4">
+        <div class="chart-container">
+            <h5><i class="fas fa-chart-area"></i> Portfolio Performance</h5>
+            <div class="btn-group btn-group-sm mb-3">
+                <button class="btn btn-outline-primary active" onclick="showEquityChart()">Equity Curve</button>
+                <button class="btn btn-outline-primary" onclick="showDrawdownChart()">Drawdown</button>
+                <button class="btn btn-outline-primary" onclick="showCombinedChart()">Combined</button>
+            </div>
+            <div id="portfolio-performance-chart" style="height: 450px;">
+                <div class="loading">
+                    <i class="fas fa-spinner fa-spin"></i>
+                    Loading performance chart...
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Performance Analytics -->
+    <div class="col-lg-4 mb-4">
+        <div class="chart-container">
+            <h5><i class="fas fa-chart-pie"></i> Performance Analytics</h5>
+            <div id="performance-analytics" style="height: 450px;">
+                <div class="loading">
+                    <i class="fas fa-spinner fa-spin"></i>
+                    Loading analytics...
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Monthly Returns Heatmap -->
+    <div class="col-lg-8 mb-4">
+        <div class="chart-container">
+            <h5><i class="fas fa-calendar-alt"></i> Monthly Returns Heatmap</h5>
+            <div id="monthly-returns-heatmap" style="height: 350px;">
+                <div class="loading">
+                    <i class="fas fa-spinner fa-spin"></i>
+                    Loading monthly returns...
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Trade Analysis -->
+    <div class="col-lg-4 mb-4">
+        <div class="chart-container">
+            <h5><i class="fas fa-exchange-alt"></i> Trade Analysis</h5>
+            <div id="trade-analysis-chart" style="height: 350px;">
+                <div class="loading">
+                    <i class="fas fa-spinner fa-spin"></i>
+                    Loading trade analysis...
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <!-- Pairs Performance Table -->
+    <div class="col-lg-12 mb-4">
+        <div class="data-table">
+            <div class="p-3 border-bottom d-flex justify-content-between align-items-center">
+                <h5><i class="fas fa-table"></i> Pairs Performance</h5>
+                <div class="d-flex gap-2">
+                    <select class="form-select form-select-sm" id="sort-select" onchange="sortPairsTable()">
+                        <option value="total_return">Sort by Return</option>
+                        <option value="sharpe_ratio">Sort by Sharpe</option>
+                        <option value="total_trades">Sort by Trades</option>
+                        <option value="win_rate">Sort by Win Rate</option>
+                    </select>
+                    <div class="input-group input-group-sm">
+                        <input type="text" class="form-control" id="search-pairs" placeholder="Search pairs..." onkeyup="filterPairsTable()">
+                        <span class="input-group-text"><i class="fas fa-search"></i></span>
+                    </div>
+                </div>
+            </div>
+            <div class="table-responsive" style="max-height: 600px; overflow-y: auto;">
+                <table class="table table-hover table-striped mb-0">
+                    <thead class="sticky-top">
+                        <tr>
+                            <th>Rank</th>
+                            <th>Pair</th>
+                            <th>Total Return %</th>
+                            <th>Sharpe Ratio</th>
+                            <th>Sortino Ratio</th>
+                            <th>Max Drawdown %</th>
+                            <th>Total Trades</th>
+                            <th>Win Rate %</th>
+                            <th>Profit Factor</th>
+                            <th>Avg Trade %</th>
+                            <th>Best Trade %</th>
+                            <th>Worst Trade %</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pairs-performance-table">
+                        <tr>
+                            <td colspan="13" class="text-center text-muted p-4">Loading pairs data...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Pair Detail Modal -->
+<div class="modal fade" id="pairDetailModal" tabindex="-1">
+    <div class="modal-dialog modal-xl">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="pairModalTitle">Pair Details</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div id="pair-detail-content">
+                    <div class="text-center p-4">
+                        <i class="fas fa-spinner fa-spin"></i>
+                        Loading pair details...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+    // Page variables
+    let currentChartType = 'equity';
+    let pairsData = [];
+    let filteredPairsData = [];
+    let currentSort = { field: 'total_return', order: 'desc' };
+
+    // Initialize page
+    document.addEventListener('DOMContentLoaded', function() {
+        loadBacktestData();
+        subscribeToUpdates('backtest');
+    });
+
+    // Load backtest data
+    async function loadBacktestData() {
+        try {
+            // Load summary
+            const summaryData = await fetchAPI('/backtest/summary');
+            if (summaryData) {
+                updateBacktestSummary(summaryData);
+            }
+            
+            // Load charts
+            const chartsData = await fetchAPI('/backtest/charts');
+            if (chartsData) {
+                updatePerformanceCharts(chartsData);
+            }
+            
+            // Load pairs data
+            const pairsResponse = await fetchAPI('/backtest/pairs?per_page=1000');
+            if (pairsResponse && pairsResponse.pairs) {
+                pairsData = pairsResponse.pairs;
+                filteredPairsData = [...pairsData];
+                updatePairsTable();
+            }
+            
+        } catch (error) {
+            console.error('Failed to load backtest data:', error);
+            showAlert({
+                level: 'danger',
+                title: 'Error',
+                message: 'Failed to load backtest data'
+            });
+        }
+    }
+
+    // Update backtest summary metrics
+    function updateBacktestSummary(data) {
+        const metrics = data.portfolio_metrics || {};
+        
+        // Update summary cards
+        const totalReturn = metrics.total_return || 0;
+        const returnEl = document.getElementById('bt-total-return');
+        returnEl.textContent = formatPercent(totalReturn);
+        returnEl.className = `metric-value ${getColorClass(totalReturn)}`;
+        
+        document.getElementById('bt-sharpe-ratio').textContent = formatNumber(metrics.sharpe_ratio);
+        
+        const maxDD = metrics.max_drawdown || 0;
+        const ddEl = document.getElementById('bt-max-drawdown');
+        ddEl.textContent = formatPercent(Math.abs(maxDD));
+        ddEl.className = `metric-value ${maxDD < 0 ? 'negative' : ''}`;
+        
+        document.getElementById('bt-total-trades').textContent = metrics.total_trades || '--';
+        
+        const winRate = metrics.win_rate || 0;
+        const winRateEl = document.getElementById('bt-win-rate');
+        winRateEl.textContent = formatPercent(winRate);
+        winRateEl.className = `metric-value ${getColorClass(winRate - 50)}`;
+        
+        document.getElementById('bt-profit-factor').textContent = formatNumber(metrics.profit_factor);
+    }
+
+    // Update performance charts
+    function updatePerformanceCharts(chartsData) {
+        // Update main performance chart
+        if (chartsData.equity_curve) {
+            updatePortfolioPerformanceChart(chartsData);
+        }
+        
+        // Update monthly returns heatmap
+        if (chartsData.monthly_returns) {
+            updateMonthlyReturnsHeatmap(chartsData.monthly_returns);
+        }
+        
+        // Update trade analysis
+        if (chartsData.trade_analysis) {
+            updateTradeAnalysisChart(chartsData.trade_analysis);
+        }
+        
+        // Update performance analytics
+        updatePerformanceAnalytics(chartsData);
+    }
+
+    // Update portfolio performance chart
+    function updatePortfolioPerformanceChart(chartsData) {
+        const chartDiv = document.getElementById('portfolio-performance-chart');
+        
+        try {
+            let traces = [];
+            
+            if (currentChartType === 'equity' || currentChartType === 'combined') {
+                const equityData = chartsData.equity_curve?.data || [];
+                if (equityData.length > 0) {
+                    traces.push({
+                        x: equityData.map(point => point.timestamp),
+                        y: equityData.map(point => point.value),
+                        type: 'scatter',
+                        mode: 'lines',
+                        name: 'Portfolio Value',
+                        line: { color: '#007bff', width: 2 },
+                        yaxis: 'y'
+                    });
+                }
+            }
+            
+            if (currentChartType === 'drawdown' || currentChartType === 'combined') {
+                const drawdownData = chartsData.drawdown?.data || [];
+                if (drawdownData.length > 0) {
+                    traces.push({
+                        x: drawdownData.map(point => point.timestamp),
+                        y: drawdownData.map(point => point.value),
+                        type: 'scatter',
+                        mode: 'lines',
+                        name: 'Drawdown %',
+                        line: { color: '#dc3545', width: 2 },
+                        fill: 'tozeroy',
+                        fillcolor: 'rgba(220, 53, 69, 0.3)',
+                        yaxis: currentChartType === 'combined' ? 'y2' : 'y'
+                    });
+                }
+            }
+            
+            let layout = {
+                title: false,
+                xaxis: { title: 'Date' },
+                margin: { l: 50, r: 50, t: 20, b: 50 },
+                showlegend: true,
+                legend: { x: 0, y: 1 }
+            };
+            
+            if (currentChartType === 'combined') {
+                layout.yaxis = { title: 'Portfolio Value', side: 'left' };
+                layout.yaxis2 = { 
+                    title: 'Drawdown %', 
+                    side: 'right', 
+                    overlaying: 'y',
+                    range: [Math.min(...(chartsData.drawdown?.data || [{value: 0}]).map(p => p.value)) * 1.1, 0]
+                };
+            } else if (currentChartType === 'equity') {
+                layout.yaxis = { title: 'Portfolio Value' };
+            } else {
+                layout.yaxis = { title: 'Drawdown %' };
+            }
+            
+            Plotly.newPlot(chartDiv, traces, layout, { responsive: true });
+            
+        } catch (error) {
+            console.error('Failed to create performance chart:', error);
+            chartDiv.innerHTML = '<div class="text-center text-muted p-4">Failed to load performance chart</div>';
+        }
+    }
+
+    // Update monthly returns heatmap
+    function updateMonthlyReturnsHeatmap(heatmapData) {
+        const chartDiv = document.getElementById('monthly-returns-heatmap');
+        
+        if (!heatmapData || !heatmapData.data) {
+            chartDiv.innerHTML = '<div class="text-center text-muted p-4">No monthly returns data available</div>';
+            return;
+        }
+        
+        try {
+            // Process data for heatmap
+            const data = heatmapData.data;
+            const years = [...new Set(data.map(d => d.year))].sort();
+            const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                          'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+            
+            const z = months.map(month => 
+                years.map(year => {
+                    const entry = data.find(d => d.year === year && d.month === month);
+                    return entry ? entry.return : null;
+                })
+            );
+            
+            const trace = {
+                type: 'heatmap',
+                z: z,
+                x: years,
+                y: months,
+                colorscale: 'RdYlGn',
+                showscale: true,
+                hoverongaps: false,
+                text: z.map(row => row.map(val => val !== null ? val.toFixed(2) + '%' : '')),
+                texttemplate: '%{text}',
+                textfont: { size: 10 }
+            };
+            
+            const layout = {
+                title: false,
+                xaxis: { title: 'Year' },
+                yaxis: { title: 'Month' },
+                margin: { l: 50, r: 50, t: 20, b: 50 }
+            };
+            
+            Plotly.newPlot(chartDiv, [trace], layout, { responsive: true });
+            
+        } catch (error) {
+            console.error('Failed to create monthly returns heatmap:', error);
+            chartDiv.innerHTML = '<div class="text-center text-muted p-4">Failed to load monthly returns</div>';
+        }
+    }
+
+    // Update trade analysis chart
+    function updateTradeAnalysisChart(tradeData) {
+        const chartDiv = document.getElementById('trade-analysis-chart');
+        
+        if (!tradeData || !tradeData.data) {
+            chartDiv.innerHTML = '<div class="text-center text-muted p-4">No trade analysis data available</div>';
+            return;
+        }
+        
+        try {
+            const data = tradeData.data;
+            
+            const trace = {
+                type: 'bar',
+                x: ['Total Trades', 'Winning Trades', 'Losing Trades'],
+                y: [data.total_trades || 0, data.winning_trades || 0, data.losing_trades || 0],
+                marker: {
+                    color: ['#6c757d', '#28a745', '#dc3545']
+                },
+                text: [data.total_trades || 0, data.winning_trades || 0, data.losing_trades || 0],
+                textposition: 'auto'
+            };
+            
+            const layout = {
+                title: false,
+                xaxis: { title: 'Trade Type' },
+                yaxis: { title: 'Count' },
+                margin: { l: 50, r: 50, t: 20, b: 50 },
+                showlegend: false
+            };
+            
+            Plotly.newPlot(chartDiv, [trace], layout, { responsive: true });
+            
+        } catch (error) {
+            console.error('Failed to create trade analysis chart:', error);
+            chartDiv.innerHTML = '<div class="text-center text-muted p-4">Failed to load trade analysis</div>';
+        }
+    }
+
+    // Update performance analytics
+    function updatePerformanceAnalytics(chartsData) {
+        const chartDiv = document.getElementById('performance-analytics');
+        
+        try {
+            // Create performance distribution histogram
+            const distributionData = chartsData.performance_distribution?.data;
+            if (distributionData && distributionData.returns) {
+                const trace = {
+                    type: 'histogram',
+                    x: distributionData.returns,
+                    nbinsx: 20,
+                    marker: { color: '#007bff', opacity: 0.7 }
+                };
+                
+                const layout = {
+                    title: 'Returns Distribution',
+                    xaxis: { title: 'Return %' },
+                    yaxis: { title: 'Frequency' },
+                    margin: { l: 50, r: 50, t: 30, b: 50 },
+                    showlegend: false
+                };
+                
+                Plotly.newPlot(chartDiv, [trace], layout, { responsive: true });
+            } else {
+                chartDiv.innerHTML = '<div class="text-center text-muted p-4">No distribution data available</div>';
+            }
+            
+        } catch (error) {
+            console.error('Failed to create performance analytics:', error);
+            chartDiv.innerHTML = '<div class="text-center text-muted p-4">Failed to load analytics</div>';
+        }
+    }
+
+    // Update pairs table
+    function updatePairsTable() {
+        const tbody = document.getElementById('pairs-performance-table');
+        
+        if (!filteredPairsData || filteredPairsData.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="13" class="text-center text-muted p-4">No pairs data available</td></tr>';
+            return;
+        }
+        
+        const rows = filteredPairsData.map((pair, index) => {
+            const metrics = pair.metrics || {};
+            
+            return `
+                <tr>
+                    <td><strong>${index + 1}</strong></td>
+                    <td><strong>${metrics.pair || '--'}</strong></td>
+                    <td class="${getColorClass(metrics.total_return)}">${formatPercent(metrics.total_return)}</td>
+                    <td>${formatNumber(metrics.sharpe_ratio)}</td>
+                    <td>${formatNumber(metrics.sortino_ratio)}</td>
+                    <td class="${metrics.max_drawdown < 0 ? 'negative' : ''}">${formatPercent(Math.abs(metrics.max_drawdown || 0))}</td>
+                    <td>${metrics.total_trades || '--'}</td>
+                    <td class="${getColorClass((metrics.win_rate || 0) - 50)}">${formatPercent(metrics.win_rate)}</td>
+                    <td>${formatNumber(metrics.profit_factor)}</td>
+                    <td class="${getColorClass(metrics.avg_trade_return)}">${formatPercent(metrics.avg_trade_return)}</td>
+                    <td class="positive">${formatPercent(metrics.best_trade)}</td>
+                    <td class="negative">${formatPercent(metrics.worst_trade)}</td>
+                    <td>
+                        <button class="btn btn-sm btn-outline-primary" onclick="showPairDetail('${metrics.pair}')">
+                            <i class="fas fa-eye"></i>
+                        </button>
+                    </td>
+                </tr>
+            `;
+        }).join('');
+        
+        tbody.innerHTML = rows;
+    }
+
+    // Chart type switching functions
+    function showEquityChart() {
+        currentChartType = 'equity';
+        document.querySelectorAll('.btn-group .btn').forEach(btn => btn.classList.remove('active'));
+        event.target.classList.add('active');
+        loadBacktestData(); // Reload charts
+    }
+
+    function showDrawdownChart() {
+        currentChartType = 'drawdown';
+        document.querySelectorAll('.btn-group .btn').forEach(btn => btn.classList.remove('active'));
+        event.target.classList.add('active');
+        loadBacktestData(); // Reload charts
+    }
+
+    function showCombinedChart() {
+        currentChartType = 'combined';
+        document.querySelectorAll('.btn-group .btn').forEach(btn => btn.classList.remove('active'));
+        event.target.classList.add('active');
+        loadBacktestData(); // Reload charts
+    }
+
+    // Sort pairs table
+    function sortPairsTable() {
+        const sortField = document.getElementById('sort-select').value;
+        const currentOrder = currentSort.field === sortField ? 
+            (currentSort.order === 'desc' ? 'asc' : 'desc') : 'desc';
+        
+        currentSort = { field: sortField, order: currentOrder };
+        
+        filteredPairsData.sort((a, b) => {
+            const aVal = a.metrics[sortField] || 0;
+            const bVal = b.metrics[sortField] || 0;
+            
+            if (currentOrder === 'desc') {
+                return bVal - aVal;
+            } else {
+                return aVal - bVal;
+            }
+        });
+        
+        updatePairsTable();
+    }
+
+    // Filter pairs table
+    function filterPairsTable() {
+        const searchTerm = document.getElementById('search-pairs').value.toLowerCase();
+        
+        if (searchTerm === '') {
+            filteredPairsData = [...pairsData];
+        } else {
+            filteredPairsData = pairsData.filter(pair => 
+                (pair.metrics.pair || '').toLowerCase().includes(searchTerm)
+            );
+        }
+        
+        updatePairsTable();
+    }
+
+    // Show pair detail modal
+    async function showPairDetail(pairName) {
+        const modal = new bootstrap.Modal(document.getElementById('pairDetailModal'));
+        document.getElementById('pairModalTitle').textContent = `${pairName} - Detailed Analysis`;
+        
+        const contentDiv = document.getElementById('pair-detail-content');
+        contentDiv.innerHTML = '<div class="text-center p-4"><i class="fas fa-spinner fa-spin"></i> Loading pair details...</div>';
+        
+        modal.show();
+        
+        try {
+            const pairData = await fetchAPI(`/backtest/pair/${encodeURIComponent(pairName)}`);
+            
+            if (pairData) {
+                // Create detailed pair analysis content
+                contentDiv.innerHTML = createPairDetailContent(pairData);
+            } else {
+                contentDiv.innerHTML = '<div class="text-center text-muted p-4">No detailed data available for this pair</div>';
+            }
+            
+        } catch (error) {
+            console.error('Failed to load pair details:', error);
+            contentDiv.innerHTML = '<div class="text-center text-danger p-4">Failed to load pair details</div>';
+        }
+    }
+
+    // Create pair detail content
+    function createPairDetailContent(pairData) {
+        const metrics = pairData.metrics || {};
+        const trades = pairData.trades || [];
+        
+        return `
+            <div class="row">
+                <div class="col-md-6">
+                    <h6>Performance Metrics</h6>
+                    <table class="table table-sm">
+                        <tr><td>Total Return:</td><td class="${getColorClass(metrics.total_return)}">${formatPercent(metrics.total_return)}</td></tr>
+                        <tr><td>Sharpe Ratio:</td><td>${formatNumber(metrics.sharpe_ratio)}</td></tr>
+                        <tr><td>Sortino Ratio:</td><td>${formatNumber(metrics.sortino_ratio)}</td></tr>
+                        <tr><td>Max Drawdown:</td><td class="negative">${formatPercent(Math.abs(metrics.max_drawdown || 0))}</td></tr>
+                        <tr><td>Volatility:</td><td>${formatPercent(metrics.volatility)}</td></tr>
+                    </table>
+                </div>
+                <div class="col-md-6">
+                    <h6>Trading Statistics</h6>
+                    <table class="table table-sm">
+                        <tr><td>Total Trades:</td><td>${metrics.total_trades || 0}</td></tr>
+                        <tr><td>Win Rate:</td><td class="${getColorClass((metrics.win_rate || 0) - 50)}">${formatPercent(metrics.win_rate)}</td></tr>
+                        <tr><td>Profit Factor:</td><td>${formatNumber(metrics.profit_factor)}</td></tr>
+                        <tr><td>Best Trade:</td><td class="positive">${formatPercent(metrics.best_trade)}</td></tr>
+                        <tr><td>Worst Trade:</td><td class="negative">${formatPercent(metrics.worst_trade)}</td></tr>
+                    </table>
+                </div>
+            </div>
+            
+            ${trades.length > 0 ? `
+            <div class="mt-4">
+                <h6>Recent Trades</h6>
+                <div class="table-responsive" style="max-height: 300px;">
+                    <table class="table table-sm table-striped">
+                        <thead>
+                            <tr>
+                                <th>Entry Time</th>
+                                <th>Exit Time</th>
+                                <th>Direction</th>
+                                <th>Return %</th>
+                                <th>P&L</th>
+                                <th>Duration</th>
+                                <th>Exit Reason</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${trades.slice(0, 20).map(trade => `
+                                <tr>
+                                    <td>${trade.entry_time || '--'}</td>
+                                    <td>${trade.exit_time || '--'}</td>
+                                    <td><span class="badge bg-${trade.direction === 'LONG' ? 'success' : 'danger'}">${trade.direction || '--'}</span></td>
+                                    <td class="${getColorClass(trade.return_pct)}">${formatPercent(trade.return_pct)}</td>
+                                    <td class="${getColorClass(trade.pnl)}">${formatCurrency(trade.pnl)}</td>
+                                    <td>${trade.duration || '--'}</td>
+                                    <td>${trade.exit_reason || '--'}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            ` : ''}
+        `;
+    }
+
+    // Refresh backtest data
+    function refreshBacktestData() {
+        loadBacktestData();
+        showAlert({
+            level: 'info',
+            title: 'Refreshed',
+            message: 'Backtest data has been refreshed'
+        });
+    }
+
+    // Export results
+    function exportResults() {
+        // TODO: Implement export functionality
+        showAlert({
+            level: 'info',
+            title: 'Export',
+            message: 'Export functionality coming soon'
+        });
+    }
+
+    // Handle backtest updates from WebSocket
+    function updateBacktestDisplay(data) {
+        if (data.portfolio_metrics) {
+            updateBacktestSummary(data);
+        }
+        
+        if (data.pairs) {
+            pairsData = data.pairs;
+            filteredPairsData = [...pairsData];
+            updatePairsTable();
+        }
+        
+        if (data.charts) {
+            updatePerformanceCharts(data.charts);
+        }
+    }
+</script>
+{% endblock %}

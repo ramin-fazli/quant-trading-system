@@ -153,6 +153,45 @@ jobs:
     - name: Set up Cloud SDK
       uses: google-github-actions/setup-gcloud@v2
 
+    - name: Configure firewall rules
+      run: |
+        echo "🔥 Configuring firewall rules for trading system..."
+        
+        # Create firewall rule for dashboard (port 8050) if it doesn't exist
+        if ! gcloud compute firewall-rules describe allow-trading-dashboard --project=${{ secrets.GCP_PROJECT_ID }} >/dev/null 2>&1; then
+          echo "Creating firewall rule for dashboard (port 8050)..."
+          gcloud compute firewall-rules create allow-trading-dashboard \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --allow tcp:8050 \
+            --source-ranges 0.0.0.0/0 \
+            --description "Allow access to trading system dashboard" \
+            --target-tags trading-system
+        else
+          echo "✅ Dashboard firewall rule already exists"
+        fi
+        
+        # Create firewall rule for API (port 8080) if it doesn't exist
+        if ! gcloud compute firewall-rules describe allow-trading-api --project=${{ secrets.GCP_PROJECT_ID }} >/dev/null 2>&1; then
+          echo "Creating firewall rule for API (port 8080)..."
+          gcloud compute firewall-rules create allow-trading-api \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --allow tcp:8080 \
+            --source-ranges 0.0.0.0/0 \
+            --description "Allow access to trading system API" \
+            --target-tags trading-system
+        else
+          echo "✅ API firewall rule already exists"
+        fi
+        
+        # Apply network tags to the VM (this is safe to run multiple times)
+        echo "🏷️ Applying network tags to VM..."
+        gcloud compute instances add-tags ${{ env.VM_NAME }} \
+          --zone=${{ env.VM_ZONE }} \
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --tags trading-system
+        
+        echo "✅ Firewall configuration completed"
+
     - name: Verify VM exists and is running
       run: |
         echo "🔍 Checking VM status..."
@@ -444,19 +483,21 @@ jobs:
         
         # Health check
         echo "🏥 Performing health check..."
-        for i in {1..12}; do
-          if curl -f http://localhost:8050/health >/dev/null 2>&1; then
+        for i in {1..8}; do
+          if timeout 5 curl -f http://localhost:8050/health >/dev/null 2>&1; then
             echo "✅ Health check passed!"
             break
           fi
-          if [ $i -eq 12 ]; then
-            echo "❌ Health check failed after 12 attempts"
-            echo "📋 Container logs:"
-            $USE_SUDO docker logs --tail 50 "$SERVICE_NAME"
+          if [ $i -eq 8 ]; then
+            echo "❌ Health check failed after 8 attempts"
+            echo "📋 Container status:"
+            $USE_SUDO docker ps --filter name="$SERVICE_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+            echo "📋 Recent logs:"
+            $USE_SUDO docker logs --tail 20 "$SERVICE_NAME"
             exit 1
           fi
-          echo "⏳ Waiting for service to be ready... ($i/12)"
-          sleep 10
+          echo "⏳ Waiting for service to be ready... ($i/8)"
+          sleep 8
         done
         
         # Display service info
@@ -470,41 +511,48 @@ jobs:
         chmod +x start-container.sh
 
     - name: Deploy to VM via SSH
+      timeout-minutes: 15
       run: |
-        # Add VM to known hosts
-        gcloud compute ssh ${{ env.VM_NAME }} \
+        # Add VM to known hosts with timeout
+        timeout 30 gcloud compute ssh ${{ env.VM_NAME }} \
           --zone=${{ env.VM_ZONE }} \
           --project=${{ secrets.GCP_PROJECT_ID }} \
           --command="echo 'SSH connection test successful'" \
-          --ssh-flag="-o StrictHostKeyChecking=no"
+          --ssh-flag="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
         
         # Copy deployment script to VM
         gcloud compute scp deploy.sh ${{ env.VM_NAME }}:~/deploy.sh \
           --zone=${{ env.VM_ZONE }} \
-          --project=${{ secrets.GCP_PROJECT_ID }}
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --ssh-flag="-o ConnectTimeout=10"
         
         # Copy environment file to VM
         gcloud compute scp .env ${{ env.VM_NAME }}:~/trading-system.env \
           --zone=${{ env.VM_ZONE }} \
-          --project=${{ secrets.GCP_PROJECT_ID }}
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --ssh-flag="-o ConnectTimeout=10"
         
         # Copy pairs configuration to VM
         gcloud compute scp pairs.json ${{ env.VM_NAME }}:~/pairs.json \
           --zone=${{ env.VM_ZONE }} \
-          --project=${{ secrets.GCP_PROJECT_ID }}
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --ssh-flag="-o ConnectTimeout=10"
         
         # Copy container start script to VM
         gcloud compute scp start-container.sh ${{ env.VM_NAME }}:~/start-container.sh \
           --zone=${{ env.VM_ZONE }} \
-          --project=${{ secrets.GCP_PROJECT_ID }}
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --ssh-flag="-o ConnectTimeout=10"
         
-        # Execute deployment on VM
-        gcloud compute ssh ${{ env.VM_NAME }} \
+        # Execute deployment on VM with timeout
+        timeout 600 gcloud compute ssh ${{ env.VM_NAME }} \
           --zone=${{ env.VM_ZONE }} \
           --project=${{ secrets.GCP_PROJECT_ID }} \
+          --ssh-flag="-o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=3" \
           --command="chmod +x ~/deploy.sh && ~/deploy.sh && sudo mv ~/trading-system.env /opt/trading-system/.env && sudo mv ~/pairs.json /opt/trading-system/pairs_config/pairs.json && sudo chown -R \$USER:\$USER /opt/trading-system && chmod +x ~/start-container.sh && cd /opt/trading-system && ~/start-container.sh"
 
     - name: Post-deployment verification
+      timeout-minutes: 5
       run: |
         # Get VM external IP
         VM_IP=$(gcloud compute instances describe ${{ env.VM_NAME }} \
@@ -514,17 +562,75 @@ jobs:
         
         echo "🌐 VM External IP: $VM_IP"
         
-        # Final health check from outside
-        echo "🔍 External health check..."
+        # Quick firewall rules verification
+        echo "🔥 Verifying firewall configuration..."
+        VM_TAGS=$(gcloud compute instances describe ${{ env.VM_NAME }} \
+          --zone=${{ env.VM_ZONE }} \
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --format="value(tags.items[])")
+        echo "📋 VM Network Tags: $VM_TAGS"
+        
+        # Quick firewall rules check with timeout
+        DASHBOARD_RULE_EXISTS=$(timeout 10 gcloud compute firewall-rules describe allow-trading-dashboard --project=${{ secrets.GCP_PROJECT_ID }} --format="value(name)" 2>/dev/null || echo "")
+        API_RULE_EXISTS=$(timeout 10 gcloud compute firewall-rules describe allow-trading-api --project=${{ secrets.GCP_PROJECT_ID }} --format="value(name)" 2>/dev/null || echo "")
+        
+        if [ -n "$DASHBOARD_RULE_EXISTS" ]; then
+          echo "✅ Dashboard firewall rule exists"
+        else
+          echo "❌ Dashboard firewall rule missing"
+        fi
+        
+        if [ -n "$API_RULE_EXISTS" ]; then
+          echo "✅ API firewall rule exists"
+        else
+          echo "❌ API firewall rule missing"
+        fi
+        
+        # Optimized external health check with shorter timeouts
+        echo "🔍 External health check (quick)..."
+        HEALTH_CHECK_SUCCESS=false
+        
         for i in {1..6}; do
-          if curl -f "http://$VM_IP:8050/health" >/dev/null 2>&1; then
+          # Use shorter timeout (5 seconds instead of default 30+)
+          if timeout 5 curl -f "http://$VM_IP:8050/health" >/dev/null 2>&1; then
             echo "✅ External health check passed!"
             echo "🎯 Dashboard URL: http://$VM_IP:8050"
+            echo "🎯 API URL: http://$VM_IP:8080"
+            HEALTH_CHECK_SUCCESS=true
             break
           fi
           echo "⏳ Waiting for external access... ($i/6)"
           sleep 10
         done
+        
+        # Only do troubleshooting if health check failed
+        if [ "$HEALTH_CHECK_SUCCESS" = "false" ]; then
+          echo "❌ External health check failed after 6 attempts"
+          echo "🔍 Quick troubleshooting..."
+          
+          # Quick container status check with timeout
+          echo "   - Checking container status..."
+          timeout 30 gcloud compute ssh ${{ env.VM_NAME }} \
+            --zone=${{ env.VM_ZONE }} \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --ssh-flag="-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3" \
+            --command="docker ps --filter name=trading-system --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'" || echo "   - SSH connection timed out"
+          
+          # Quick log check with timeout  
+          echo "   - Checking recent logs..."
+          timeout 30 gcloud compute ssh ${{ env.VM_NAME }} \
+            --zone=${{ env.VM_ZONE }} \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --ssh-flag="-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3" \
+            --command="docker logs --tail 10 trading-system 2>/dev/null || echo 'Container logs unavailable'" || echo "   - Log retrieval timed out"
+          
+          echo ""
+          echo "🔍 Manual verification steps:"
+          echo "   1. Check container: gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.VM_ZONE }} --command='docker ps'"
+          echo "   2. Check logs: gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.VM_ZONE }} --command='docker logs trading-system'"
+          echo "   3. Test locally: gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.VM_ZONE }} --command='curl http://localhost:8050/health'"
+          echo "   4. Check firewall: gcloud compute firewall-rules list --filter='name:allow-trading*'"
+        fi
 
     - name: Notify deployment status
       if: always()
@@ -539,9 +645,21 @@ jobs:
           echo "✅ Deployment completed successfully!"
           echo "📊 Service Status: Active"
           echo "🔗 Dashboard: http://$VM_IP:8050"
+          echo "🔗 API: http://$VM_IP:8080"
+          echo "🔗 Health Check: http://$VM_IP:8050/health"
+          echo ""
+          echo "🔥 Firewall Rules:"
+          echo "   - allow-trading-dashboard: Port 8050"
+          echo "   - allow-trading-api: Port 8080"
+          echo ""
+          echo "🏷️ VM Network Tags: trading-system"
         else
           echo "❌ Deployment failed!"
           echo "📋 Check the logs above for details"
+          echo "🔍 Common issues:"
+          echo "   - Firewall rules not applied"
+          echo "   - Container startup failed"
+          echo "   - Network connectivity issues"
         fi
 
   # Job 3: Cleanup (optional)

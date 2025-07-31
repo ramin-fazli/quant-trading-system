@@ -1,0 +1,480 @@
+{% extends "base.html" %}
+
+{% block page_title %}Portfolio{% endblock %}
+
+{% block content %}
+<div class="row">
+    <!-- Portfolio Header -->
+    <div class="col-12">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h2><i class="fas fa-briefcase"></i> Portfolio Overview</h2>
+            <div>
+                <button class="btn btn-primary btn-sm" onclick="refreshPortfolio()">
+                    <i class="fas fa-sync-alt"></i> Refresh
+                </button>
+                <button class="btn btn-success btn-sm" onclick="exportPortfolio()">
+                    <i class="fas fa-download"></i> Export
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Portfolio Summary -->
+<div class="row mb-4">
+    <div class="col-md-2">
+        <div class="metric-card p-3">
+            <div class="metric-value" id="total-value">$0</div>
+            <div class="metric-label">Total Value</div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="metric-card p-3">
+            <div class="metric-value" id="available-cash">$0</div>
+            <div class="metric-label">Available Cash</div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="metric-card p-3">
+            <div class="metric-value" id="margin-used">0%</div>
+            <div class="metric-label">Margin Used</div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="metric-card p-3">
+            <div class="metric-value" id="day-pnl">$0</div>
+            <div class="metric-label">Day P&L</div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="metric-card p-3">
+            <div class="metric-value" id="unrealized-pnl">$0</div>
+            <div class="metric-label">Unrealized P&L</div>
+        </div>
+    </div>
+    <div class="col-md-2">
+        <div class="metric-card p-3">
+            <div class="metric-value" id="risk-level">Low</div>
+            <div class="metric-label">Risk Level</div>
+        </div>
+    </div>
+</div>
+
+<!-- Portfolio Charts -->
+<div class="row">
+    <div class="col-lg-8">
+        <div class="chart-container">
+            <h5><i class="fas fa-chart-area"></i> Portfolio Value History</h5>
+            <div id="portfolio-value-chart" style="height: 400px;"></div>
+        </div>
+    </div>
+    <div class="col-lg-4">
+        <div class="chart-container">
+            <h5><i class="fas fa-chart-pie"></i> Asset Allocation</h5>
+            <div id="allocation-chart" style="height: 400px;"></div>
+        </div>
+    </div>
+</div>
+
+<!-- Risk Metrics -->
+<div class="row">
+    <div class="col-lg-6">
+        <div class="chart-container">
+            <h5><i class="fas fa-shield-alt"></i> Risk Metrics</h5>
+            <div id="risk-chart" style="height: 350px;"></div>
+        </div>
+    </div>
+    <div class="col-lg-6">
+        <div class="chart-container">
+            <h5><i class="fas fa-chart-bar"></i> Daily Returns Distribution</h5>
+            <div id="returns-distribution-chart" style="height: 350px;"></div>
+        </div>
+    </div>
+</div>
+
+<!-- Holdings Table -->
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="data-table">
+            <div class="d-flex justify-content-between align-items-center p-3 border-bottom">
+                <h5 class="mb-0"><i class="fas fa-list"></i> Current Holdings</h5>
+                <div>
+                    <input type="text" class="form-control form-control-sm" placeholder="Search holdings..." id="holdings-search" style="width: 200px;">
+                </div>
+            </div>
+            <div class="table-responsive">
+                <table class="table table-hover mb-0">
+                    <thead>
+                        <tr>
+                            <th>Symbol</th>
+                            <th>Position</th>
+                            <th>Quantity</th>
+                            <th>Avg Price</th>
+                            <th>Current Price</th>
+                            <th>Market Value</th>
+                            <th>P&L</th>
+                            <th>% of Portfolio</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="holdings-table">
+                        <tr>
+                            <td colspan="9" class="text-center text-muted py-4">
+                                <i class="fas fa-spinner fa-spin"></i> Loading holdings...
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Recent Transactions -->
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="chart-container">
+            <h5><i class="fas fa-history"></i> Recent Transactions</h5>
+            <div class="table-responsive">
+                <table class="table table-sm">
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Type</th>
+                            <th>Symbol</th>
+                            <th>Quantity</th>
+                            <th>Price</th>
+                            <th>Total</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="transactions-table">
+                        <tr>
+                            <td colspan="7" class="text-center text-muted py-3">
+                                <i class="fas fa-info-circle"></i> No recent transactions
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+    let portfolioValueChart = null;
+    let allocationChart = null;
+    let riskChart = null;
+    let returnsChart = null;
+
+    document.addEventListener('DOMContentLoaded', function() {
+        initializePortfolioCharts();
+        loadPortfolioData();
+        subscribeToUpdates('portfolio');
+        
+        // Setup search functionality
+        document.getElementById('holdings-search').addEventListener('input', filterHoldings);
+    });
+
+    function initializePortfolioCharts() {
+        // Portfolio value chart
+        const valueData = [{
+            x: [],
+            y: [],
+            type: 'scatter',
+            mode: 'lines',
+            fill: 'tozeroy',
+            name: 'Portfolio Value',
+            line: { color: '#007bff' }
+        }];
+
+        const valueLayout = {
+            title: '',
+            xaxis: { title: 'Date' },
+            yaxis: { title: 'Value ($)' },
+            showlegend: false,
+            plot_bgcolor: 'transparent',
+            paper_bgcolor: 'transparent'
+        };
+
+        portfolioValueChart = Plotly.newPlot('portfolio-value-chart', valueData, valueLayout, {responsive: true});
+
+        // Asset allocation pie chart
+        const allocationData = [{
+            labels: [],
+            values: [],
+            type: 'pie',
+            hole: 0.4,
+            textinfo: 'label+percent',
+            textposition: 'outside'
+        }];
+
+        const allocationLayout = {
+            title: '',
+            showlegend: true,
+            plot_bgcolor: 'transparent',
+            paper_bgcolor: 'transparent'
+        };
+
+        allocationChart = Plotly.newPlot('allocation-chart', allocationData, allocationLayout, {responsive: true});
+
+        // Risk metrics radar chart
+        const riskData = [{
+            type: 'scatterpolar',
+            r: [],
+            theta: ['VaR', 'Beta', 'Correlation', 'Volatility', 'Sharpe', 'Sortino'],
+            fill: 'toself',
+            name: 'Risk Profile',
+            line: { color: '#dc3545' }
+        }];
+
+        const riskLayout = {
+            polar: {
+                radialaxis: {
+                    visible: true,
+                    range: [0, 100]
+                }
+            },
+            showlegend: false,
+            plot_bgcolor: 'transparent',
+            paper_bgcolor: 'transparent'
+        };
+
+        riskChart = Plotly.newPlot('risk-chart', riskData, riskLayout, {responsive: true});
+
+        // Returns distribution histogram
+        const returnsData = [{
+            x: [],
+            type: 'histogram',
+            nbinsx: 30,
+            name: 'Daily Returns',
+            marker: { color: '#28a745' }
+        }];
+
+        const returnsLayout = {
+            title: '',
+            xaxis: { title: 'Daily Return (%)' },
+            yaxis: { title: 'Frequency' },
+            showlegend: false,
+            plot_bgcolor: 'transparent',
+            paper_bgcolor: 'transparent'
+        };
+
+        returnsChart = Plotly.newPlot('returns-distribution-chart', returnsData, returnsLayout, {responsive: true});
+    }
+
+    async function loadPortfolioData() {
+        try {
+            const response = await fetchAPI('/portfolio');
+            updatePortfolioDisplay(response);
+        } catch (error) {
+            console.error('Failed to load portfolio data:', error);
+        }
+    }
+
+    function updatePortfolioDisplay(data) {
+        // Update summary metrics
+        if (data.summary) {
+            document.getElementById('total-value').textContent = formatCurrency(data.summary.total_value);
+            document.getElementById('available-cash').textContent = formatCurrency(data.summary.available_cash);
+            document.getElementById('margin-used').textContent = formatPercent(data.summary.margin_used);
+            
+            const dayPnlEl = document.getElementById('day-pnl');
+            dayPnlEl.innerHTML = `<span class="${getColorClass(data.summary.day_pnl)}">${formatCurrency(data.summary.day_pnl)}</span>`;
+            
+            const unrealizedPnlEl = document.getElementById('unrealized-pnl');
+            unrealizedPnlEl.innerHTML = `<span class="${getColorClass(data.summary.unrealized_pnl)}">${formatCurrency(data.summary.unrealized_pnl)}</span>`;
+            
+            document.getElementById('risk-level').textContent = data.summary.risk_level || 'Unknown';
+        }
+
+        // Update portfolio value chart
+        if (data.value_history && portfolioValueChart) {
+            const update = {
+                x: [data.value_history.map(h => new Date(h.date))],
+                y: [data.value_history.map(h => h.value)]
+            };
+            Plotly.restyle('portfolio-value-chart', update, 0);
+        }
+
+        // Update allocation chart
+        if (data.allocation && allocationChart) {
+            const update = {
+                labels: [data.allocation.map(a => a.symbol)],
+                values: [data.allocation.map(a => a.percentage)]
+            };
+            Plotly.restyle('allocation-chart', update, 0);
+        }
+
+        // Update risk chart
+        if (data.risk_metrics && riskChart) {
+            const riskValues = [
+                data.risk_metrics.var || 0,
+                data.risk_metrics.beta || 0,
+                data.risk_metrics.correlation || 0,
+                data.risk_metrics.volatility || 0,
+                data.risk_metrics.sharpe || 0,
+                data.risk_metrics.sortino || 0
+            ];
+            Plotly.restyle('risk-chart', { r: [riskValues] }, 0);
+        }
+
+        // Update returns distribution
+        if (data.daily_returns && returnsChart) {
+            Plotly.restyle('returns-distribution-chart', { x: [data.daily_returns] }, 0);
+        }
+
+        // Update holdings table
+        if (data.holdings) {
+            updateHoldingsTable(data.holdings);
+        }
+
+        // Update transactions table
+        if (data.recent_transactions) {
+            updateTransactionsTable(data.recent_transactions);
+        }
+    }
+
+    function updateHoldingsTable(holdings) {
+        const tbody = document.getElementById('holdings-table');
+        
+        if (!holdings || holdings.length === 0) {
+            tbody.innerHTML = `
+                <tr>
+                    <td colspan="9" class="text-center text-muted py-4">
+                        <i class="fas fa-info-circle"></i> No holdings found
+                    </td>
+                </tr>
+            `;
+            return;
+        }
+
+        tbody.innerHTML = holdings.map(holding => `
+            <tr data-symbol="${holding.symbol}">
+                <td><strong>${holding.symbol}</strong></td>
+                <td>
+                    <span class="badge ${holding.position_type === 'long' ? 'bg-success' : 'bg-danger'}">
+                        ${holding.position_type.toUpperCase()}
+                    </span>
+                </td>
+                <td>${formatNumber(holding.quantity, 0)}</td>
+                <td>${formatCurrency(holding.avg_price)}</td>
+                <td>${formatCurrency(holding.current_price)}</td>
+                <td>${formatCurrency(holding.market_value)}</td>
+                <td>
+                    <span class="${getColorClass(holding.pnl)}">
+                        ${formatCurrency(holding.pnl)} (${formatPercent(holding.pnl_percent)})
+                    </span>
+                </td>
+                <td>${formatPercent(holding.portfolio_percent)}</td>
+                <td>
+                    <div class="btn-group btn-group-sm">
+                        <button class="btn btn-outline-primary" onclick="viewHolding('${holding.symbol}')">
+                            <i class="fas fa-eye"></i>
+                        </button>
+                        <button class="btn btn-outline-warning" onclick="editHolding('${holding.symbol}')">
+                            <i class="fas fa-edit"></i>
+                        </button>
+                        <button class="btn btn-outline-danger" onclick="closeHolding('${holding.symbol}')">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                </td>
+            </tr>
+        `).join('');
+    }
+
+    function updateTransactionsTable(transactions) {
+        const tbody = document.getElementById('transactions-table');
+        
+        if (!transactions || transactions.length === 0) {
+            tbody.innerHTML = `
+                <tr>
+                    <td colspan="7" class="text-center text-muted py-3">
+                        <i class="fas fa-info-circle"></i> No recent transactions
+                    </td>
+                </tr>
+            `;
+            return;
+        }
+
+        tbody.innerHTML = transactions.slice(0, 10).map(tx => `
+            <tr>
+                <td>${new Date(tx.timestamp).toLocaleString()}</td>
+                <td>
+                    <span class="badge ${tx.type === 'buy' ? 'bg-success' : 'bg-danger'}">
+                        ${tx.type.toUpperCase()}
+                    </span>
+                </td>
+                <td>${tx.symbol}</td>
+                <td>${formatNumber(tx.quantity, 0)}</td>
+                <td>${formatCurrency(tx.price)}</td>
+                <td>${formatCurrency(tx.total)}</td>
+                <td>
+                    <span class="badge ${tx.status === 'completed' ? 'bg-success' : tx.status === 'pending' ? 'bg-warning' : 'bg-danger'}">
+                        ${tx.status.toUpperCase()}
+                    </span>
+                </td>
+            </tr>
+        `).join('');
+    }
+
+    function filterHoldings() {
+        const searchTerm = document.getElementById('holdings-search').value.toLowerCase();
+        const rows = document.querySelectorAll('#holdings-table tr[data-symbol]');
+        
+        rows.forEach(row => {
+            const symbol = row.dataset.symbol.toLowerCase();
+            row.style.display = symbol.includes(searchTerm) ? '' : 'none';
+        });
+    }
+
+    function refreshPortfolio() {
+        loadPortfolioData();
+        showAlert({
+            level: 'info',
+            title: 'Portfolio Refresh',
+            message: 'Portfolio data refreshed successfully'
+        });
+    }
+
+    function exportPortfolio() {
+        showAlert({
+            level: 'info',
+            title: 'Export Portfolio',
+            message: 'Portfolio export feature coming soon'
+        });
+    }
+
+    function viewHolding(symbol) {
+        showAlert({
+            level: 'info',
+            title: 'View Holding',
+            message: `Viewing details for ${symbol}`
+        });
+    }
+
+    function editHolding(symbol) {
+        showAlert({
+            level: 'info',
+            title: 'Edit Holding',
+            message: `Editing position for ${symbol}`
+        });
+    }
+
+    function closeHolding(symbol) {
+        if (confirm(`Close entire position for ${symbol}?`)) {
+            showAlert({
+                level: 'warning',
+                title: 'Close Position',
+                message: `Close request sent for ${symbol}`
+            });
+        }
+    }
+
+    // Handle WebSocket updates for portfolio data
+    window.updatePortfolioDisplay = updatePortfolioDisplay;
+</script>
+{% endblock %}

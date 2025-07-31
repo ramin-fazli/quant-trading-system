@@ -1,0 +1,284 @@
+{% extends "base.html" %}
+
+{% block page_title %}Live Trading{% endblock %}
+
+{% block content %}
+<div class="row">
+    <!-- Live Trading Header -->
+    <div class="col-12">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h2><i class="fas fa-broadcast-tower"></i> Live Trading Monitor</h2>
+            <div>
+                <button class="btn btn-success btn-sm" onclick="subscribeToUpdates('live')">
+                    <i class="fas fa-play"></i> Start Live Feed
+                </button>
+                <button class="btn btn-warning btn-sm" onclick="unsubscribeFromUpdates('live')">
+                    <i class="fas fa-pause"></i> Pause Feed
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Market Data Overview -->
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="metric-card p-3">
+            <div class="metric-value" id="live-pnl">$0.00</div>
+            <div class="metric-label">Today's P&L</div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="metric-card p-3">
+            <div class="metric-value" id="open-trades">0</div>
+            <div class="metric-label">Open Trades</div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="metric-card p-3">
+            <div class="metric-value" id="market-exposure">0%</div>
+            <div class="metric-label">Market Exposure</div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="metric-card p-3">
+            <div class="metric-value" id="last-update">--</div>
+            <div class="metric-label">Last Update</div>
+        </div>
+    </div>
+</div>
+
+<!-- Live Charts -->
+<div class="row">
+    <div class="col-lg-8">
+        <div class="chart-container">
+            <h5><i class="fas fa-chart-line"></i> Real-time P&L</h5>
+            <div id="live-pnl-chart" style="height: 400px;"></div>
+        </div>
+    </div>
+    <div class="col-lg-4">
+        <div class="chart-container">
+            <h5><i class="fas fa-tachometer-alt"></i> Market Status</h5>
+            <div id="market-status-chart" style="height: 400px;"></div>
+        </div>
+    </div>
+</div>
+
+<!-- Active Positions Table -->
+<div class="row">
+    <div class="col-12">
+        <div class="data-table">
+            <div class="table-responsive">
+                <table class="table table-hover mb-0">
+                    <thead>
+                        <tr>
+                            <th>Pair</th>
+                            <th>Position</th>
+                            <th>Entry Price</th>
+                            <th>Current Price</th>
+                            <th>P&L</th>
+                            <th>Duration</th>
+                            <th>Z-Score</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="live-positions-table">
+                        <tr>
+                            <td colspan="8" class="text-center text-muted py-4">
+                                <i class="fas fa-spinner fa-spin"></i> Loading live positions...
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Recent Signals -->
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="chart-container">
+            <h5><i class="fas fa-signal"></i> Recent Trading Signals</h5>
+            <div id="recent-signals" style="max-height: 300px; overflow-y: auto;">
+                <div class="text-center text-muted py-4">
+                    <i class="fas fa-info-circle"></i> No recent signals
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+    let livePnlChart = null;
+    let marketStatusChart = null;
+
+    document.addEventListener('DOMContentLoaded', function() {
+        initializeLiveCharts();
+        loadLiveData();
+        subscribeToUpdates('live');
+    });
+
+    function initializeLiveCharts() {
+        // Initialize real-time P&L chart
+        const pnlData = [{
+            x: [],
+            y: [],
+            type: 'scatter',
+            mode: 'lines',
+            name: 'P&L',
+            line: { color: '#007bff' }
+        }];
+
+        const pnlLayout = {
+            title: '',
+            xaxis: { title: 'Time' },
+            yaxis: { title: 'P&L ($)' },
+            showlegend: false,
+            plot_bgcolor: 'transparent',
+            paper_bgcolor: 'transparent'
+        };
+
+        livePnlChart = Plotly.newPlot('live-pnl-chart', pnlData, pnlLayout, {responsive: true});
+
+        // Initialize market status gauge
+        const gaugeData = [{
+            type: "indicator",
+            mode: "gauge+number",
+            value: 50,
+            domain: { x: [0, 1], y: [0, 1] },
+            title: { text: "Market Health" },
+            gauge: {
+                axis: { range: [null, 100] },
+                bar: { color: "#007bff" },
+                steps: [
+                    { range: [0, 30], color: "#dc3545" },
+                    { range: [30, 70], color: "#ffc107" },
+                    { range: [70, 100], color: "#28a745" }
+                ],
+                threshold: {
+                    line: { color: "red", width: 4 },
+                    thickness: 0.75,
+                    value: 90
+                }
+            }
+        }];
+
+        const gaugeLayout = {
+            plot_bgcolor: 'transparent',
+            paper_bgcolor: 'transparent',
+            font: { size: 12 }
+        };
+
+        marketStatusChart = Plotly.newPlot('market-status-chart', gaugeData, gaugeLayout, {responsive: true});
+    }
+
+    async function loadLiveData() {
+        try {
+            const response = await fetchAPI('/live/data');
+            updateLiveDisplay(response);
+        } catch (error) {
+            console.error('Failed to load live data:', error);
+        }
+    }
+
+    function updateLiveDisplay(data) {
+        // Update metrics
+        if (data.pnl !== undefined) {
+            const pnlEl = document.getElementById('live-pnl');
+            const pnlClass = data.pnl >= 0 ? 'positive' : 'negative';
+            pnlEl.innerHTML = `<span class="${pnlClass}">${formatCurrency(data.pnl)}</span>`;
+        }
+
+        if (data.open_trades !== undefined) {
+            document.getElementById('open-trades').textContent = data.open_trades;
+        }
+
+        if (data.market_exposure !== undefined) {
+            document.getElementById('market-exposure').textContent = formatPercent(data.market_exposure);
+        }
+
+        document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+
+        // Update P&L chart
+        if (data.pnl_history && livePnlChart) {
+            const update = {
+                x: [data.pnl_history.map(p => new Date(p.timestamp))],
+                y: [data.pnl_history.map(p => p.pnl)]
+            };
+            Plotly.restyle('live-pnl-chart', update, 0);
+        }
+
+        // Update positions table
+        if (data.positions) {
+            updatePositionsTable(data.positions);
+        }
+
+        // Update market status gauge
+        if (data.market_health !== undefined && marketStatusChart) {
+            Plotly.restyle('market-status-chart', { value: data.market_health }, 0);
+        }
+    }
+
+    function updatePositionsTable(positions) {
+        const tbody = document.getElementById('live-positions-table');
+        
+        if (!positions || positions.length === 0) {
+            tbody.innerHTML = `
+                <tr>
+                    <td colspan="8" class="text-center text-muted py-4">
+                        <i class="fas fa-info-circle"></i> No open positions
+                    </td>
+                </tr>
+            `;
+            return;
+        }
+
+        tbody.innerHTML = positions.map(pos => `
+            <tr>
+                <td><strong>${pos.pair}</strong></td>
+                <td>
+                    <span class="badge ${pos.position_type === 'long' ? 'bg-success' : 'bg-danger'}">
+                        ${pos.position_type.toUpperCase()}
+                    </span>
+                </td>
+                <td>${formatCurrency(pos.entry_price)}</td>
+                <td>${formatCurrency(pos.current_price)}</td>
+                <td>
+                    <span class="${getColorClass(pos.pnl)}">
+                        ${formatCurrency(pos.pnl)}
+                    </span>
+                </td>
+                <td>${pos.duration}</td>
+                <td>
+                    <span class="${Math.abs(pos.z_score) > 2 ? 'text-warning' : ''}">
+                        ${formatNumber(pos.z_score, 2)}
+                    </span>
+                </td>
+                <td>
+                    <button class="btn btn-sm btn-outline-danger" onclick="closePosition('${pos.pair}')">
+                        Close
+                    </button>
+                </td>
+            </tr>
+        `).join('');
+    }
+
+    function closePosition(pair) {
+        if (confirm(`Close position for ${pair}?`)) {
+            // Implementation for closing position
+            console.log(`Closing position for ${pair}`);
+            showAlert({
+                level: 'info',
+                title: 'Position Close',
+                message: `Close request sent for ${pair}`
+            });
+        }
+    }
+
+    // Handle WebSocket updates for live data
+    window.updateLiveDisplay = updateLiveDisplay;
+</script>
+{% endblock %}

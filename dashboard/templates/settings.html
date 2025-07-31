@@ -1,0 +1,602 @@
+{% extends "base.html" %}
+
+{% block page_title %}Settings{% endblock %}
+
+{% block content %}
+<div class="row">
+    <!-- Settings Header -->
+    <div class="col-12">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h2><i class="fas fa-cog"></i> Dashboard Settings</h2>
+            <div>
+                <button class="btn btn-success btn-sm" onclick="saveSettings()">
+                    <i class="fas fa-save"></i> Save Settings
+                </button>
+                <button class="btn btn-secondary btn-sm" onclick="resetSettings()">
+                    <i class="fas fa-undo"></i> Reset to Defaults
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Settings Tabs -->
+<div class="row">
+    <div class="col-12">
+        <div class="chart-container">
+            <ul class="nav nav-tabs" id="settingsTabs" role="tablist">
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link active" id="general-tab" data-bs-toggle="tab" data-bs-target="#general" type="button" role="tab">
+                        <i class="fas fa-sliders-h"></i> General
+                    </button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="display-tab" data-bs-toggle="tab" data-bs-target="#display" type="button" role="tab">
+                        <i class="fas fa-palette"></i> Display
+                    </button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="data-tab" data-bs-toggle="tab" data-bs-target="#data" type="button" role="tab">
+                        <i class="fas fa-database"></i> Data
+                    </button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="alerts-tab" data-bs-toggle="tab" data-bs-target="#alerts" type="button" role="tab">
+                        <i class="fas fa-bell"></i> Alerts
+                    </button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="advanced-tab" data-bs-toggle="tab" data-bs-target="#advanced" type="button" role="tab">
+                        <i class="fas fa-tools"></i> Advanced
+                    </button>
+                </li>
+            </ul>
+
+            <div class="tab-content mt-4" id="settingsTabContent">
+                <!-- General Settings -->
+                <div class="tab-pane fade show active" id="general" role="tabpanel">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <h5><i class="fas fa-cog"></i> Dashboard Configuration</h5>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Dashboard Title</label>
+                                <input type="text" class="form-control" id="dashboard-title" value="Quantitative Trading Dashboard">
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Default Page</label>
+                                <select class="form-select" id="default-page">
+                                    <option value="/">Overview</option>
+                                    <option value="/backtest">Backtest Results</option>
+                                    <option value="/live">Live Trading</option>
+                                    <option value="/portfolio">Portfolio</option>
+                                    <option value="/pairs">Pairs Analysis</option>
+                                </select>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Auto-refresh Interval (seconds)</label>
+                                <input type="number" class="form-control" id="refresh-interval" value="5" min="1" max="60">
+                            </div>
+                            
+                            <div class="form-check mb-3">
+                                <input class="form-check-input" type="checkbox" id="auto-refresh-enabled" checked>
+                                <label class="form-check-label" for="auto-refresh-enabled">
+                                    Enable auto-refresh
+                                </label>
+                            </div>
+                        </div>
+                        
+                        <div class="col-md-6">
+                            <h5><i class="fas fa-wifi"></i> WebSocket Configuration</h5>
+                            
+                            <div class="form-check mb-3">
+                                <input class="form-check-input" type="checkbox" id="websocket-enabled" checked>
+                                <label class="form-check-label" for="websocket-enabled">
+                                    Enable WebSocket connections
+                                </label>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">WebSocket Namespace</label>
+                                <input type="text" class="form-control" id="websocket-namespace" value="/dashboard">
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Connection Timeout (seconds)</label>
+                                <input type="number" class="form-control" id="websocket-timeout" value="60" min="10" max="300">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Display Settings -->
+                <div class="tab-pane fade" id="display" role="tabpanel">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <h5><i class="fas fa-palette"></i> Theme & Appearance</h5>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Color Theme</label>
+                                <select class="form-select" id="color-theme">
+                                    <option value="dark">Dark Theme</option>
+                                    <option value="light">Light Theme</option>
+                                    <option value="auto">Auto (System)</option>
+                                </select>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Chart Color Scheme</label>
+                                <select class="form-select" id="chart-colorscheme">
+                                    <option value="plotly_dark">Dark</option>
+                                    <option value="plotly">Light</option>
+                                    <option value="viridis">Viridis</option>
+                                    <option value="plasma">Plasma</option>
+                                </select>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Default Chart Height (px)</label>
+                                <input type="number" class="form-control" id="chart-height" value="400" min="200" max="800">
+                            </div>
+                            
+                            <div class="form-check mb-3">
+                                <input class="form-check-input" type="checkbox" id="responsive-charts" checked>
+                                <label class="form-check-label" for="responsive-charts">
+                                    Responsive charts
+                                </label>
+                            </div>
+                        </div>
+                        
+                        <div class="col-md-6">
+                            <h5><i class="fas fa-calculator"></i> Number Formatting</h5>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Currency Symbol</label>
+                                <select class="form-select" id="currency-symbol">
+                                    <option value="$">Dollar ($)</option>
+                                    <option value="€">Euro (€)</option>
+                                    <option value="£">Pound (£)</option>
+                                    <option value="¥">Yen (¥)</option>
+                                </select>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Decimal Places</label>
+                                <input type="number" class="form-control" id="decimal-places" value="2" min="0" max="6">
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Percentage Decimal Places</label>
+                                <input type="number" class="form-control" id="percent-decimals" value="2" min="0" max="4">
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Date Format</label>
+                                <select class="form-select" id="date-format">
+                                    <option value="YYYY-MM-DD">YYYY-MM-DD</option>
+                                    <option value="MM/DD/YYYY">MM/DD/YYYY</option>
+                                    <option value="DD/MM/YYYY">DD/MM/YYYY</option>
+                                    <option value="MMM DD, YYYY">MMM DD, YYYY</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Data Settings -->
+                <div class="tab-pane fade" id="data" role="tabpanel">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <h5><i class="fas fa-database"></i> Data Management</h5>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Maximum Data Points</label>
+                                <input type="number" class="form-control" id="max-data-points" value="10000" min="1000" max="100000">
+                                <div class="form-text">Maximum number of data points to store in memory</div>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Cache Size (MB)</label>
+                                <input type="number" class="form-control" id="cache-size" value="100" min="10" max="1000">
+                            </div>
+                            
+                            <div class="form-check mb-3">
+                                <input class="form-check-input" type="checkbox" id="data-compression" checked>
+                                <label class="form-check-label" for="data-compression">
+                                    Enable data compression
+                                </label>
+                            </div>
+                            
+                            <div class="form-check mb-3">
+                                <input class="form-check-input" type="checkbox" id="lazy-loading" checked>
+                                <label class="form-check-label" for="lazy-loading">
+                                    Enable lazy loading
+                                </label>
+                            </div>
+                        </div>
+                        
+                        <div class="col-md-6">
+                            <h5><i class="fas fa-clock"></i> Data Updates</h5>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Live Data Update Frequency (seconds)</label>
+                                <input type="number" class="form-control" id="live-update-frequency" value="1" min="0.1" max="60" step="0.1">
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Backtest Data Refresh (minutes)</label>
+                                <input type="number" class="form-control" id="backtest-refresh" value="5" min="1" max="60">
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Portfolio Update Frequency (seconds)</label>
+                                <input type="number" class="form-control" id="portfolio-update-frequency" value="5" min="1" max="300">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Alerts Settings -->
+                <div class="tab-pane fade" id="alerts" role="tabpanel">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <h5><i class="fas fa-bell"></i> Alert Configuration</h5>
+                            
+                            <div class="form-check mb-3">
+                                <input class="form-check-input" type="checkbox" id="alerts-enabled" checked>
+                                <label class="form-check-label" for="alerts-enabled">
+                                    Enable alerts
+                                </label>
+                            </div>
+                            
+                            <div class="form-check mb-3">
+                                <input class="form-check-input" type="checkbox" id="sound-alerts">
+                                <label class="form-check-label" for="sound-alerts">
+                                    Enable sound alerts
+                                </label>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Alert Display Duration (seconds)</label>
+                                <input type="number" class="form-control" id="alert-duration" value="5" min="1" max="30">
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Maximum Alerts to Display</label>
+                                <input type="number" class="form-control" id="max-alerts" value="10" min="1" max="100">
+                            </div>
+                        </div>
+                        
+                        <div class="col-md-6">
+                            <h5><i class="fas fa-exclamation-triangle"></i> Alert Types</h5>
+                            
+                            <div class="form-check mb-2">
+                                <input class="form-check-input" type="checkbox" id="trade-signals-alerts" checked>
+                                <label class="form-check-label" for="trade-signals-alerts">
+                                    Trading signals
+                                </label>
+                            </div>
+                            
+                            <div class="form-check mb-2">
+                                <input class="form-check-input" type="checkbox" id="portfolio-alerts" checked>
+                                <label class="form-check-label" for="portfolio-alerts">
+                                    Portfolio updates
+                                </label>
+                            </div>
+                            
+                            <div class="form-check mb-2">
+                                <input class="form-check-input" type="checkbox" id="system-alerts" checked>
+                                <label class="form-check-label" for="system-alerts">
+                                    System status
+                                </label>
+                            </div>
+                            
+                            <div class="form-check mb-2">
+                                <input class="form-check-input" type="checkbox" id="error-alerts" checked>
+                                <label class="form-check-label" for="error-alerts">
+                                    Error notifications
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Advanced Settings -->
+                <div class="tab-pane fade" id="advanced" role="tabpanel">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <h5><i class="fas fa-shield-alt"></i> Security & Performance</h5>
+                            
+                            <div class="form-check mb-3">
+                                <input class="form-check-input" type="checkbox" id="cors-enabled" checked>
+                                <label class="form-check-label" for="cors-enabled">
+                                    Enable CORS
+                                </label>
+                            </div>
+                            
+                            <div class="form-check mb-3">
+                                <input class="form-check-input" type="checkbox" id="api-rate-limiting">
+                                <label class="form-check-label" for="api-rate-limiting">
+                                    Enable API rate limiting
+                                </label>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Max Requests per Minute</label>
+                                <input type="number" class="form-control" id="max-requests" value="1000" min="10" max="10000">
+                            </div>
+                            
+                            <div class="form-check mb-3">
+                                <input class="form-check-input" type="checkbox" id="debug-mode">
+                                <label class="form-check-label" for="debug-mode">
+                                    Enable debug mode
+                                </label>
+                            </div>
+                        </div>
+                        
+                        <div class="col-md-6">
+                            <h5><i class="fas fa-file-alt"></i> Logging</h5>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Log Level</label>
+                                <select class="form-select" id="log-level">
+                                    <option value="DEBUG">Debug</option>
+                                    <option value="INFO" selected>Info</option>
+                                    <option value="WARNING">Warning</option>
+                                    <option value="ERROR">Error</option>
+                                </select>
+                            </div>
+                            
+                            <div class="form-check mb-3">
+                                <input class="form-check-input" type="checkbox" id="file-logging" checked>
+                                <label class="form-check-label" for="file-logging">
+                                    Enable file logging
+                                </label>
+                            </div>
+                            
+                            <div class="form-check mb-3">
+                                <input class="form-check-input" type="checkbox" id="console-logging" checked>
+                                <label class="form-check-label" for="console-logging">
+                                    Enable console logging
+                                </label>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Log File Size Limit (MB)</label>
+                                <input type="number" class="form-control" id="log-file-size" value="10" min="1" max="100">
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Settings Status -->
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="chart-container">
+            <h5><i class="fas fa-info-circle"></i> System Information</h5>
+            <div class="row">
+                <div class="col-md-3">
+                    <div class="metric-card p-3">
+                        <div class="metric-value" id="dashboard-version">v1.0.0</div>
+                        <div class="metric-label">Version</div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="metric-card p-3">
+                        <div class="metric-value" id="uptime">--</div>
+                        <div class="metric-label">Uptime</div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="metric-card p-3">
+                        <div class="metric-value" id="memory-usage">--</div>
+                        <div class="metric-label">Memory Usage</div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="metric-card p-3">
+                        <div class="metric-value" id="active-connections">0</div>
+                        <div class="metric-label">Active Connections</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        loadCurrentSettings();
+        loadSystemInfo();
+    });
+
+    async function loadCurrentSettings() {
+        try {
+            const response = await fetchAPI('/config');
+            populateSettingsForm(response);
+        } catch (error) {
+            console.error('Failed to load settings:', error);
+        }
+    }
+
+    function populateSettingsForm(config) {
+        // General settings
+        document.getElementById('dashboard-title').value = config.title || 'Quantitative Trading Dashboard';
+        document.getElementById('default-page').value = config.default_page || '/';
+        document.getElementById('refresh-interval').value = config.refresh_interval || 5;
+        document.getElementById('auto-refresh-enabled').checked = config.auto_refresh !== false;
+        
+        // WebSocket settings
+        document.getElementById('websocket-enabled').checked = config.websocket_enabled !== false;
+        document.getElementById('websocket-namespace').value = config.websocket_namespace || '/dashboard';
+        document.getElementById('websocket-timeout').value = config.websocket_timeout || 60;
+        
+        // Display settings
+        document.getElementById('color-theme').value = config.theme || 'dark';
+        document.getElementById('chart-colorscheme').value = config.chart_colorscheme || 'plotly_dark';
+        document.getElementById('chart-height').value = config.chart_height || 400;
+        document.getElementById('responsive-charts').checked = config.responsive_charts !== false;
+        
+        // Number formatting
+        document.getElementById('currency-symbol').value = config.currency_symbol || '$';
+        document.getElementById('decimal-places').value = config.decimal_places || 2;
+        document.getElementById('percent-decimals').value = config.percent_decimals || 2;
+        document.getElementById('date-format').value = config.date_format || 'YYYY-MM-DD';
+        
+        // Data settings
+        document.getElementById('max-data-points').value = config.max_data_points || 10000;
+        document.getElementById('cache-size').value = config.cache_size || 100;
+        document.getElementById('data-compression').checked = config.data_compression !== false;
+        document.getElementById('lazy-loading').checked = config.lazy_loading !== false;
+        
+        // Update frequencies
+        document.getElementById('live-update-frequency').value = config.live_update_frequency || 1;
+        document.getElementById('backtest-refresh').value = config.backtest_refresh || 5;
+        document.getElementById('portfolio-update-frequency').value = config.portfolio_update_frequency || 5;
+        
+        // Alert settings
+        document.getElementById('alerts-enabled').checked = config.alerts_enabled !== false;
+        document.getElementById('sound-alerts').checked = config.sound_alerts === true;
+        document.getElementById('alert-duration').value = config.alert_duration || 5;
+        document.getElementById('max-alerts').value = config.max_alerts || 10;
+        
+        // Alert types
+        document.getElementById('trade-signals-alerts').checked = config.trade_signals_alerts !== false;
+        document.getElementById('portfolio-alerts').checked = config.portfolio_alerts !== false;
+        document.getElementById('system-alerts').checked = config.system_alerts !== false;
+        document.getElementById('error-alerts').checked = config.error_alerts !== false;
+        
+        // Advanced settings
+        document.getElementById('cors-enabled').checked = config.cors_enabled !== false;
+        document.getElementById('api-rate-limiting').checked = config.api_rate_limiting === true;
+        document.getElementById('max-requests').value = config.max_requests || 1000;
+        document.getElementById('debug-mode').checked = config.debug === true;
+        
+        // Logging
+        document.getElementById('log-level').value = config.log_level || 'INFO';
+        document.getElementById('file-logging').checked = config.file_logging !== false;
+        document.getElementById('console-logging').checked = config.console_logging !== false;
+        document.getElementById('log-file-size').value = config.log_file_size || 10;
+    }
+
+    async function saveSettings() {
+        const config = {
+            // General settings
+            title: document.getElementById('dashboard-title').value,
+            default_page: document.getElementById('default-page').value,
+            refresh_interval: parseInt(document.getElementById('refresh-interval').value),
+            auto_refresh: document.getElementById('auto-refresh-enabled').checked,
+            
+            // WebSocket settings
+            websocket_enabled: document.getElementById('websocket-enabled').checked,
+            websocket_namespace: document.getElementById('websocket-namespace').value,
+            websocket_timeout: parseInt(document.getElementById('websocket-timeout').value),
+            
+            // Display settings
+            theme: document.getElementById('color-theme').value,
+            chart_colorscheme: document.getElementById('chart-colorscheme').value,
+            chart_height: parseInt(document.getElementById('chart-height').value),
+            responsive_charts: document.getElementById('responsive-charts').checked,
+            
+            // Number formatting
+            currency_symbol: document.getElementById('currency-symbol').value,
+            decimal_places: parseInt(document.getElementById('decimal-places').value),
+            percent_decimals: parseInt(document.getElementById('percent-decimals').value),
+            date_format: document.getElementById('date-format').value,
+            
+            // Data settings
+            max_data_points: parseInt(document.getElementById('max-data-points').value),
+            cache_size: parseInt(document.getElementById('cache-size').value),
+            data_compression: document.getElementById('data-compression').checked,
+            lazy_loading: document.getElementById('lazy-loading').checked,
+            
+            // Update frequencies
+            live_update_frequency: parseFloat(document.getElementById('live-update-frequency').value),
+            backtest_refresh: parseInt(document.getElementById('backtest-refresh').value),
+            portfolio_update_frequency: parseInt(document.getElementById('portfolio-update-frequency').value),
+            
+            // Alert settings
+            alerts_enabled: document.getElementById('alerts-enabled').checked,
+            sound_alerts: document.getElementById('sound-alerts').checked,
+            alert_duration: parseInt(document.getElementById('alert-duration').value),
+            max_alerts: parseInt(document.getElementById('max-alerts').value),
+            
+            // Alert types
+            trade_signals_alerts: document.getElementById('trade-signals-alerts').checked,
+            portfolio_alerts: document.getElementById('portfolio-alerts').checked,
+            system_alerts: document.getElementById('system-alerts').checked,
+            error_alerts: document.getElementById('error-alerts').checked,
+            
+            // Advanced settings
+            cors_enabled: document.getElementById('cors-enabled').checked,
+            api_rate_limiting: document.getElementById('api-rate-limiting').checked,
+            max_requests: parseInt(document.getElementById('max-requests').value),
+            debug: document.getElementById('debug-mode').checked,
+            
+            // Logging
+            log_level: document.getElementById('log-level').value,
+            file_logging: document.getElementById('file-logging').checked,
+            console_logging: document.getElementById('console-logging').checked,
+            log_file_size: parseInt(document.getElementById('log-file-size').value)
+        };
+
+        try {
+            await postAPI('/config', config);
+            showAlert({
+                level: 'success',
+                title: 'Settings Saved',
+                message: 'Dashboard settings have been saved successfully'
+            });
+        } catch (error) {
+            console.error('Failed to save settings:', error);
+            showAlert({
+                level: 'danger',
+                title: 'Save Failed',
+                message: 'Failed to save dashboard settings'
+            });
+        }
+    }
+
+    function resetSettings() {
+        if (confirm('Reset all settings to default values? This action cannot be undone.')) {
+            // Reset form to defaults
+            document.getElementById('dashboard-title').value = 'Quantitative Trading Dashboard';
+            document.getElementById('default-page').value = '/';
+            document.getElementById('refresh-interval').value = 5;
+            document.getElementById('auto-refresh-enabled').checked = true;
+            
+            // Reset other fields to defaults...
+            
+            showAlert({
+                level: 'info',
+                title: 'Settings Reset',
+                message: 'All settings have been reset to default values'
+            });
+        }
+    }
+
+    async function loadSystemInfo() {
+        try {
+            const response = await fetchAPI('/status');
+            updateSystemInfo(response);
+        } catch (error) {
+            console.error('Failed to load system info:', error);
+        }
+    }
+
+    function updateSystemInfo(info) {
+        document.getElementById('dashboard-version').textContent = info.version || 'v1.0.0';
+        document.getElementById('uptime').textContent = info.uptime || '--';
+        document.getElementById('memory-usage').textContent = info.memory_usage || '--';
+        document.getElementById('active-connections').textContent = info.active_connections || 0;
+    }
+</script>
+{% endblock %}

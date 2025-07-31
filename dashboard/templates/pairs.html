@@ -1,0 +1,560 @@
+{% extends "base.html" %}
+
+{% block page_title %}Pairs Analysis{% endblock %}
+
+{% block content %}
+<div class="row">
+    <!-- Pairs Analysis Header -->
+    <div class="col-12">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h2><i class="fas fa-link"></i> Pairs Analysis</h2>
+            <div>
+                <button class="btn btn-primary btn-sm" onclick="runPairsAnalysis()">
+                    <i class="fas fa-play"></i> Run Analysis
+                </button>
+                <button class="btn btn-success btn-sm" onclick="exportResults()">
+                    <i class="fas fa-download"></i> Export
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Analysis Controls -->
+<div class="row mb-4">
+    <div class="col-md-8">
+        <div class="chart-container">
+            <h5><i class="fas fa-sliders-h"></i> Analysis Parameters</h5>
+            <div class="row">
+                <div class="col-md-6">
+                    <div class="mb-3">
+                        <label class="form-label">Lookback Period (days)</label>
+                        <input type="number" class="form-control" id="lookback-period" value="252" min="50" max="1000">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Z-Score Window</label>
+                        <input type="number" class="form-control" id="zscore-window" value="20" min="5" max="100">
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="mb-3">
+                        <label class="form-label">Correlation Threshold</label>
+                        <input type="number" class="form-control" id="correlation-threshold" value="0.7" min="0" max="1" step="0.1">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Cointegration Test</label>
+                        <select class="form-select" id="cointegration-test">
+                            <option value="adf">Augmented Dickey-Fuller</option>
+                            <option value="johansen">Johansen Test</option>
+                            <option value="engle-granger">Engle-Granger</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="chart-container">
+            <h5><i class="fas fa-info-circle"></i> Analysis Status</h5>
+            <div id="analysis-status">
+                <div class="text-center text-muted py-3">
+                    <i class="fas fa-play-circle"></i><br>
+                    Ready to run analysis
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Correlation Matrix -->
+<div class="row">
+    <div class="col-lg-8">
+        <div class="chart-container">
+            <h5><i class="fas fa-th"></i> Correlation Matrix</h5>
+            <div id="correlation-matrix" style="height: 500px;"></div>
+        </div>
+    </div>
+    <div class="col-lg-4">
+        <div class="chart-container">
+            <h5><i class="fas fa-chart-bar"></i> Correlation Distribution</h5>
+            <div id="correlation-distribution" style="height: 500px;"></div>
+        </div>
+    </div>
+</div>
+
+<!-- Pairs Results -->
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="data-table">
+            <div class="d-flex justify-content-between align-items-center p-3 border-bottom">
+                <h5 class="mb-0"><i class="fas fa-table"></i> Pairs Analysis Results</h5>
+                <div class="d-flex gap-2">
+                    <select class="form-select form-select-sm" id="pairs-filter" style="width: 150px;">
+                        <option value="all">All Pairs</option>
+                        <option value="cointegrated">Cointegrated</option>
+                        <option value="high-correlation">High Correlation</option>
+                        <option value="tradeable">Tradeable</option>
+                    </select>
+                    <input type="text" class="form-control form-control-sm" placeholder="Search pairs..." id="pairs-search" style="width: 200px;">
+                </div>
+            </div>
+            <div class="table-responsive">
+                <table class="table table-hover mb-0">
+                    <thead>
+                        <tr>
+                            <th>Pair</th>
+                            <th>Correlation</th>
+                            <th>Cointegration</th>
+                            <th>Half-Life</th>
+                            <th>Mean Reversion</th>
+                            <th>Current Z-Score</th>
+                            <th>Volatility</th>
+                            <th>Signal</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pairs-results-table">
+                        <tr>
+                            <td colspan="9" class="text-center text-muted py-4">
+                                <i class="fas fa-info-circle"></i> Run analysis to see results
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Individual Pair Analysis -->
+<div class="row mt-4" id="pair-detail-section" style="display: none;">
+    <div class="col-12">
+        <div class="chart-container">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+                <h5><i class="fas fa-chart-line"></i> Pair Detail: <span id="selected-pair-name">--</span></h5>
+                <button class="btn btn-sm btn-outline-secondary" onclick="closePairDetail()">
+                    <i class="fas fa-times"></i> Close
+                </button>
+            </div>
+            <div class="row">
+                <div class="col-lg-6">
+                    <div id="pair-prices-chart" style="height: 300px;"></div>
+                </div>
+                <div class="col-lg-6">
+                    <div id="pair-spread-chart" style="height: 300px;"></div>
+                </div>
+            </div>
+            <div class="row mt-3">
+                <div class="col-lg-6">
+                    <div id="pair-zscore-chart" style="height: 300px;"></div>
+                </div>
+                <div class="col-lg-6">
+                    <div id="pair-rolling-corr-chart" style="height: 300px;"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+    let correlationMatrix = null;
+    let correlationDist = null;
+    let pairPricesChart = null;
+    let pairSpreadChart = null;
+    let pairZscoreChart = null;
+    let pairRollingCorrChart = null;
+
+    document.addEventListener('DOMContentLoaded', function() {
+        initializePairsCharts();
+        loadPairsData();
+        
+        // Setup event listeners
+        document.getElementById('pairs-filter').addEventListener('change', filterPairs);
+        document.getElementById('pairs-search').addEventListener('input', searchPairs);
+    });
+
+    function initializePairsCharts() {
+        // Correlation matrix heatmap
+        const matrixData = [{
+            z: [],
+            x: [],
+            y: [],
+            type: 'heatmap',
+            colorscale: 'RdYlBu',
+            reversescale: true,
+            showscale: true
+        }];
+
+        const matrixLayout = {
+            title: '',
+            xaxis: { title: 'Symbol' },
+            yaxis: { title: 'Symbol' },
+            plot_bgcolor: 'transparent',
+            paper_bgcolor: 'transparent'
+        };
+
+        correlationMatrix = Plotly.newPlot('correlation-matrix', matrixData, matrixLayout, {responsive: true});
+
+        // Correlation distribution
+        const distData = [{
+            x: [],
+            type: 'histogram',
+            nbinsx: 20,
+            name: 'Correlation',
+            marker: { color: '#007bff' }
+        }];
+
+        const distLayout = {
+            title: '',
+            xaxis: { title: 'Correlation Coefficient' },
+            yaxis: { title: 'Frequency' },
+            showlegend: false,
+            plot_bgcolor: 'transparent',
+            paper_bgcolor: 'transparent'
+        };
+
+        correlationDist = Plotly.newPlot('correlation-distribution', distData, distLayout, {responsive: true});
+    }
+
+    async function loadPairsData() {
+        try {
+            const response = await fetchAPI('/pairs/analysis');
+            updatePairsDisplay(response);
+        } catch (error) {
+            console.error('Failed to load pairs data:', error);
+        }
+    }
+
+    function updatePairsDisplay(data) {
+        // Update correlation matrix
+        if (data.correlation_matrix && correlationMatrix) {
+            const symbols = data.symbols || [];
+            const matrix = data.correlation_matrix;
+            
+            const update = {
+                z: [matrix],
+                x: [symbols],
+                y: [symbols]
+            };
+            Plotly.restyle('correlation-matrix', update, 0);
+        }
+
+        // Update correlation distribution
+        if (data.correlation_values && correlationDist) {
+            Plotly.restyle('correlation-distribution', { x: [data.correlation_values] }, 0);
+        }
+
+        // Update pairs results table
+        if (data.pairs_results) {
+            updatePairsTable(data.pairs_results);
+        }
+    }
+
+    function updatePairsTable(pairs) {
+        const tbody = document.getElementById('pairs-results-table');
+        
+        if (!pairs || pairs.length === 0) {
+            tbody.innerHTML = `
+                <tr>
+                    <td colspan="9" class="text-center text-muted py-4">
+                        <i class="fas fa-info-circle"></i> No pairs analysis results
+                    </td>
+                </tr>
+            `;
+            return;
+        }
+
+        tbody.innerHTML = pairs.map(pair => `
+            <tr data-pair="${pair.pair}">
+                <td><strong>${pair.pair}</strong></td>
+                <td>
+                    <span class="${pair.correlation > 0.7 ? 'text-success' : pair.correlation > 0.5 ? 'text-warning' : 'text-danger'}">
+                        ${formatNumber(pair.correlation, 3)}
+                    </span>
+                </td>
+                <td>
+                    <span class="badge ${pair.cointegrated ? 'bg-success' : 'bg-danger'}">
+                        ${pair.cointegrated ? 'Yes' : 'No'}
+                    </span>
+                    ${pair.p_value ? `<br><small>p=${formatNumber(pair.p_value, 4)}</small>` : ''}
+                </td>
+                <td>${pair.half_life ? formatNumber(pair.half_life, 1) + ' days' : '--'}</td>
+                <td>
+                    <span class="${pair.mean_reverting ? 'text-success' : 'text-danger'}">
+                        ${pair.mean_reverting ? 'Yes' : 'No'}
+                    </span>
+                </td>
+                <td>
+                    <span class="${Math.abs(pair.current_zscore) > 2 ? 'text-warning' : ''}">
+                        ${formatNumber(pair.current_zscore, 2)}
+                    </span>
+                </td>
+                <td>${formatPercent(pair.volatility)}</td>
+                <td>
+                    ${pair.signal ? `<span class="badge ${pair.signal === 'buy' ? 'bg-success' : 'bg-danger'}">${pair.signal.toUpperCase()}</span>` : '--'}
+                </td>
+                <td>
+                    <div class="btn-group btn-group-sm">
+                        <button class="btn btn-outline-primary" onclick="viewPairDetail('${pair.pair}')">
+                            <i class="fas fa-eye"></i>
+                        </button>
+                        <button class="btn btn-outline-success" onclick="tradePair('${pair.pair}')">
+                            <i class="fas fa-chart-line"></i>
+                        </button>
+                    </div>
+                </td>
+            </tr>
+        `).join('');
+    }
+
+    async function runPairsAnalysis() {
+        const statusDiv = document.getElementById('analysis-status');
+        statusDiv.innerHTML = `
+            <div class="text-center py-3">
+                <i class="fas fa-spinner fa-spin"></i><br>
+                Running analysis...
+            </div>
+        `;
+
+        try {
+            const params = {
+                lookback_period: parseInt(document.getElementById('lookback-period').value),
+                zscore_window: parseInt(document.getElementById('zscore-window').value),
+                correlation_threshold: parseFloat(document.getElementById('correlation-threshold').value),
+                cointegration_test: document.getElementById('cointegration-test').value
+            };
+
+            const response = await postAPI('/pairs/run-analysis', params);
+            updatePairsDisplay(response);
+            
+            statusDiv.innerHTML = `
+                <div class="text-center text-success py-3">
+                    <i class="fas fa-check-circle"></i><br>
+                    Analysis completed
+                </div>
+            `;
+
+            showAlert({
+                level: 'success',
+                title: 'Analysis Complete',
+                message: `Found ${response.pairs_results?.length || 0} tradeable pairs`
+            });
+
+        } catch (error) {
+            console.error('Failed to run analysis:', error);
+            statusDiv.innerHTML = `
+                <div class="text-center text-danger py-3">
+                    <i class="fas fa-exclamation-circle"></i><br>
+                    Analysis failed
+                </div>
+            `;
+            showAlert({
+                level: 'danger',
+                title: 'Analysis Failed',
+                message: 'Failed to complete pairs analysis'
+            });
+        }
+    }
+
+    async function viewPairDetail(pairName) {
+        try {
+            const response = await fetchAPI(`/pairs/detail/${encodeURIComponent(pairName)}`);
+            displayPairDetail(pairName, response);
+        } catch (error) {
+            console.error('Failed to load pair detail:', error);
+        }
+    }
+
+    function displayPairDetail(pairName, data) {
+        document.getElementById('selected-pair-name').textContent = pairName;
+        document.getElementById('pair-detail-section').style.display = 'block';
+
+        // Scroll to detail section
+        document.getElementById('pair-detail-section').scrollIntoView({ behavior: 'smooth' });
+
+        // Initialize detail charts if not already done
+        if (!pairPricesChart) {
+            initializePairDetailCharts();
+        }
+
+        // Update charts with pair data
+        if (data.prices && pairPricesChart) {
+            const symbols = pairName.split('-');
+            const pricesData = [
+                {
+                    x: data.prices.dates,
+                    y: data.prices[symbols[0]],
+                    type: 'scatter',
+                    mode: 'lines',
+                    name: symbols[0],
+                    line: { color: '#007bff' }
+                },
+                {
+                    x: data.prices.dates,
+                    y: data.prices[symbols[1]],
+                    type: 'scatter',
+                    mode: 'lines',
+                    name: symbols[1],
+                    line: { color: '#dc3545' },
+                    yaxis: 'y2'
+                }
+            ];
+
+            const pricesLayout = {
+                title: 'Price History',
+                xaxis: { title: 'Date' },
+                yaxis: { title: `${symbols[0]} Price`, side: 'left' },
+                yaxis2: { title: `${symbols[1]} Price`, side: 'right', overlaying: 'y' },
+                plot_bgcolor: 'transparent',
+                paper_bgcolor: 'transparent'
+            };
+
+            Plotly.newPlot('pair-prices-chart', pricesData, pricesLayout, {responsive: true});
+        }
+
+        if (data.spread && pairSpreadChart) {
+            const spreadData = [{
+                x: data.spread.dates,
+                y: data.spread.values,
+                type: 'scatter',
+                mode: 'lines',
+                name: 'Spread',
+                line: { color: '#28a745' }
+            }];
+
+            const spreadLayout = {
+                title: 'Price Spread',
+                xaxis: { title: 'Date' },
+                yaxis: { title: 'Spread' },
+                plot_bgcolor: 'transparent',
+                paper_bgcolor: 'transparent'
+            };
+
+            Plotly.newPlot('pair-spread-chart', spreadData, spreadLayout, {responsive: true});
+        }
+
+        if (data.zscore && pairZscoreChart) {
+            const zscoreData = [
+                {
+                    x: data.zscore.dates,
+                    y: data.zscore.values,
+                    type: 'scatter',
+                    mode: 'lines',
+                    name: 'Z-Score',
+                    line: { color: '#6f42c1' }
+                },
+                {
+                    x: data.zscore.dates,
+                    y: Array(data.zscore.dates.length).fill(2),
+                    type: 'scatter',
+                    mode: 'lines',
+                    name: 'Upper Threshold',
+                    line: { color: 'red', dash: 'dash' }
+                },
+                {
+                    x: data.zscore.dates,
+                    y: Array(data.zscore.dates.length).fill(-2),
+                    type: 'scatter',
+                    mode: 'lines',
+                    name: 'Lower Threshold',
+                    line: { color: 'red', dash: 'dash' }
+                }
+            ];
+
+            const zscoreLayout = {
+                title: 'Z-Score Evolution',
+                xaxis: { title: 'Date' },
+                yaxis: { title: 'Z-Score' },
+                plot_bgcolor: 'transparent',
+                paper_bgcolor: 'transparent'
+            };
+
+            Plotly.newPlot('pair-zscore-chart', zscoreData, zscoreLayout, {responsive: true});
+        }
+
+        if (data.rolling_correlation && pairRollingCorrChart) {
+            const corrData = [{
+                x: data.rolling_correlation.dates,
+                y: data.rolling_correlation.values,
+                type: 'scatter',
+                mode: 'lines',
+                name: 'Rolling Correlation',
+                line: { color: '#fd7e14' }
+            }];
+
+            const corrLayout = {
+                title: 'Rolling Correlation',
+                xaxis: { title: 'Date' },
+                yaxis: { title: 'Correlation', range: [0, 1] },
+                plot_bgcolor: 'transparent',
+                paper_bgcolor: 'transparent'
+            };
+
+            Plotly.newPlot('pair-rolling-corr-chart', corrData, corrLayout, {responsive: true});
+        }
+    }
+
+    function initializePairDetailCharts() {
+        // Charts will be initialized when data is loaded
+        pairPricesChart = true;
+        pairSpreadChart = true;
+        pairZscoreChart = true;
+        pairRollingCorrChart = true;
+    }
+
+    function closePairDetail() {
+        document.getElementById('pair-detail-section').style.display = 'none';
+    }
+
+    function filterPairs() {
+        const filter = document.getElementById('pairs-filter').value;
+        const rows = document.querySelectorAll('#pairs-results-table tr[data-pair]');
+        
+        rows.forEach(row => {
+            let show = true;
+            
+            if (filter === 'cointegrated') {
+                const badge = row.querySelector('.badge');
+                show = badge && badge.textContent === 'Yes';
+            } else if (filter === 'high-correlation') {
+                const correlationCell = row.children[1];
+                const correlation = parseFloat(correlationCell.textContent);
+                show = correlation > 0.7;
+            } else if (filter === 'tradeable') {
+                const signalCell = row.children[7];
+                show = signalCell.textContent.trim() !== '--';
+            }
+            
+            row.style.display = show ? '' : 'none';
+        });
+    }
+
+    function searchPairs() {
+        const searchTerm = document.getElementById('pairs-search').value.toLowerCase();
+        const rows = document.querySelectorAll('#pairs-results-table tr[data-pair]');
+        
+        rows.forEach(row => {
+            const pairName = row.dataset.pair.toLowerCase();
+            row.style.display = pairName.includes(searchTerm) ? '' : 'none';
+        });
+    }
+
+    function tradePair(pairName) {
+        showAlert({
+            level: 'info',
+            title: 'Trade Pair',
+            message: `Opening trade setup for ${pairName}`
+        });
+    }
+
+    function exportResults() {
+        showAlert({
+            level: 'info',
+            title: 'Export Results',
+            message: 'Pairs analysis export feature coming soon'
+        });
+    }
+</script>
+{% endblock %}

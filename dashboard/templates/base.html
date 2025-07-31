@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Dashboard - {{ title if title else 'Overview' }}</title>
+    
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Font Awesome -->
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Plotly.js -->
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <!-- Socket.IO -->
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    
+    <style>
+        :root {
+            --primary-color: #2c3e50;
+            --secondary-color: #34495e;
+            --success-color: #27ae60;
+            --danger-color: #e74c3c;
+            --warning-color: #f39c12;
+            --info-color: #3498db;
+            --light-color: #ecf0f1;
+            --dark-color: #2c3e50;
+        }
+
+        .sidebar {
+            min-height: 100vh;
+            background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+            color: white;
+            transition: all 0.3s;
+        }
+
+        .sidebar .nav-link {
+            color: rgba(255, 255, 255, 0.8);
+            padding: 0.75rem 1rem;
+            transition: all 0.3s;
+        }
+
+        .sidebar .nav-link:hover,
+        .sidebar .nav-link.active {
+            color: white;
+            background-color: rgba(255, 255, 255, 0.1);
+            border-radius: 0.5rem;
+        }
+
+        .main-content {
+            background-color: #f8f9fa;
+            min-height: 100vh;
+        }
+
+        .metric-card {
+            background: white;
+            border-radius: 1rem;
+            box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .metric-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
+        }
+
+        .metric-value {
+            font-size: 2rem;
+            font-weight: bold;
+        }
+
+        .metric-label {
+            font-size: 0.875rem;
+            color: #6c757d;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .chart-container {
+            background: white;
+            border-radius: 1rem;
+            padding: 1.5rem;
+            box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+            margin-bottom: 2rem;
+        }
+
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 0.5rem;
+        }
+
+        .status-connected {
+            background-color: var(--success-color);
+            animation: pulse 2s infinite;
+        }
+
+        .status-disconnected {
+            background-color: var(--danger-color);
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+
+        .navbar-custom {
+            background: white;
+            box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+        }
+
+        .data-table {
+            background: white;
+            border-radius: 1rem;
+            overflow: hidden;
+            box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+        }
+
+        .table th {
+            background-color: #f8f9fa;
+            border: none;
+            font-weight: 600;
+            color: var(--dark-color);
+        }
+
+        .positive {
+            color: var(--success-color) !important;
+        }
+
+        .negative {
+            color: var(--danger-color) !important;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 2rem;
+            color: #6c757d;
+        }
+
+        .alert-toast {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 9999;
+            max-width: 350px;
+        }
+
+        .pair-card {
+            background: white;
+            border-radius: 0.75rem;
+            padding: 1rem;
+            margin-bottom: 1rem;
+            box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+            transition: all 0.2s;
+        }
+
+        .pair-card:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 0.25rem 0.5rem rgba(0, 0, 0, 0.1);
+        }
+
+        .websocket-status {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 1000;
+            padding: 0.5rem 1rem;
+            border-radius: 2rem;
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+    </style>
+    
+    {% block extra_head %}{% endblock %}
+</head>
+<body>
+    <div class="container-fluid">
+        <div class="row">
+            <!-- Sidebar -->
+            <nav class="col-md-3 col-lg-2 d-md-block sidebar collapse">
+                <div class="position-sticky pt-3">
+                    <div class="text-center mb-4">
+                        <h4><i class="fas fa-chart-line"></i> Trading Dashboard</h4>
+                        <div class="mt-2">
+                            <span class="status-indicator" id="connection-status"></span>
+                            <small id="connection-text">Connecting...</small>
+                        </div>
+                    </div>
+                    
+                    <ul class="nav flex-column">
+                        <li class="nav-item">
+                            <a class="nav-link" href="/">
+                                <i class="fas fa-tachometer-alt"></i> Overview
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="/backtest">
+                                <i class="fas fa-history"></i> Backtest Results
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="/live">
+                                <i class="fas fa-broadcast-tower"></i> Live Trading
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="/portfolio">
+                                <i class="fas fa-briefcase"></i> Portfolio
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="/pairs">
+                                <i class="fas fa-link"></i> Pairs Analysis
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="/reports">
+                                <i class="fas fa-file-excel"></i> Reports
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="/settings">
+                                <i class="fas fa-cog"></i> Settings
+                            </a>
+                        </li>
+                    </ul>
+                    
+                    <hr class="my-3">
+                    
+                    <div class="px-3">
+                        <h6 class="text-muted">Quick Stats</h6>
+                        <div class="small">
+                            <div class="d-flex justify-content-between">
+                                <span>Active Pairs:</span>
+                                <span id="active-pairs">--</span>
+                            </div>
+                            <div class="d-flex justify-content-between">
+                                <span>Open Positions:</span>
+                                <span id="open-positions">--</span>
+                            </div>
+                            <div class="d-flex justify-content-between">
+                                <span>Today's P&L:</span>
+                                <span id="daily-pnl">--</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </nav>
+
+            <!-- Main content -->
+            <main class="col-md-9 ms-sm-auto col-lg-10 px-md-4 main-content">
+                <!-- Top navigation -->
+                <nav class="navbar navbar-expand-lg navbar-custom mb-4">
+                    <div class="container-fluid">
+                        <span class="navbar-brand">
+                            {% block page_title %}Dashboard{% endblock %}
+                        </span>
+                        <div class="navbar-nav ms-auto">
+                            <div class="nav-item dropdown">
+                                <a class="nav-link dropdown-toggle" href="#" role="button" data-bs-toggle="dropdown">
+                                    <i class="fas fa-bell"></i>
+                                    <span class="badge bg-danger" id="alert-count" style="display: none;">0</span>
+                                </a>
+                                <ul class="dropdown-menu dropdown-menu-end" id="alerts-dropdown">
+                                    <li><span class="dropdown-item-text">No new alerts</span></li>
+                                </ul>
+                            </div>
+                            <div class="nav-item">
+                                <span class="nav-link">
+                                    <i class="fas fa-clock"></i>
+                                    <span id="current-time"></span>
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                </nav>
+
+                <!-- Page content -->
+                <div class="container-fluid">
+                    {% block content %}{% endblock %}
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <!-- WebSocket Status -->
+    <div class="websocket-status bg-secondary text-white" id="ws-status">
+        <i class="fas fa-wifi"></i> Connecting...
+    </div>
+
+    <!-- Alert Toast Container -->
+    <div class="toast-container position-fixed top-0 end-0 p-3" style="z-index: 9999;">
+        <div id="alert-toast" class="toast" role="alert" aria-live="assertive" aria-atomic="true">
+            <div class="toast-header">
+                <strong class="me-auto" id="toast-title">Alert</strong>
+                <small id="toast-time">now</small>
+                <button type="button" class="btn-close" data-bs-dismiss="toast"></button>
+            </div>
+            <div class="toast-body" id="toast-body">
+                Alert message here.
+            </div>
+        </div>
+    </div>
+
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    
+    <script>
+        // Global variables
+        let socket = null;
+        let dashboardData = {};
+        let isConnected = false;
+
+        // Initialize dashboard
+        document.addEventListener('DOMContentLoaded', function() {
+            initializeWebSocket();
+            updateCurrentTime();
+            setInterval(updateCurrentTime, 1000);
+            highlightActiveNavItem();
+        });
+
+        // WebSocket initialization
+        function initializeWebSocket() {
+            // Check if Socket.IO is available and WebSocket is enabled
+            if (typeof io !== 'undefined') {
+                try {
+                    socket = io('/dashboard');
+                    
+                    socket.on('connect', function() {
+                        isConnected = true;
+                        updateConnectionStatus(true);
+                        updateWebSocketStatus('Connected', 'success');
+                    });
+
+                    socket.on('disconnect', function() {
+                        isConnected = false;
+                        updateConnectionStatus(false);
+                        updateWebSocketStatus('Disconnected', 'danger');
+                    });
+
+                    socket.on('backtest_update', function(data) {
+                        handleBacktestUpdate(data);
+                    });
+
+                    socket.on('live_update', function(data) {
+                        handleLiveUpdate(data);
+                    });
+
+                    socket.on('portfolio_update', function(data) {
+                        handlePortfolioUpdate(data);
+                    });
+
+                    socket.on('alert', function(data) {
+                        showAlert(data);
+                    });
+
+                    socket.on('trade_signal', function(data) {
+                        handleTradeSignal(data);
+                    });
+
+                    socket.on('system_status', function(data) {
+                        handleSystemStatus(data);
+                    });
+
+                } catch (error) {
+                    console.error('WebSocket initialization failed:', error);
+                    updateWebSocketStatus('Failed to connect', 'danger');
+                }
+            } else {
+                console.warn('Socket.IO not available, WebSocket features disabled');
+                updateWebSocketStatus('WebSocket disabled', 'warning');
+            }
+        }
+
+        // Update connection status
+        function updateConnectionStatus(connected) {
+            const statusEl = document.getElementById('connection-status');
+            const textEl = document.getElementById('connection-text');
+            
+            if (connected) {
+                statusEl.className = 'status-indicator status-connected';
+                textEl.textContent = 'Connected';
+            } else {
+                statusEl.className = 'status-indicator status-disconnected';
+                textEl.textContent = 'Disconnected';
+            }
+        }
+
+        // Update WebSocket status
+        function updateWebSocketStatus(status, type) {
+            const wsStatus = document.getElementById('ws-status');
+            wsStatus.className = `websocket-status bg-${type} text-white`;
+            wsStatus.innerHTML = `<i class="fas fa-wifi"></i> ${status}`;
+        }
+
+        // Handle backtest data update
+        function handleBacktestUpdate(data) {
+            dashboardData.backtest = data.data;
+            if (typeof updateBacktestDisplay === 'function') {
+                updateBacktestDisplay(data.data);
+            }
+        }
+
+        // Handle live data update
+        function handleLiveUpdate(socketData) {
+            // Extract the actual data from the WebSocket message
+            const data = socketData.data || socketData;
+            dashboardData.live = data;
+            
+            // Update Quick Stats from live data
+            const activePairs = document.getElementById('active-pairs');
+            const openPositions = document.getElementById('open-positions');
+            const dailyPnl = document.getElementById('daily-pnl');
+            
+            if (activePairs && data.active_pairs !== undefined) {
+                activePairs.textContent = data.active_pairs;
+            }
+            if (openPositions && data.open_positions !== undefined) {
+                openPositions.textContent = data.open_positions;
+            }
+            if (dailyPnl && data.today_pnl !== undefined) {
+                const pnl = data.today_pnl;
+                const pnlClass = pnl >= 0 ? 'positive' : 'negative';
+                const pnlText = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
+                dailyPnl.innerHTML = `<span class="${pnlClass}">${pnlText}</span>`;
+            }
+            
+            // Update live display if function exists
+            if (typeof updateLiveDisplay === 'function') {
+                updateLiveDisplay(data);
+            }
+        }
+
+        // Handle portfolio update
+        function handlePortfolioUpdate(socketData) {
+            // Extract the actual data from the WebSocket message
+            const data = socketData.data || socketData;
+            dashboardData.portfolio = data;
+            
+            // Update Quick Stats
+            const activePairs = document.getElementById('active-pairs');
+            const openPositions = document.getElementById('open-positions');
+            const dailyPnl = document.getElementById('daily-pnl');
+            
+            if (activePairs && data.active_pairs !== undefined) {
+                activePairs.textContent = data.active_pairs;
+            }
+            if (openPositions && data.open_positions !== undefined) {
+                openPositions.textContent = data.open_positions;
+            }
+            if (dailyPnl && data.today_pnl !== undefined) {
+                const pnl = data.today_pnl;
+                const pnlClass = pnl >= 0 ? 'positive' : 'negative';
+                const pnlText = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
+                dailyPnl.innerHTML = `<span class="${pnlClass}">${pnlText}</span>`;
+            }
+            
+            if (typeof updatePortfolioDisplay === 'function') {
+                updatePortfolioDisplay(data);
+            }
+        }
+
+        // Handle trade signal
+        function handleTradeSignal(data) {
+            showAlert({
+                level: 'info',
+                title: 'Trade Signal',
+                message: `${data.pair}: ${data.action.toUpperCase()} signal (Z-Score: ${data.z_score.toFixed(2)})`
+            });
+        }
+
+        // Handle system status
+        function handleSystemStatus(data) {
+            const activePairs = document.getElementById('active-pairs');
+            const openPositions = document.getElementById('open-positions');
+            
+            if (activePairs) activePairs.textContent = data.active_pairs || '--';
+            if (openPositions) openPositions.textContent = data.open_positions || '--';
+        }
+
+        // Update quick stats in sidebar
+        function updateQuickStats(portfolioData) {
+            const dailyPnl = document.getElementById('daily-pnl');
+            if (dailyPnl && portfolioData.daily_pnl !== undefined) {
+                const pnl = portfolioData.daily_pnl;
+                const pnlClass = pnl >= 0 ? 'positive' : 'negative';
+                const pnlText = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
+                dailyPnl.innerHTML = `<span class="${pnlClass}">${pnlText}</span>`;
+            }
+        }
+
+        // Show alert toast
+        function showAlert(alert) {
+            const toast = document.getElementById('alert-toast');
+            const toastTitle = document.getElementById('toast-title');
+            const toastBody = document.getElementById('toast-body');
+            const toastTime = document.getElementById('toast-time');
+            
+            toastTitle.textContent = alert.title || 'Alert';
+            toastBody.textContent = alert.message || '';
+            toastTime.textContent = 'now';
+            
+            // Set toast type
+            const toastHeader = toast.querySelector('.toast-header');
+            toastHeader.className = `toast-header bg-${alert.level || 'info'} text-white`;
+            
+            const bsToast = new bootstrap.Toast(toast);
+            bsToast.show();
+            
+            // Update alert counter
+            updateAlertCounter();
+        }
+
+        // Update alert counter
+        function updateAlertCounter() {
+            const counter = document.getElementById('alert-count');
+            if (counter) {
+                let count = parseInt(counter.textContent) || 0;
+                count++;
+                counter.textContent = count;
+                counter.style.display = count > 0 ? 'inline' : 'none';
+            }
+        }
+
+        // Update current time
+        function updateCurrentTime() {
+            const timeEl = document.getElementById('current-time');
+            if (timeEl) {
+                const now = new Date();
+                timeEl.textContent = now.toLocaleTimeString();
+            }
+        }
+
+        // Highlight active navigation item
+        function highlightActiveNavItem() {
+            const currentPath = window.location.pathname;
+            const navLinks = document.querySelectorAll('.sidebar .nav-link');
+            
+            navLinks.forEach(link => {
+                const href = link.getAttribute('href');
+                if (href === currentPath || (currentPath === '/' && href === '/')) {
+                    link.classList.add('active');
+                } else {
+                    link.classList.remove('active');
+                }
+            });
+        }
+
+        // Utility functions
+        function formatNumber(num, decimals = 2) {
+            if (num === null || num === undefined) return '--';
+            return typeof num === 'number' ? num.toFixed(decimals) : num;
+        }
+
+        function formatPercent(num, decimals = 2) {
+            if (num === null || num === undefined) return '--';
+            const formatted = formatNumber(num, decimals);
+            return formatted !== '--' ? formatted + '%' : '--';
+        }
+
+        function formatCurrency(num, currency = '$') {
+            if (num === null || num === undefined) return '--';
+            const formatted = formatNumber(Math.abs(num), 2);
+            const sign = num >= 0 ? '' : '-';
+            return formatted !== '--' ? `${sign}${currency}${formatted}` : '--';
+        }
+
+        function getColorClass(value) {
+            if (value === null || value === undefined || value === 0) return '';
+            return value > 0 ? 'positive' : 'negative';
+        }
+
+        // Subscribe to data updates
+        function subscribeToUpdates(subscriptionType) {
+            if (socket && isConnected) {
+                socket.emit('subscribe_data', { type: subscriptionType });
+            }
+        }
+
+        // Unsubscribe from data updates
+        function unsubscribeFromUpdates(subscriptionType) {
+            if (socket && isConnected) {
+                socket.emit('unsubscribe_data', { type: subscriptionType });
+            }
+        }
+
+        // API helper functions
+        async function fetchAPI(endpoint) {
+            try {
+                const response = await fetch(`/api${endpoint}`);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                return await response.json();
+            } catch (error) {
+                console.error(`API request failed for ${endpoint}:`, error);
+                throw error;
+            }
+        }
+
+        async function postAPI(endpoint, data) {
+            try {
+                const response = await fetch(`/api${endpoint}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(data)
+                });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                return await response.json();
+            } catch (error) {
+                console.error(`API POST failed for ${endpoint}:`, error);
+                throw error;
+            }
+        }
+    </script>
+
+    {% block extra_scripts %}{% endblock %}
+</body>
+</html>
