@@ -157,30 +157,17 @@ jobs:
       run: |
         echo "🔥 Configuring firewall rules for trading system..."
         
-        # Create firewall rule for dashboard (port 80) if it doesn't exist
+        # Create firewall rule for dashboard (port 8050) if it doesn't exist
         if ! gcloud compute firewall-rules describe allow-trading-dashboard --project=${{ secrets.GCP_PROJECT_ID }} >/dev/null 2>&1; then
-          echo "Creating firewall rule for dashboard (port 80)..."
+          echo "Creating firewall rule for dashboard (port 8050)..."
           gcloud compute firewall-rules create allow-trading-dashboard \
             --project=${{ secrets.GCP_PROJECT_ID }} \
-            --allow tcp:80 \
+            --allow tcp:8050 \
             --source-ranges 0.0.0.0/0 \
             --description "Allow access to trading system dashboard" \
             --target-tags trading-system
         else
           echo "✅ Dashboard firewall rule already exists"
-        fi
-        
-        # Create firewall rule for HTTPS (port 443) if it doesn't exist
-        if ! gcloud compute firewall-rules describe allow-trading-https --project=${{ secrets.GCP_PROJECT_ID }} >/dev/null 2>&1; then
-          echo "Creating firewall rule for HTTPS (port 443)..."
-          gcloud compute firewall-rules create allow-trading-https \
-            --project=${{ secrets.GCP_PROJECT_ID }} \
-            --allow tcp:443 \
-            --source-ranges 0.0.0.0/0 \
-            --description "Allow HTTPS access to trading system dashboard" \
-            --target-tags trading-system
-        else
-          echo "✅ HTTPS firewall rule already exists"
         fi
         
         # Create firewall rule for API (port 8080) if it doesn't exist
@@ -276,34 +263,12 @@ jobs:
             sudo docker rm "$SERVICE_NAME" 2>/dev/null || true
         fi
         
-        # Clean up old images (keep last 3) - FIXED VERSION
-        echo "🧹 Cleaning up old local images..."
+        # Clean up old images (keep last 3) (with fallback to sudo)
+        echo "🧹 Cleaning up old images..."
         if docker info >/dev/null 2>&1; then
-            # List images, sort by created date, keep only the 3 most recent, delete the rest
-            OLD_IMAGES=$(docker images "${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}" --format "{{.ID}} {{.CreatedAt}}" | sort -k2 -r | tail -n +4 | awk '{print $1}')
-            if [ -n "$OLD_IMAGES" ]; then
-                echo "Removing old images: $OLD_IMAGES"
-                echo "$OLD_IMAGES" | xargs -r docker rmi -f || true
-            else
-                echo "No old images to remove"
-            fi
+            docker images "${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}" --format "table {{.Repository}}:{{.Tag}}\t{{.CreatedAt}}" | tail -n +2 | head -n -3 | awk '{print $1}' | xargs -r docker rmi || true
         else
-            # Same logic with sudo
-            OLD_IMAGES=$(sudo docker images "${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}" --format "{{.ID}} {{.CreatedAt}}" | sort -k2 -r | tail -n +4 | awk '{print $1}')
-            if [ -n "$OLD_IMAGES" ]; then
-                echo "Removing old images: $OLD_IMAGES"
-                echo "$OLD_IMAGES" | xargs -r sudo docker rmi -f || true
-            else
-                echo "No old images to remove"
-            fi
-        fi
-        
-        # Also clean up dangling images
-        echo "🧹 Cleaning up dangling images..."
-        if docker info >/dev/null 2>&1; then
-            docker image prune -f || true
-        else
-            sudo docker image prune -f || true
+            sudo docker images "${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }}" --format "table {{.Repository}}:{{.Tag}}\t{{.CreatedAt}}" | tail -n +2 | head -n -3 | awk '{print $1}' | xargs -r sudo docker rmi || true
         fi
         
         echo "🎉 Deployment completed successfully!"
@@ -476,8 +441,7 @@ jobs:
         $USE_SUDO docker run -d \
           --name "$SERVICE_NAME" \
           --restart unless-stopped \
-          -p 80:8050 \
-          -p 443:8050 \
+          -p 8050:8050 \
           -p 8080:8080 \
           --env-file /opt/trading-system/.env \
           -v /opt/trading-system/logs:/app/logs \
@@ -519,21 +483,19 @@ jobs:
         
         # Health check
         echo "🏥 Performing health check..."
-        for i in {1..8}; do
-          if timeout 5 curl -f http://localhost/health >/dev/null 2>&1; then
+        for i in {1..12}; do
+          if curl -f http://localhost:8050/health >/dev/null 2>&1; then
             echo "✅ Health check passed!"
             break
           fi
-          if [ $i -eq 8 ]; then
-            echo "❌ Health check failed after 8 attempts"
-            echo "📋 Container status:"
-            $USE_SUDO docker ps --filter name="$SERVICE_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-            echo "📋 Recent logs:"
-            $USE_SUDO docker logs --tail 20 "$SERVICE_NAME"
+          if [ $i -eq 12 ]; then
+            echo "❌ Health check failed after 12 attempts"
+            echo "📋 Container logs:"
+            $USE_SUDO docker logs --tail 50 "$SERVICE_NAME"
             exit 1
           fi
-          echo "⏳ Waiting for service to be ready... ($i/8)"
-          sleep 8
+          echo "⏳ Waiting for service to be ready... ($i/12)"
+          sleep 10
         done
         
         # Display service info
@@ -547,89 +509,41 @@ jobs:
         chmod +x start-container.sh
 
     - name: Deploy to VM via SSH
-      timeout-minutes: 15
       run: |
-        # Add VM to known hosts with timeout
-        timeout 30 gcloud compute ssh ${{ env.VM_NAME }} \
+        # Add VM to known hosts
+        gcloud compute ssh ${{ env.VM_NAME }} \
           --zone=${{ env.VM_ZONE }} \
           --project=${{ secrets.GCP_PROJECT_ID }} \
           --command="echo 'SSH connection test successful'" \
-          --ssh-flag="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
+          --ssh-flag="-o StrictHostKeyChecking=no"
         
         # Copy deployment script to VM
         gcloud compute scp deploy.sh ${{ env.VM_NAME }}:~/deploy.sh \
           --zone=${{ env.VM_ZONE }} \
-          --project=${{ secrets.GCP_PROJECT_ID }} \
-          --scp-flag="-o ConnectTimeout=10"
+          --project=${{ secrets.GCP_PROJECT_ID }}
         
         # Copy environment file to VM
         gcloud compute scp .env ${{ env.VM_NAME }}:~/trading-system.env \
           --zone=${{ env.VM_ZONE }} \
-          --project=${{ secrets.GCP_PROJECT_ID }} \
-          --scp-flag="-o ConnectTimeout=10"
+          --project=${{ secrets.GCP_PROJECT_ID }}
         
         # Copy pairs configuration to VM
         gcloud compute scp pairs.json ${{ env.VM_NAME }}:~/pairs.json \
           --zone=${{ env.VM_ZONE }} \
-          --project=${{ secrets.GCP_PROJECT_ID }} \
-          --scp-flag="-o ConnectTimeout=10"
+          --project=${{ secrets.GCP_PROJECT_ID }}
         
         # Copy container start script to VM
         gcloud compute scp start-container.sh ${{ env.VM_NAME }}:~/start-container.sh \
           --zone=${{ env.VM_ZONE }} \
-          --project=${{ secrets.GCP_PROJECT_ID }} \
-          --scp-flag="-o ConnectTimeout=10"
+          --project=${{ secrets.GCP_PROJECT_ID }}
         
-        # Execute deployment on VM with timeout
-        timeout 600 gcloud compute ssh ${{ env.VM_NAME }} \
-          --zone=${{ env.VM_ZONE }} \
-          --project=${{ secrets.GCP_PROJECT_ID }} \
-          --ssh-flag="-o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=3" \
-          --command="chmod +x ~/deploy.sh && ~/deploy.sh && sudo mv ~/trading-system.env /opt/trading-system/.env && sudo mv ~/pairs.json /opt/trading-system/pairs_config/pairs.json && sudo chown -R \$USER:\$USER /opt/trading-system && chmod +x ~/start-container.sh && cd /opt/trading-system && ~/start-container.sh"
-
-    - name: VM Docker cleanup
-      run: |
-        echo "🧹 Performing Docker cleanup on VM..."
+        # Execute deployment on VM
         gcloud compute ssh ${{ env.VM_NAME }} \
           --zone=${{ env.VM_ZONE }} \
           --project=${{ secrets.GCP_PROJECT_ID }} \
-          --ssh-flag="-o ConnectTimeout=10" \
-          --command="
-            echo 'Current images before cleanup:';
-            docker images | grep trading-system || true;
-            echo '';
-            echo 'Cleaning up old trading-system images (keeping latest 3)...';
-            
-            # Get image IDs of old images (skip the latest 3)
-            OLD_IMAGES=\$(docker images us-east4-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/trading-system/trading-system --format '{{.ID}} {{.CreatedAt}}' | sort -k2 -r | tail -n +4 | awk '{print \$1}');
-            
-            if [ -n \"\$OLD_IMAGES\" ]; then
-              echo \"Removing images: \$OLD_IMAGES\";
-              echo \"\$OLD_IMAGES\" | xargs -r docker rmi -f || true;
-              echo 'Old images removed successfully';
-            else
-              echo 'No old images to remove';
-            fi;
-            
-            echo '';
-            echo 'Cleaning up dangling images...';
-            docker image prune -f || true;
-            
-            echo '';
-            echo 'Final cleanup - removing unused images...';
-            docker system prune -f || true;
-            
-            echo '';
-            echo 'Images after cleanup:';
-            docker images | grep trading-system || echo 'No trading-system images found';
-            
-            echo '';
-            echo 'Disk usage:';
-            df -h /var/lib/docker 2>/dev/null || df -h / | grep -v tmpfs | head -2;
-          " || echo "Cleanup completed with some warnings"
+          --command="chmod +x ~/deploy.sh && ~/deploy.sh && sudo mv ~/trading-system.env /opt/trading-system/.env && sudo mv ~/pairs.json /opt/trading-system/pairs_config/pairs.json && sudo chown -R \$USER:\$USER /opt/trading-system && chmod +x ~/start-container.sh && cd /opt/trading-system && ~/start-container.sh"
 
     - name: Post-deployment verification
-      timeout-minutes: 5
       run: |
         # Get VM external IP
         VM_IP=$(gcloud compute instances describe ${{ env.VM_NAME }} \
@@ -639,7 +553,7 @@ jobs:
         
         echo "🌐 VM External IP: $VM_IP"
         
-        # Quick firewall rules verification
+        # Verify firewall rules are applied
         echo "🔥 Verifying firewall configuration..."
         VM_TAGS=$(gcloud compute instances describe ${{ env.VM_NAME }} \
           --zone=${{ env.VM_ZONE }} \
@@ -647,67 +561,42 @@ jobs:
           --format="value(tags.items[])")
         echo "📋 VM Network Tags: $VM_TAGS"
         
-        # Quick firewall rules check with timeout
-        DASHBOARD_RULE_EXISTS=$(timeout 10 gcloud compute firewall-rules describe allow-trading-dashboard --project=${{ secrets.GCP_PROJECT_ID }} --format="value(name)" 2>/dev/null || echo "")
-        API_RULE_EXISTS=$(timeout 10 gcloud compute firewall-rules describe allow-trading-api --project=${{ secrets.GCP_PROJECT_ID }} --format="value(name)" 2>/dev/null || echo "")
-        
-        if [ -n "$DASHBOARD_RULE_EXISTS" ]; then
+        # Check if firewall rules exist
+        if gcloud compute firewall-rules describe allow-trading-dashboard --project=${{ secrets.GCP_PROJECT_ID }} >/dev/null 2>&1; then
           echo "✅ Dashboard firewall rule exists"
         else
           echo "❌ Dashboard firewall rule missing"
         fi
         
-        if [ -n "$API_RULE_EXISTS" ]; then
+        if gcloud compute firewall-rules describe allow-trading-api --project=${{ secrets.GCP_PROJECT_ID }} >/dev/null 2>&1; then
           echo "✅ API firewall rule exists"
         else
           echo "❌ API firewall rule missing"
         fi
         
-        # Optimized external health check with shorter timeouts
-        echo "🔍 External health check (quick)..."
-        HEALTH_CHECK_SUCCESS=false
-        
-        for i in {1..6}; do
-          # Use shorter timeout (5 seconds instead of default 30+)
-          if timeout 5 curl -f "http://$VM_IP/health" >/dev/null 2>&1; then
+        # Final health check from outside with better error reporting
+        echo "🔍 External health check..."
+        for i in {1..10}; do
+          if curl -f "http://$VM_IP:8050/health" >/dev/null 2>&1; then
             echo "✅ External health check passed!"
-            echo "🎯 Dashboard URL: http://$VM_IP"
+            echo "🎯 Dashboard URL: http://$VM_IP:8050"
             echo "🎯 API URL: http://$VM_IP:8080"
-            HEALTH_CHECK_SUCCESS=true
             break
           fi
-          echo "⏳ Waiting for external access... ($i/6)"
-          sleep 10
+          if [ $i -eq 10 ]; then
+            echo "❌ External health check failed after 10 attempts"
+            echo "🔍 Troubleshooting information:"
+            echo "   - VM IP: $VM_IP"
+            echo "   - VM Tags: $VM_TAGS"
+            echo "   - Checking if container is running..."
+            gcloud compute ssh ${{ env.VM_NAME }} \
+              --zone=${{ env.VM_ZONE }} \
+              --project=${{ secrets.GCP_PROJECT_ID }} \
+              --command="docker ps | grep trading-system && docker logs --tail 20 trading-system" || true
+          fi
+          echo "⏳ Waiting for external access... ($i/10)"
+          sleep 15
         done
-        
-        # Only do troubleshooting if health check failed
-        if [ "$HEALTH_CHECK_SUCCESS" = "false" ]; then
-          echo "❌ External health check failed after 6 attempts"
-          echo "🔍 Quick troubleshooting..."
-          
-          # Quick container status check with timeout
-          echo "   - Checking container status..."
-          timeout 30 gcloud compute ssh ${{ env.VM_NAME }} \
-            --zone=${{ env.VM_ZONE }} \
-            --project=${{ secrets.GCP_PROJECT_ID }} \
-            --ssh-flag="-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3" \
-            --command="docker ps --filter name=trading-system --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'" || echo "   - SSH connection timed out"
-          
-          # Quick log check with timeout  
-          echo "   - Checking recent logs..."
-          timeout 30 gcloud compute ssh ${{ env.VM_NAME }} \
-            --zone=${{ env.VM_ZONE }} \
-            --project=${{ secrets.GCP_PROJECT_ID }} \
-            --ssh-flag="-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3" \
-            --command="docker logs --tail 10 trading-system 2>/dev/null || echo 'Container logs unavailable'" || echo "   - Log retrieval timed out"
-          
-          echo ""
-          echo "🔍 Manual verification steps:"
-          echo "   1. Check container: gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.VM_ZONE }} --command='docker ps'"
-          echo "   2. Check logs: gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.VM_ZONE }} --command='docker logs trading-system'"
-          echo "   3. Test locally: gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.VM_ZONE }} --command='curl http://localhost/health'"
-          echo "   4. Check firewall: gcloud compute firewall-rules list --filter='name:allow-trading*'"
-        fi
 
     - name: Notify deployment status
       if: always()
@@ -721,15 +610,13 @@ jobs:
         if [ "${{ job.status }}" = "success" ]; then
           echo "✅ Deployment completed successfully!"
           echo "📊 Service Status: Active"
-          echo "🔗 Dashboard URL: http://$VM_IP"
-          echo "🔗 Dashboard HTTPS: https://$VM_IP (if SSL configured)"
-          echo "🔗 API URL: http://$VM_IP:8080"
-          echo "🔗 Health Check: http://$VM_IP/health"
+          echo "🔗 Dashboard: http://$VM_IP:8050"
+          echo "🔗 API: http://$VM_IP:8080"
+          echo "🔗 Health Check: http://$VM_IP:8050/health"
           echo ""
           echo "🔥 Firewall Rules:"
-          echo "   - allow-trading-dashboard: Port 80 (HTTP)"
-          echo "   - allow-trading-https: Port 443 (HTTPS)"
-          echo "   - allow-trading-api: Port 8080 (API)"
+          echo "   - allow-trading-dashboard: Port 8050"
+          echo "   - allow-trading-api: Port 8080"
           echo ""
           echo "🏷️ VM Network Tags: trading-system"
         else
@@ -761,32 +648,14 @@ jobs:
       run: |
         echo "🧹 Cleaning up old Docker images in Artifact Registry..."
         
-        # Get list of images with proper sorting
-        IMAGES_TO_DELETE=$(gcloud artifacts docker images list \
-          ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }} \
-          --sort-by="~CREATE_TIME" \
-          --format="value(IMAGE)" | tail -n +6)  # Keep latest 5 instead of 10
-        
-        if [ -n "$IMAGES_TO_DELETE" ]; then
-          echo "Images to delete:"
-          echo "$IMAGES_TO_DELETE"
-          echo ""
-          
-          echo "$IMAGES_TO_DELETE" | while read image; do
-            if [ -n "$image" ]; then
-              echo "Deleting: $image"
-              gcloud artifacts docker images delete "$image" --quiet || echo "Failed to delete $image"
-            fi
-          done
-        else
-          echo "No old images to delete"
-        fi
-        
-        echo "✅ Artifact Registry cleanup completed"
-        
-        # Show remaining images
-        echo "📊 Remaining images in registry:"
+        # Keep only the last 10 images
         gcloud artifacts docker images list \
           ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }} \
           --sort-by="~CREATE_TIME" \
-          --limit=10
+          --limit=100 \
+          --format="value(IMAGE)" | tail -n +11 | while read image; do
+          echo "Deleting old image: $image"
+          gcloud artifacts docker images delete "$image" --quiet || true
+        done
+        
+        echo "✅ Cleanup completed"
