@@ -282,9 +282,15 @@ jobs:
         if docker info >/dev/null 2>&1; then
             docker stop "$SERVICE_NAME" 2>/dev/null || true
             docker rm "$SERVICE_NAME" 2>/dev/null || true
+            # Also stop and remove InfluxDB container
+            docker stop "influxdb" 2>/dev/null || true
+            docker rm "influxdb" 2>/dev/null || true
         else
             sudo docker stop "$SERVICE_NAME" 2>/dev/null || true
             sudo docker rm "$SERVICE_NAME" 2>/dev/null || true
+            # Also stop and remove InfluxDB container
+            sudo docker stop "influxdb" 2>/dev/null || true
+            sudo docker rm "influxdb" 2>/dev/null || true
         fi
         
         # Clean up old images (keep last 3) - FIXED VERSION
