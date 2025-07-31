@@ -524,25 +524,25 @@ jobs:
         gcloud compute scp deploy.sh ${{ env.VM_NAME }}:~/deploy.sh \
           --zone=${{ env.VM_ZONE }} \
           --project=${{ secrets.GCP_PROJECT_ID }} \
-          --ssh-flag="-o ConnectTimeout=10"
+          --scp-flag="-o ConnectTimeout=10"
         
         # Copy environment file to VM
         gcloud compute scp .env ${{ env.VM_NAME }}:~/trading-system.env \
           --zone=${{ env.VM_ZONE }} \
           --project=${{ secrets.GCP_PROJECT_ID }} \
-          --ssh-flag="-o ConnectTimeout=10"
+          --scp-flag="-o ConnectTimeout=10"
         
         # Copy pairs configuration to VM
         gcloud compute scp pairs.json ${{ env.VM_NAME }}:~/pairs.json \
           --zone=${{ env.VM_ZONE }} \
           --project=${{ secrets.GCP_PROJECT_ID }} \
-          --ssh-flag="-o ConnectTimeout=10"
+          --scp-flag="-o ConnectTimeout=10"
         
         # Copy container start script to VM
         gcloud compute scp start-container.sh ${{ env.VM_NAME }}:~/start-container.sh \
           --zone=${{ env.VM_ZONE }} \
           --project=${{ secrets.GCP_PROJECT_ID }} \
-          --ssh-flag="-o ConnectTimeout=10"
+          --scp-flag="-o ConnectTimeout=10"
         
         # Execute deployment on VM with timeout
         timeout 600 gcloud compute ssh ${{ env.VM_NAME }} \
