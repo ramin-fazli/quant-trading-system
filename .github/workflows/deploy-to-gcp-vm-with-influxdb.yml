@@ -5,6 +5,7 @@
 # - GCP_PROJECT_ID: Google Cloud Project ID
 # - INFLUXDB_USERNAME: InfluxDB admin username for self-hosted setup
 # - INFLUXDB_PASSWORD: InfluxDB admin password for self-hosted setup
+# - INFLUXDB_TOKEN: InfluxDB admin token for self-hosted setup (generate a secure token)
 # - INFLUXDB_ORG: InfluxDB organization name
 # - INFLUXDB_BUCKET: InfluxDB bucket name
 # - MT5_LOGIN: MetaTrader 5 login (optional)
@@ -410,6 +411,7 @@ jobs:
         echo "INFLUXDB_PASSWORD=${{ secrets.INFLUXDB_PASSWORD }}" >> .env
         echo "INFLUXDB_ORG=${{ secrets.INFLUXDB_ORG }}" >> .env
         echo "INFLUXDB_BUCKET=${{ secrets.INFLUXDB_BUCKET }}" >> .env
+        echo "INFLUXDB_TOKEN=${{ secrets.INFLUXDB_TOKEN }}" >> .env
         echo "CTRADER_CLIENT_ID=${{ secrets.CTRADER_CLIENT_ID }}" >> .env
         echo "CTRADER_CLIENT_SECRET=${{ secrets.CTRADER_CLIENT_SECRET }}" >> .env
         echo "CTRADER_ACCESS_TOKEN=${{ secrets.CTRADER_ACCESS_TOKEN }}" >> .env
@@ -434,6 +436,7 @@ jobs:
         echo "TRADING_STATE_INFLUXDB_PASSWORD=${{ secrets.INFLUXDB_PASSWORD }}" >> .env
         echo "TRADING_STATE_INFLUXDB_ORG=${{ secrets.INFLUXDB_ORG }}" >> .env
         echo "TRADING_STATE_INFLUXDB_BUCKET=${{ secrets.INFLUXDB_BUCKET }}" >> .env
+        echo "TRADING_STATE_INFLUXDB_TOKEN=${{ secrets.INFLUXDB_TOKEN }}" >> .env
 
     - name: Create trading pairs configuration file
       run: |
@@ -505,6 +508,7 @@ jobs:
           -e DOCKER_INFLUXDB_INIT_PASSWORD=${{ secrets.INFLUXDB_PASSWORD }} \
           -e DOCKER_INFLUXDB_INIT_ORG=${{ secrets.INFLUXDB_ORG }} \
           -e DOCKER_INFLUXDB_INIT_BUCKET=${{ secrets.INFLUXDB_BUCKET }} \
+          -e DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${{ secrets.INFLUXDB_TOKEN }} \
           --memory=512m \
           --cpus=1 \
           --log-driver=json-file \
