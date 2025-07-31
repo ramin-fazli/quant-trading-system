@@ -13,6 +13,7 @@ from pathlib import Path
 
 from flask import Flask, render_template, jsonify, request, send_from_directory, send_file
 from flask_cors import CORS
+from jinja2 import TemplateNotFound
 
 logger = logging.getLogger(__name__)
 
@@ -63,37 +64,68 @@ class DashboardServer:
         @self.app.route('/')
         def index():
             """Main dashboard page"""
-            return render_template('index.html', config=self.config)
+            try:
+                return render_template('index.html', config=self.config)
+            except TemplateNotFound:
+                return jsonify({
+                    'message': 'Trading System Dashboard',
+                    'status': 'running',
+                    'timestamp': datetime.now().isoformat(),
+                    'available_endpoints': [
+                        '/health',
+                        '/api/status',
+                        '/api/backtest/summary',
+                        '/api/portfolio'
+                    ]
+                })
         
         @self.app.route('/backtest')
         def backtest_page():
             """Backtest results page"""
-            return render_template('backtest.html', config=self.config)
+            try:
+                return render_template('backtest.html', config=self.config)
+            except TemplateNotFound:
+                return jsonify({'error': 'Template not available', 'endpoint': '/api/backtest/summary'})
         
         @self.app.route('/live')
         def live_page():
             """Live trading page"""
-            return render_template('live.html', config=self.config)
+            try:
+                return render_template('live.html', config=self.config)
+            except TemplateNotFound:
+                return jsonify({'error': 'Template not available', 'endpoint': '/api/live/data'})
         
         @self.app.route('/portfolio')
         def portfolio_page():
             """Portfolio overview page"""
-            return render_template('portfolio.html', config=self.config)
+            try:
+                return render_template('portfolio.html', config=self.config)
+            except TemplateNotFound:
+                return jsonify({'error': 'Template not available', 'endpoint': '/api/portfolio'})
         
         @self.app.route('/pairs')
         def pairs_page():
             """Pairs analysis page"""
-            return render_template('pairs.html', config=self.config)
+            try:
+                return render_template('pairs.html', config=self.config)
+            except TemplateNotFound:
+                return jsonify({'error': 'Template not available', 'endpoint': '/api/pairs/analysis'})
         
         @self.app.route('/settings')
         def settings_page():
             """Settings page"""
-            return render_template('settings.html', config=self.config)
+            try:
+                return render_template('settings.html', config=self.config)
+            except TemplateNotFound:
+                return jsonify({'error': 'Template not available', 'endpoint': '/api/config'})
         
         @self.app.route('/reports')
         def reports_page():
             """Reports download page"""
-            return render_template('reports.html', config=self.config)
+            try:
+                return render_template('reports.html', config=self.config)
+            except TemplateNotFound:
+                return jsonify({'error': 'Template not available', 'endpoint': '/api/reports'})
     
     def _register_api_routes(self):
         """Register API routes"""
@@ -112,6 +144,11 @@ class DashboardServer:
             except Exception as e:
                 logger.error(f"Error getting status: {e}")
                 return jsonify({'error': str(e)}), 500
+        
+        @self.app.route('/health')
+        def health_check():
+            """Health check endpoint for Docker"""
+            return jsonify({'status': 'OK', 'timestamp': datetime.now().isoformat()})
         
         @self.app.route('/api/backtest/summary')
         def api_backtest_summary():
@@ -567,18 +604,24 @@ class DashboardServer:
             if request.path.startswith('/api/'):
                 return jsonify({'error': 'Endpoint not found'}), 404
             else:
-                return render_template('error.html', 
-                                     error='Page not found', 
-                                     code=404), 404
+                try:
+                    return render_template('error.html', 
+                                         error='Page not found', 
+                                         code=404), 404
+                except TemplateNotFound:
+                    return jsonify({'error': 'Page not found', 'code': 404}), 404
         
         @self.app.errorhandler(500)
         def internal_error(error):
             if request.path.startswith('/api/'):
                 return jsonify({'error': 'Internal server error'}), 500
             else:
-                return render_template('error.html', 
-                                     error='Internal server error', 
-                                     code=500), 500
+                try:
+                    return render_template('error.html', 
+                                         error='Internal server error', 
+                                         code=500), 500
+                except TemplateNotFound:
+                    return jsonify({'error': 'Internal server error', 'code': 500}), 500
         
         @self.app.errorhandler(Exception)
         def handle_exception(e):

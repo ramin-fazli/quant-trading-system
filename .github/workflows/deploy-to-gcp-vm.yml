@@ -250,6 +250,11 @@ jobs:
         INFLUXDB_PORT=8086
         REDIS_PORT=6379
         
+        # === Dashboard Configuration ===
+        DASHBOARD_HOST=0.0.0.0
+        DASHBOARD_DEBUG=false
+        DASHBOARD_THREADED=true
+        
         # === Trading Mode Configuration ===
         TRADING_MODE=live
         
@@ -404,7 +409,7 @@ jobs:
           -v /opt/trading-system/backtest_reports:/app/backtest_reports \
           -v /opt/trading-system/cache:/app/cache \
           -v /opt/trading-system/pairs_config:/app/pairs_config \
-          --memory=4g \
+          --memory=2g \
           --cpus=2 \
           --log-driver=json-file \
           --log-opt max-size=100m \
@@ -413,11 +418,24 @@ jobs:
         
         # Verify deployment
         echo "🔍 Verifying deployment..."
-        sleep 10
+        sleep 15
         
         if $USE_SUDO docker ps | grep -q "$SERVICE_NAME"; then
-          echo "✅ Service is running successfully!"
-          $USE_SUDO docker logs --tail 20 "$SERVICE_NAME"
+          echo "✅ Container is running successfully!"
+          
+          # Check container health
+          CONTAINER_STATUS=$($USE_SUDO docker inspect -f '{{.State.Status}}' "$SERVICE_NAME")
+          echo "📊 Container status: $CONTAINER_STATUS"
+          
+          if [ "$CONTAINER_STATUS" = "running" ]; then
+            echo "✅ Container is healthy"
+            echo "📋 Recent logs:"
+            $USE_SUDO docker logs --tail 20 "$SERVICE_NAME"
+          else
+            echo "❌ Container is not in running state"
+            $USE_SUDO docker logs "$SERVICE_NAME"
+            exit 1
+          fi
         else
           echo "❌ Service failed to start!"
           $USE_SUDO docker logs "$SERVICE_NAME"
@@ -427,9 +445,15 @@ jobs:
         # Health check
         echo "🏥 Performing health check..."
         for i in {1..12}; do
-          if curl -f http://localhost:8050 >/dev/null 2>&1; then
+          if curl -f http://localhost:8050/health >/dev/null 2>&1; then
             echo "✅ Health check passed!"
             break
+          fi
+          if [ $i -eq 12 ]; then
+            echo "❌ Health check failed after 12 attempts"
+            echo "📋 Container logs:"
+            $USE_SUDO docker logs --tail 50 "$SERVICE_NAME"
+            exit 1
           fi
           echo "⏳ Waiting for service to be ready... ($i/12)"
           sleep 10
@@ -493,7 +517,7 @@ jobs:
         # Final health check from outside
         echo "🔍 External health check..."
         for i in {1..6}; do
-          if curl -f "http://$VM_IP:8050" >/dev/null 2>&1; then
+          if curl -f "http://$VM_IP:8050/health" >/dev/null 2>&1; then
             echo "✅ External health check passed!"
             echo "🎯 Dashboard URL: http://$VM_IP:8050"
             break
