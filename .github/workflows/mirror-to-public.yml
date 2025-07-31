@@ -3,7 +3,7 @@ name: Mirror to Public Repository
 
 on:
   push:
-    branches: [ main ]
+    branches: [ version/2.3 ]
   workflow_dispatch:
 
 jobs:
