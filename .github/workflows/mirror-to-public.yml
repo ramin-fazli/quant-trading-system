@@ -19,13 +19,13 @@ jobs:
         run: |
           # Remove sensitive files and directories
           rm -rf .github/workflows/mirror-to-public.yml
+          rm -rf .github/workflows/deploy-private.yml
           rm -rf .github/workflows/*private* 2>/dev/null || true
           rm -f .env 2>/dev/null || true
           rm -rf config/production_config.json 2>/dev/null || true
           rm -rf config/*production* 2>/dev/null || true
           rm -rf secrets/ 2>/dev/null || true
           rm -f *.key *.pem 2>/dev/null || true
-          EOF
 
       - name: Setup SSH for deployment
         run: |
