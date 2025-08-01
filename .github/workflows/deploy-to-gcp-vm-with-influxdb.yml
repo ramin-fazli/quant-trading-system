@@ -447,10 +447,11 @@ jobs:
         echo "TRADING_STATE_INFLUXDB_PASSWORD=${{ secrets.INFLUXDB_PASSWORD }}" >> .env
         
         # Verify token is set (debug info)
-        if [ -z "${{ secrets.INFLUXDB_TOKEN }}" ]; then
+        INFLUXDB_TOKEN_VALUE="${{ secrets.INFLUXDB_TOKEN }}"
+        if [ -z "$INFLUXDB_TOKEN_VALUE" ]; then
           echo "⚠️ WARNING: INFLUXDB_TOKEN secret is empty or not set!"
         else
-          echo "✅ INFLUXDB_TOKEN secret is configured (length: ${#"${{ secrets.INFLUXDB_TOKEN }}"})"
+          echo "✅ INFLUXDB_TOKEN secret is configured (length: ${#INFLUXDB_TOKEN_VALUE} chars)"
         fi
 
     - name: Create trading pairs configuration file
