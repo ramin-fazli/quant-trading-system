@@ -438,7 +438,6 @@ jobs:
         
         # Add state management secrets (Local InfluxDB with token-based auth)
         echo "TRADING_STATE_INFLUXDB_URL=http://influxdb:8086" >> .env
-        echo "TRADING_STATE_INFLUXDB_TOKEN=${{ secrets.INFLUXDB_TOKEN }}" >> .env
         echo "TRADING_STATE_INFLUXDB_ORG=${{ secrets.INFLUXDB_ORG }}" >> .env
         echo "TRADING_STATE_INFLUXDB_BUCKET=${{ secrets.INFLUXDB_BUCKET }}" >> .env
         
@@ -448,11 +447,34 @@ jobs:
         
         # Verify token is set (debug info)
         INFLUXDB_TOKEN_VALUE="${{ secrets.INFLUXDB_TOKEN }}"
+        # Clean the token of any whitespace/newlines
+        INFLUXDB_TOKEN_VALUE=$(echo "$INFLUXDB_TOKEN_VALUE" | tr -d '\n\r\t ' 2>/dev/null || echo "$INFLUXDB_TOKEN_VALUE")
+        
         if [ -z "$INFLUXDB_TOKEN_VALUE" ]; then
           echo "⚠️ WARNING: INFLUXDB_TOKEN secret is empty or not set!"
         else
           echo "✅ INFLUXDB_TOKEN secret is configured (length: ${#INFLUXDB_TOKEN_VALUE} chars)"
+          # Debug: Show first and last few characters
+          echo "   Token preview: ${INFLUXDB_TOKEN_VALUE:0:8}...${INFLUXDB_TOKEN_VALUE: -8}"
+          
+          # Validate token format - InfluxDB tokens should be 88 characters for v2
+          if [ ${#INFLUXDB_TOKEN_VALUE} -eq 88 ]; then
+            echo "   ✅ Token length matches InfluxDB v2 format (88 chars)"
+          else
+            echo "   ⚠️ Token length (${#INFLUXDB_TOKEN_VALUE}) doesn't match standard InfluxDB v2 format (88 chars)"
+            echo "   This might be a custom token or there could be formatting issues"
+          fi
+          
+          # Check for valid base64-like characters
+          if echo "$INFLUXDB_TOKEN_VALUE" | grep -q '^[A-Za-z0-9_-]*$'; then
+            echo "   ✅ Token contains valid characters"
+          else
+            echo "   ⚠️ Token contains invalid characters - may cause authentication issues"
+          fi
         fi
+        
+        # Write the cleaned token to the env file
+        echo "TRADING_STATE_INFLUXDB_TOKEN=$INFLUXDB_TOKEN_VALUE" >> .env
 
     - name: Create trading pairs configuration file
       run: |
@@ -513,6 +535,17 @@ jobs:
         
         # Start InfluxDB container first
         echo "📊 Starting InfluxDB container..."
+        
+        # Clean the token for InfluxDB initialization  
+        CLEAN_INFLUXDB_TOKEN=$(echo "${{ secrets.INFLUXDB_TOKEN }}" | tr -d '\n\r\t ' 2>/dev/null || echo "${{ secrets.INFLUXDB_TOKEN }}")
+        
+        echo "🔍 InfluxDB Configuration:"
+        echo "   Username: ${{ secrets.INFLUXDB_USERNAME }}"
+        echo "   Organization: ${{ secrets.INFLUXDB_ORG }}"
+        echo "   Bucket: ${{ secrets.INFLUXDB_BUCKET }}"
+        echo "   Token length: ${#CLEAN_INFLUXDB_TOKEN} chars"
+        echo "   Token preview: ${CLEAN_INFLUXDB_TOKEN:0:8}...${CLEAN_INFLUXDB_TOKEN: -8}"
+        
         $USE_SUDO docker run -d \
           --name "influxdb" \
           --restart unless-stopped \
@@ -524,7 +557,7 @@ jobs:
           -e DOCKER_INFLUXDB_INIT_PASSWORD=${{ secrets.INFLUXDB_PASSWORD }} \
           -e DOCKER_INFLUXDB_INIT_ORG=${{ secrets.INFLUXDB_ORG }} \
           -e DOCKER_INFLUXDB_INIT_BUCKET=${{ secrets.INFLUXDB_BUCKET }} \
-          -e DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${{ secrets.INFLUXDB_TOKEN }} \
+          -e DOCKER_INFLUXDB_INIT_ADMIN_TOKEN="$CLEAN_INFLUXDB_TOKEN" \
           --memory=512m \
           --cpus=1 \
           --log-driver=json-file \
@@ -536,6 +569,10 @@ jobs:
         echo "⏳ Waiting for InfluxDB to initialize..."
         sleep 15
         
+        # Check InfluxDB logs for any initialization errors
+        echo "📋 InfluxDB initialization logs:"
+        $USE_SUDO docker logs --tail 20 influxdb
+        
         # Verify InfluxDB is ready with health check
         echo "🔍 Verifying InfluxDB health..."
         for i in {1..12}; do
@@ -546,7 +583,7 @@ jobs:
           if [ $i -eq 12 ]; then
             echo "❌ InfluxDB health check failed after 60 seconds"
             echo "📋 InfluxDB container logs:"
-            $USE_SUDO docker logs --tail 20 influxdb
+            $USE_SUDO docker logs --tail 30 influxdb
             exit 1
           fi
           echo "   Attempt $i/12: InfluxDB still initializing..."
@@ -560,56 +597,96 @@ jobs:
         # Verify InfluxDB setup completed successfully
         echo "🔐 Testing InfluxDB setup and authentication..."
         
+        # Debug: Show what tokens we're working with
+        echo "🔍 Debugging token configuration..."
+        echo "   Token from GitHub secret: ${#CLEAN_INFLUXDB_TOKEN} characters"
+        echo "   Token preview: ${CLEAN_INFLUXDB_TOKEN:0:8}...${CLEAN_INFLUXDB_TOKEN: -8}"
+        echo "   Expected organization: ${{ secrets.INFLUXDB_ORG }}"
+        echo "   Expected bucket: ${{ secrets.INFLUXDB_BUCKET }}"
+        
         # Test 1: Check if organization exists
-        ORG_CHECK=$($USE_SUDO docker exec influxdb curl -s \
-          -H "Authorization: Token ${{ secrets.INFLUXDB_TOKEN }}" \
+        echo "🏢 Testing organization access..."
+        ORG_RESPONSE=$($USE_SUDO docker exec influxdb curl -s \
+          -H "Authorization: Token $CLEAN_INFLUXDB_TOKEN" \
           -H "Accept: application/json" \
-          "http://localhost:8086/api/v2/orgs" | grep -c "${{ secrets.INFLUXDB_ORG }}" || echo "0")
+          "http://localhost:8086/api/v2/orgs")
+        
+        echo "Organization API response: $ORG_RESPONSE"
+        
+        ORG_CHECK=$(echo "$ORG_RESPONSE" | grep -c "${{ secrets.INFLUXDB_ORG }}" 2>/dev/null || echo "0")
         
         if [ "$ORG_CHECK" -gt 0 ]; then
           echo "✅ Organization '${{ secrets.INFLUXDB_ORG }}' exists"
         else
           echo "❌ Organization '${{ secrets.INFLUXDB_ORG }}' not found"
+          echo "📋 Full organization response:"
+          echo "$ORG_RESPONSE"
           echo "📋 Available organizations:"
-          $USE_SUDO docker exec influxdb curl -s \
-            -H "Authorization: Token ${{ secrets.INFLUXDB_TOKEN }}" \
-            -H "Accept: application/json" \
-            "http://localhost:8086/api/v2/orgs" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 || echo "Could not list organizations"
+          echo "$ORG_RESPONSE" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "Could not parse organizations"
         fi
         
-        # Test 2: Check if bucket exists
-        BUCKET_CHECK=$($USE_SUDO docker exec influxdb curl -s \
-          -H "Authorization: Token ${{ secrets.INFLUXDB_TOKEN }}" \
+        # Test 2: Check if bucket exists  
+        echo "🪣 Testing bucket access..."
+        BUCKET_RESPONSE=$($USE_SUDO docker exec influxdb curl -s \
+          -H "Authorization: Token $CLEAN_INFLUXDB_TOKEN" \
           -H "Accept: application/json" \
-          "http://localhost:8086/api/v2/buckets?org=${{ secrets.INFLUXDB_ORG }}" | grep -c "${{ secrets.INFLUXDB_BUCKET }}" || echo "0")
+          "http://localhost:8086/api/v2/buckets?org=${{ secrets.INFLUXDB_ORG }}")
+        
+        echo "Bucket API response: $BUCKET_RESPONSE"
+        
+        BUCKET_CHECK=$(echo "$BUCKET_RESPONSE" | grep -c "${{ secrets.INFLUXDB_BUCKET }}" 2>/dev/null || echo "0")
         
         if [ "$BUCKET_CHECK" -gt 0 ]; then
           echo "✅ Bucket '${{ secrets.INFLUXDB_BUCKET }}' exists and is accessible"
         else
           echo "❌ Bucket '${{ secrets.INFLUXDB_BUCKET }}' not found or not accessible"
+          echo "📋 Full bucket response:"
+          echo "$BUCKET_RESPONSE"
           echo "📋 Available buckets:"
-          $USE_SUDO docker exec influxdb curl -s \
-            -H "Authorization: Token ${{ secrets.INFLUXDB_TOKEN }}" \
-            -H "Accept: application/json" \
-            "http://localhost:8086/api/v2/buckets?org=${{ secrets.INFLUXDB_ORG }}" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 || echo "Could not list buckets"
+          echo "$BUCKET_RESPONSE" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "Could not parse buckets"
         fi
         
         # Test 3: Test write permission (write a test point)
-        echo "🔍 Testing write permissions..."
-        TEST_WRITE=$($USE_SUDO docker exec influxdb curl -s -w "%{http_code}" -o /dev/null \
-          -H "Authorization: Token ${{ secrets.INFLUXDB_TOKEN }}" \
+        echo "✍️ Testing write permissions..."
+        TEST_WRITE_RESPONSE=$($USE_SUDO docker exec influxdb curl -s -w "\nHTTP_STATUS:%{http_code}" \
+          -H "Authorization: Token $CLEAN_INFLUXDB_TOKEN" \
           -H "Content-Type: text/plain; charset=utf-8" \
           -H "Accept: application/json" \
           -X POST \
           "http://localhost:8086/api/v2/write?org=${{ secrets.INFLUXDB_ORG }}&bucket=${{ secrets.INFLUXDB_BUCKET }}" \
           --data-raw "test_connection,source=deployment value=1")
         
+        echo "Write test response: $TEST_WRITE_RESPONSE"
+        TEST_WRITE=$(echo "$TEST_WRITE_RESPONSE" | grep "HTTP_STATUS:" | cut -d: -f2)
+        
         if [ "$TEST_WRITE" = "204" ]; then
           echo "✅ Write permissions verified - InfluxDB is ready for trading system"
         else
           echo "❌ Write permission test failed (HTTP: $TEST_WRITE)"
+          echo "📋 Full response: $TEST_WRITE_RESPONSE"
           echo "📋 This may indicate token permission issues"
         fi
+        
+        # Test 4: Verify the exact same token will work from trading container
+        echo "🔗 Testing token access from trading container perspective..."
+        # Store the token in a temporary file to test it exactly as the trading system will use it
+        echo "$CLEAN_INFLUXDB_TOKEN" > /tmp/test_token.txt
+        EXACT_TOKEN=$(cat /tmp/test_token.txt)
+        
+        CONTAINER_TEST=$($USE_SUDO docker exec influxdb curl -s -w "%{http_code}" -o /dev/null \
+          -H "Authorization: Token $EXACT_TOKEN" \
+          -H "Accept: application/json" \
+          "http://localhost:8086/api/v2/buckets?org=${{ secrets.INFLUXDB_ORG }}")
+        
+        echo "Container-style token test result: HTTP $CONTAINER_TEST"
+        
+        if [ "$CONTAINER_TEST" = "200" ]; then
+          echo "✅ Token verification successful - trading system should work"
+        else
+          echo "❌ Token verification failed - trading system will likely fail"
+        fi
+        
+        rm -f /tmp/test_token.txt
         
         # Start new container
         echo "🚀 Starting new service..."
@@ -643,6 +720,13 @@ jobs:
           else
             echo 'TRADING_STATE_INFLUXDB_TOKEN: ***NOT SET***'
           fi
+          
+          echo '🔍 Testing token from within trading container...'
+          # Test the exact same API call that the trading system will make
+          curl -s -w \"\\nHTTP_STATUS:%{http_code}\" \
+            -H \"Authorization: Token \$TRADING_STATE_INFLUXDB_TOKEN\" \
+            -H \"Accept: application/json\" \
+            \"http://influxdb:8086/api/v2/buckets?org=\$TRADING_STATE_INFLUXDB_ORG\" || echo 'API test failed'
         " || echo "⚠️ Could not verify environment - container may be starting"
         
         # Test network connectivity from trading system to InfluxDB
