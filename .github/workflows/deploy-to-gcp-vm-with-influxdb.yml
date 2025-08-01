@@ -528,6 +528,28 @@ jobs:
         echo "📁 Creating InfluxDB directories..."
         sudo mkdir -p /opt/trading-system/influxdb-data
         sudo mkdir -p /opt/trading-system/influxdb-config
+        
+        # IMPORTANT: Clear existing InfluxDB data to force fresh setup
+        echo "🧹 Clearing existing InfluxDB data to ensure fresh setup..."
+        sudo rm -rf /opt/trading-system/influxdb-data/*
+        sudo rm -rf /opt/trading-system/influxdb-config/*
+        
+        # Verify directories are empty
+        DATA_FILES=$(sudo find /opt/trading-system/influxdb-data -type f 2>/dev/null | wc -l)
+        CONFIG_FILES=$(sudo find /opt/trading-system/influxdb-config -type f 2>/dev/null | wc -l)
+        
+        if [ "$DATA_FILES" -eq 0 ] && [ "$CONFIG_FILES" -eq 0 ]; then
+          echo "✅ InfluxDB directories confirmed empty - will perform fresh initialization"
+        else
+          echo "❌ WARNING: InfluxDB directories not empty (data: $DATA_FILES files, config: $CONFIG_FILES files)"
+          echo "   This may cause setup to be skipped! Attempting more aggressive cleanup..."
+          sudo rm -rf /opt/trading-system/influxdb-data
+          sudo rm -rf /opt/trading-system/influxdb-config
+          sudo mkdir -p /opt/trading-system/influxdb-data
+          sudo mkdir -p /opt/trading-system/influxdb-config
+          echo "✅ Forced recreation of empty directories"
+        fi
+        
         sudo chown -R 1000:1000 /opt/trading-system/influxdb-data
         sudo chown -R 1000:1000 /opt/trading-system/influxdb-config
         sudo chmod -R 755 /opt/trading-system/influxdb-data
@@ -545,6 +567,9 @@ jobs:
         echo "   Bucket: ${{ secrets.INFLUXDB_BUCKET }}"
         echo "   Token length: ${#CLEAN_INFLUXDB_TOKEN} chars"
         echo "   Token preview: ${CLEAN_INFLUXDB_TOKEN:0:8}...${CLEAN_INFLUXDB_TOKEN: -8}"
+        echo "   Setup Mode: DOCKER_INFLUXDB_INIT_MODE=setup (will create admin token)"
+        
+        echo "🚀 Starting InfluxDB with fresh setup..."
         
         $USE_SUDO docker run -d \
           --name "influxdb" \
@@ -572,6 +597,22 @@ jobs:
         # Check InfluxDB logs for any initialization errors
         echo "📋 InfluxDB initialization logs:"
         $USE_SUDO docker logs --tail 20 influxdb
+        
+        # Check if setup actually ran (look for setup success indicators)
+        SETUP_LOGS=$($USE_SUDO docker logs influxdb 2>&1)
+        if echo "$SETUP_LOGS" | grep -q "skipping setup wrapper"; then
+          echo "❌ CRITICAL: InfluxDB found existing data and skipped setup!"
+          echo "❌ This means the admin token, organization, and bucket were NOT created!"
+          echo "❌ The token authentication will fail because the token doesn't exist in the database."
+          echo "📋 InfluxDB data was not properly cleared. Stopping deployment."
+          exit 1
+        elif echo "$SETUP_LOGS" | grep -q "setup complete" || echo "$SETUP_LOGS" | grep -q "UI setup complete"; then
+          echo "✅ InfluxDB setup completed successfully - admin token should be active"
+        else
+          echo "⚠️ InfluxDB setup status unclear from logs - proceeding with caution"
+          echo "📋 Full InfluxDB logs for analysis:"
+          echo "$SETUP_LOGS"
+        fi
         
         # Verify InfluxDB is ready with health check
         echo "🔍 Verifying InfluxDB health..."
