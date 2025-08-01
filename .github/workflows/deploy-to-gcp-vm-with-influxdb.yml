@@ -440,40 +440,11 @@ jobs:
         echo "TRADING_STATE_INFLUXDB_URL=http://influxdb:8086" >> .env
         echo "TRADING_STATE_INFLUXDB_ORG=${{ secrets.INFLUXDB_ORG }}" >> .env
         echo "TRADING_STATE_INFLUXDB_BUCKET=${{ secrets.INFLUXDB_BUCKET }}" >> .env
-        
-        # Legacy compatibility variables (for any code still using username/password)
         echo "TRADING_STATE_INFLUXDB_USERNAME=${{ secrets.INFLUXDB_USERNAME }}" >> .env
         echo "TRADING_STATE_INFLUXDB_PASSWORD=${{ secrets.INFLUXDB_PASSWORD }}" >> .env
         
-        # Verify token is set (debug info)
-        INFLUXDB_TOKEN_VALUE="${{ secrets.INFLUXDB_TOKEN }}"
-        # Clean the token of any whitespace/newlines
-        INFLUXDB_TOKEN_VALUE=$(echo "$INFLUXDB_TOKEN_VALUE" | tr -d '\n\r\t ' 2>/dev/null || echo "$INFLUXDB_TOKEN_VALUE")
-        
-        if [ -z "$INFLUXDB_TOKEN_VALUE" ]; then
-          echo "⚠️ WARNING: INFLUXDB_TOKEN secret is empty or not set!"
-        else
-          echo "✅ INFLUXDB_TOKEN secret is configured (length: ${#INFLUXDB_TOKEN_VALUE} chars)"
-          # Debug: Show first and last few characters
-          echo "   Token preview: ${INFLUXDB_TOKEN_VALUE:0:8}...${INFLUXDB_TOKEN_VALUE: -8}"
-          
-          # Validate token format - InfluxDB tokens should be 88 characters for v2
-          if [ ${#INFLUXDB_TOKEN_VALUE} -eq 88 ]; then
-            echo "   ✅ Token length matches InfluxDB v2 format (88 chars)"
-          else
-            echo "   ⚠️ Token length (${#INFLUXDB_TOKEN_VALUE}) doesn't match standard InfluxDB v2 format (88 chars)"
-            echo "   This might be a custom token or there could be formatting issues"
-          fi
-          
-          # Check for valid base64-like characters
-          if echo "$INFLUXDB_TOKEN_VALUE" | grep -q '^[A-Za-z0-9_-]*$'; then
-            echo "   ✅ Token contains valid characters"
-          else
-            echo "   ⚠️ Token contains invalid characters - may cause authentication issues"
-          fi
-        fi
-        
-        # Write the cleaned token to the env file
+        # Clean and add InfluxDB token
+        INFLUXDB_TOKEN_VALUE=$(echo "${{ secrets.INFLUXDB_TOKEN }}" | tr -d '\n\r\t ' 2>/dev/null || echo "${{ secrets.INFLUXDB_TOKEN }}")
         echo "TRADING_STATE_INFLUXDB_TOKEN=$INFLUXDB_TOKEN_VALUE" >> .env
 
     - name: Create trading pairs configuration file
@@ -533,23 +504,6 @@ jobs:
         echo "🧹 Clearing existing InfluxDB data to ensure fresh setup..."
         sudo rm -rf /opt/trading-system/influxdb-data/*
         sudo rm -rf /opt/trading-system/influxdb-config/*
-        
-        # Verify directories are empty
-        DATA_FILES=$(sudo find /opt/trading-system/influxdb-data -type f 2>/dev/null | wc -l)
-        CONFIG_FILES=$(sudo find /opt/trading-system/influxdb-config -type f 2>/dev/null | wc -l)
-        
-        if [ "$DATA_FILES" -eq 0 ] && [ "$CONFIG_FILES" -eq 0 ]; then
-          echo "✅ InfluxDB directories confirmed empty - will perform fresh initialization"
-        else
-          echo "❌ WARNING: InfluxDB directories not empty (data: $DATA_FILES files, config: $CONFIG_FILES files)"
-          echo "   This may cause setup to be skipped! Attempting more aggressive cleanup..."
-          sudo rm -rf /opt/trading-system/influxdb-data
-          sudo rm -rf /opt/trading-system/influxdb-config
-          sudo mkdir -p /opt/trading-system/influxdb-data
-          sudo mkdir -p /opt/trading-system/influxdb-config
-          echo "✅ Forced recreation of empty directories"
-        fi
-        
         sudo chown -R 1000:1000 /opt/trading-system/influxdb-data
         sudo chown -R 1000:1000 /opt/trading-system/influxdb-config
         sudo chmod -R 755 /opt/trading-system/influxdb-data
@@ -557,19 +511,7 @@ jobs:
         
         # Start InfluxDB container first
         echo "📊 Starting InfluxDB container..."
-        
-        # Clean the token for InfluxDB initialization  
         CLEAN_INFLUXDB_TOKEN=$(echo "${{ secrets.INFLUXDB_TOKEN }}" | tr -d '\n\r\t ' 2>/dev/null || echo "${{ secrets.INFLUXDB_TOKEN }}")
-        
-        echo "🔍 InfluxDB Configuration:"
-        echo "   Username: ${{ secrets.INFLUXDB_USERNAME }}"
-        echo "   Organization: ${{ secrets.INFLUXDB_ORG }}"
-        echo "   Bucket: ${{ secrets.INFLUXDB_BUCKET }}"
-        echo "   Token length: ${#CLEAN_INFLUXDB_TOKEN} chars"
-        echo "   Token preview: ${CLEAN_INFLUXDB_TOKEN:0:8}...${CLEAN_INFLUXDB_TOKEN: -8}"
-        echo "   Setup Mode: DOCKER_INFLUXDB_INIT_MODE=setup (will create admin token)"
-        
-        echo "🚀 Starting InfluxDB with fresh setup..."
         
         $USE_SUDO docker run -d \
           --name "influxdb" \
@@ -590,29 +532,9 @@ jobs:
           --log-opt max-file=3 \
           influxdb:2.7-alpine
         
-        # Wait for InfluxDB to be ready
+        # Wait for InfluxDB to be ready and verify setup
         echo "⏳ Waiting for InfluxDB to initialize..."
         sleep 15
-        
-        # Check InfluxDB logs for any initialization errors
-        echo "📋 InfluxDB initialization logs:"
-        $USE_SUDO docker logs --tail 20 influxdb
-        
-        # Check if setup actually ran (look for setup success indicators)
-        SETUP_LOGS=$($USE_SUDO docker logs influxdb 2>&1)
-        
-        # Look for signs that setup completed successfully
-        if echo "$SETUP_LOGS" | grep -q "initialization complete"; then
-          echo "✅ InfluxDB setup completed successfully - admin token should be active"
-          echo "📋 Setup created user/org/bucket as shown in logs"
-        elif echo "$SETUP_LOGS" | grep -q "skipping setup wrapper" && ! echo "$SETUP_LOGS" | grep -q "initialization complete"; then
-          echo "❌ WARNING: InfluxDB found existing data and skipped setup!"
-          echo "❌ This means the admin token, organization, and bucket were NOT created!"
-          echo "⚠️ However, continuing deployment in case setup succeeded in a previous run..."
-        else
-          echo "⚠️ InfluxDB setup status unclear from logs - proceeding with caution"
-          echo "📋 Will test authentication to verify setup worked"
-        fi
         
         # Verify InfluxDB is ready with health check
         echo "🔍 Verifying InfluxDB health..."
@@ -623,145 +545,12 @@ jobs:
           fi
           if [ $i -eq 12 ]; then
             echo "❌ InfluxDB health check failed after 60 seconds"
-            echo "📋 InfluxDB container logs:"
-            $USE_SUDO docker logs --tail 30 influxdb
+            $USE_SUDO docker logs --tail 10 influxdb
             exit 1
           fi
-          echo "   Attempt $i/12: InfluxDB still initializing..."
+          echo "   Waiting for InfluxDB... ($i/12)"
           sleep 5
         done
-        
-        # Wait additional time for InfluxDB setup to complete
-        echo "⏳ Allowing additional time for InfluxDB setup to complete..."
-        sleep 10
-        
-        # Verify InfluxDB setup completed successfully
-        echo "🔐 Testing InfluxDB setup and authentication..."
-        
-        # Debug: Show what tokens we're working with
-        echo "🔍 Debugging token configuration..."
-        echo "   Token from GitHub secret: ${#CLEAN_INFLUXDB_TOKEN} characters"
-        echo "   Token preview: ${CLEAN_INFLUXDB_TOKEN:0:8}...${CLEAN_INFLUXDB_TOKEN: -8}"
-        echo "   Expected organization: ${{ secrets.INFLUXDB_ORG }}"
-        echo "   Expected bucket: ${{ secrets.INFLUXDB_BUCKET }}"
-        
-        # Test 1: Check if organization exists
-        echo "🏢 Testing organization access..."
-        ORG_RESPONSE=$($USE_SUDO docker exec influxdb curl -s \
-          -H "Authorization: Token $CLEAN_INFLUXDB_TOKEN" \
-          -H "Accept: application/json" \
-          "http://localhost:8086/api/v2/orgs")
-        
-        echo "Organization API response: $ORG_RESPONSE"
-        
-        ORG_CHECK=$(echo "$ORG_RESPONSE" | grep -c "${{ secrets.INFLUXDB_ORG }}" 2>/dev/null || echo "0")
-        
-        if [ "$ORG_CHECK" -gt 0 ]; then
-          echo "✅ Organization '${{ secrets.INFLUXDB_ORG }}' exists"
-        else
-          echo "❌ Organization '${{ secrets.INFLUXDB_ORG }}' not found"
-          echo "📋 Full organization response:"
-          echo "$ORG_RESPONSE"
-          
-          # Check if this is an authentication error vs missing org
-          if echo "$ORG_RESPONSE" | grep -q "unauthorized"; then
-            echo "❌ AUTHENTICATION ERROR: Token is invalid or expired"
-            echo "📋 This suggests the InfluxDB setup token doesn't match the provided token"
-            echo "⚠️ Continuing deployment - will test if trading system can still connect..."
-          else
-            echo "📋 Available organizations:"
-            echo "$ORG_RESPONSE" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "Could not parse organizations"
-          fi
-        fi
-        
-        # Test 2: Check if bucket exists  
-        echo "🪣 Testing bucket access..."
-        BUCKET_RESPONSE=$($USE_SUDO docker exec influxdb curl -s \
-          -H "Authorization: Token $CLEAN_INFLUXDB_TOKEN" \
-          -H "Accept: application/json" \
-          "http://localhost:8086/api/v2/buckets?org=${{ secrets.INFLUXDB_ORG }}")
-        
-        echo "Bucket API response: $BUCKET_RESPONSE"
-        
-        BUCKET_CHECK=$(echo "$BUCKET_RESPONSE" | grep -c "${{ secrets.INFLUXDB_BUCKET }}" 2>/dev/null || echo "0")
-        
-        if [ "$BUCKET_CHECK" -gt 0 ]; then
-          echo "✅ Bucket '${{ secrets.INFLUXDB_BUCKET }}' exists and is accessible"
-        else
-          echo "❌ Bucket '${{ secrets.INFLUXDB_BUCKET }}' not found or not accessible"
-          echo "📋 Full bucket response:"
-          echo "$BUCKET_RESPONSE"
-          
-          # Check if this is an authentication error vs missing bucket
-          if echo "$BUCKET_RESPONSE" | grep -q "unauthorized"; then
-            echo "❌ AUTHENTICATION ERROR: Token is invalid or cannot access buckets"
-            echo "📋 This confirms the token authentication is failing"
-            echo "⚠️ Continuing deployment - will test if trading system can still connect..."
-          else
-            echo "📋 Available buckets:"
-            echo "$BUCKET_RESPONSE" | grep -o '"name":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "Could not parse buckets"
-          fi
-        fi
-        
-        # Test 3: Test write permission (write a test point)
-        echo "✍️ Testing write permissions..."
-        TEST_WRITE_RESPONSE=$($USE_SUDO docker exec influxdb curl -s -w "\nHTTP_STATUS:%{http_code}" \
-          -H "Authorization: Token $CLEAN_INFLUXDB_TOKEN" \
-          -H "Content-Type: text/plain; charset=utf-8" \
-          -H "Accept: application/json" \
-          -X POST \
-          "http://localhost:8086/api/v2/write?org=${{ secrets.INFLUXDB_ORG }}&bucket=${{ secrets.INFLUXDB_BUCKET }}" \
-          --data-raw "test_connection,source=deployment value=1")
-        
-        echo "Write test response: $TEST_WRITE_RESPONSE"
-        TEST_WRITE=$(echo "$TEST_WRITE_RESPONSE" | grep "HTTP_STATUS:" | cut -d: -f2)
-        
-        if [ "$TEST_WRITE" = "204" ]; then
-          echo "✅ Write permissions verified - InfluxDB is ready for trading system"
-        else
-          echo "❌ Write permission test failed (HTTP: $TEST_WRITE)"
-          echo "📋 Full response: $TEST_WRITE_RESPONSE"
-          echo "📋 This may indicate token permission issues"
-        fi
-        
-        # Test 4: Verify the exact same token will work from trading container
-        echo "🔗 Testing token access from trading container perspective..."
-        # Store the token in a temporary file to test it exactly as the trading system will use it
-        echo "$CLEAN_INFLUXDB_TOKEN" > /tmp/test_token.txt
-        EXACT_TOKEN=$(cat /tmp/test_token.txt)
-        
-        CONTAINER_TEST=$($USE_SUDO docker exec influxdb curl -s -w "%{http_code}" -o /dev/null \
-          -H "Authorization: Token $EXACT_TOKEN" \
-          -H "Accept: application/json" \
-          "http://localhost:8086/api/v2/buckets?org=${{ secrets.INFLUXDB_ORG }}")
-        
-        echo "Container-style token test result: HTTP $CONTAINER_TEST"
-        
-        if [ "$CONTAINER_TEST" = "200" ]; then
-          echo "✅ Token verification successful - trading system should work"
-        else
-          echo "❌ Token verification failed - trading system will likely fail"
-          
-          # Debug: Try to list all tokens (this will fail with our token but might give us info)
-          echo "🔍 Debugging: Attempting to check InfluxDB setup with admin credentials..."
-          
-          # Try using the initial setup API to see what was created
-          echo "📋 Checking if we can access setup information..."
-          SETUP_CHECK=$($USE_SUDO docker exec influxdb curl -s \
-            -H "Content-Type: application/json" \
-            "http://localhost:8086/api/v2/setup" 2>/dev/null || echo "Setup API unavailable")
-          echo "Setup API response: $SETUP_CHECK"
-          
-          # This suggests the token provided doesn't match what was created during setup
-          echo "❌ POSSIBLE ISSUE: The token in GitHub secrets may not match what InfluxDB created"
-          echo "📋 Consider regenerating the INFLUXDB_TOKEN secret with a fresh token"
-          
-          # Try to continue deployment anyway - the trading system might still connect
-          echo "⚠️ Continuing deployment despite token test failure..."
-          echo "📋 The trading system will attempt to connect and may still work"
-        fi
-        
-        rm -f /tmp/test_token.txt
         
         # Start new container
         echo "🚀 Starting new service..."
@@ -787,36 +576,15 @@ jobs:
         # Verify environment variables are properly loaded
         echo "🔍 Verifying environment configuration..."
         $USE_SUDO docker exec "$SERVICE_NAME" bash -c "
-          echo 'TRADING_STATE_INFLUXDB_URL:' \$TRADING_STATE_INFLUXDB_URL
-          echo 'TRADING_STATE_INFLUXDB_ORG:' \$TRADING_STATE_INFLUXDB_ORG  
-          echo 'TRADING_STATE_INFLUXDB_BUCKET:' \$TRADING_STATE_INFLUXDB_BUCKET
+          echo 'InfluxDB URL:' \$TRADING_STATE_INFLUXDB_URL
+          echo 'Organization:' \$TRADING_STATE_INFLUXDB_ORG  
+          echo 'Bucket:' \$TRADING_STATE_INFLUXDB_BUCKET
           if [ -n \"\$TRADING_STATE_INFLUXDB_TOKEN\" ]; then
-            echo 'TRADING_STATE_INFLUXDB_TOKEN: ***configured*** (length:' \${#TRADING_STATE_INFLUXDB_TOKEN} 'chars)'
+            echo 'Token: configured (length:' \${#TRADING_STATE_INFLUXDB_TOKEN} 'chars)'
           else
-            echo 'TRADING_STATE_INFLUXDB_TOKEN: ***NOT SET***'
+            echo 'Token: NOT SET'
           fi
-          
-          echo '🔍 Testing token from within trading container...'
-          # Test the exact same API call that the trading system will make
-          curl -s -w \"\\nHTTP_STATUS:%{http_code}\" \
-            -H \"Authorization: Token \$TRADING_STATE_INFLUXDB_TOKEN\" \
-            -H \"Accept: application/json\" \
-            \"http://influxdb:8086/api/v2/buckets?org=\$TRADING_STATE_INFLUXDB_ORG\" || echo 'API test failed'
         " || echo "⚠️ Could not verify environment - container may be starting"
-        
-        # Test network connectivity from trading system to InfluxDB
-        echo "🌐 Testing network connectivity from trading system to InfluxDB..."
-        sleep 5  # Give containers time to link
-        $USE_SUDO docker exec "$SERVICE_NAME" bash -c "
-          echo 'Testing ping to influxdb host...'
-          ping -c 3 influxdb || echo 'Ping failed'
-          echo 'Testing InfluxDB health endpoint...'
-          curl -f http://influxdb:8086/health || echo 'Health check failed'
-          echo 'Testing InfluxDB API with token...'
-          curl -s -H \"Authorization: Token \$TRADING_STATE_INFLUXDB_TOKEN\" \
-               -H \"Accept: application/json\" \
-               \"http://influxdb:8086/api/v2/buckets?org=\$TRADING_STATE_INFLUXDB_ORG\" | head -100
-        " || echo "⚠️ Network connectivity test failed - container may still be starting"
         
         # Verify deployment
         echo "🔍 Verifying deployment..."
@@ -825,50 +593,40 @@ jobs:
         if $USE_SUDO docker ps | grep -q "$SERVICE_NAME"; then
           echo "✅ Container is running successfully!"
           
-          # Check container health
           CONTAINER_STATUS=$($USE_SUDO docker inspect -f '{{.State.Status}}' "$SERVICE_NAME")
-          echo "📊 Container status: $CONTAINER_STATUS"
-          
           if [ "$CONTAINER_STATUS" = "running" ]; then
             echo "✅ Container is healthy"
-            echo "📋 Recent logs:"
-            $USE_SUDO docker logs --tail 20 "$SERVICE_NAME"
           else
             echo "❌ Container is not in running state"
-            $USE_SUDO docker logs "$SERVICE_NAME"
+            $USE_SUDO docker logs --tail 10 "$SERVICE_NAME"
             exit 1
           fi
         else
           echo "❌ Service failed to start!"
-          $USE_SUDO docker logs "$SERVICE_NAME"
+          $USE_SUDO docker logs --tail 10 "$SERVICE_NAME"
           exit 1
         fi
         
         # Health check
         echo "🏥 Performing health check..."
-        for i in {1..8}; do
+        for i in {1..6}; do
           if timeout 5 curl -f http://localhost/health >/dev/null 2>&1; then
             echo "✅ Health check passed!"
             break
           fi
-          if [ $i -eq 8 ]; then
-            echo "❌ Health check failed after 8 attempts"
-            echo "📋 Container status:"
-            $USE_SUDO docker ps --filter name="$SERVICE_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+          if [ $i -eq 6 ]; then
+            echo "❌ Health check failed - service may still be initializing"
             echo "📋 Recent logs:"
-            $USE_SUDO docker logs --tail 20 "$SERVICE_NAME"
-            exit 1
+            $USE_SUDO docker logs --tail 10 "$SERVICE_NAME"
           fi
-          echo "⏳ Waiting for service to be ready... ($i/8)"
+          echo "⏳ Waiting for service to be ready... ($i/6)"
           sleep 8
         done
         
         # Display service info
-        echo "📊 Service Information:"
-        echo "Container ID: $($USE_SUDO docker ps -q -f name=$SERVICE_NAME)"
-        echo "Image: $IMAGE_NAME"
+        echo "📊 Deployment completed successfully!"
+        echo "Container: $($USE_SUDO docker ps -q -f name=$SERVICE_NAME)"
         echo "Status: $($USE_SUDO docker inspect -f '{{.State.Status}}' $SERVICE_NAME)"
-        echo "Started: $($USE_SUDO docker inspect -f '{{.State.StartedAt}}' $SERVICE_NAME)"
         EOF
         
         chmod +x start-container.sh
@@ -922,38 +680,20 @@ jobs:
           --project=${{ secrets.GCP_PROJECT_ID }} \
           --ssh-flag="-o ConnectTimeout=10" \
           --command="
-            echo 'Current images before cleanup:';
-            docker images | grep trading-system || true;
-            echo '';
-            echo 'Cleaning up old trading-system images (keeping latest 3)...';
-            
-            # Get image IDs of old images (skip the latest 3)
+            # Get old images (skip latest 3)
             OLD_IMAGES=\$(docker images us-east4-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/trading-system/trading-system --format '{{.ID}} {{.CreatedAt}}' | sort -k2 -r | tail -n +4 | awk '{print \$1}');
             
             if [ -n \"\$OLD_IMAGES\" ]; then
-              echo \"Removing images: \$OLD_IMAGES\";
+              echo \"Removing old images...\";
               echo \"\$OLD_IMAGES\" | xargs -r docker rmi -f || true;
-              echo 'Old images removed successfully';
-            else
-              echo 'No old images to remove';
             fi;
             
-            echo '';
-            echo 'Cleaning up dangling images...';
+            # Clean up dangling images and unused resources
             docker image prune -f || true;
-            
-            echo '';
-            echo 'Final cleanup - removing unused images...';
             docker system prune -f || true;
             
-            echo '';
-            echo 'Images after cleanup:';
-            docker images | grep trading-system || echo 'No trading-system images found';
-            
-            echo '';
-            echo 'Disk usage:';
-            df -h /var/lib/docker 2>/dev/null || df -h / | grep -v tmpfs | head -2;
-          " || echo "Cleanup completed with some warnings"
+            echo 'Cleanup completed';
+          " || echo "Cleanup completed with warnings"
 
     - name: Post-deployment verification
       timeout-minutes: 5
@@ -974,28 +714,11 @@ jobs:
           --format="value(tags.items[])")
         echo "📋 VM Network Tags: $VM_TAGS"
         
-        # Quick firewall rules check with timeout
-        DASHBOARD_RULE_EXISTS=$(timeout 10 gcloud compute firewall-rules describe allow-trading-dashboard --project=${{ secrets.GCP_PROJECT_ID }} --format="value(name)" 2>/dev/null || echo "")
-        API_RULE_EXISTS=$(timeout 10 gcloud compute firewall-rules describe allow-trading-api --project=${{ secrets.GCP_PROJECT_ID }} --format="value(name)" 2>/dev/null || echo "")
-        
-        if [ -n "$DASHBOARD_RULE_EXISTS" ]; then
-          echo "✅ Dashboard firewall rule exists"
-        else
-          echo "❌ Dashboard firewall rule missing"
-        fi
-        
-        if [ -n "$API_RULE_EXISTS" ]; then
-          echo "✅ API firewall rule exists"
-        else
-          echo "❌ API firewall rule missing"
-        fi
-        
-        # Optimized external health check with shorter timeouts
-        echo "🔍 External health check (quick)..."
+        # Optimized external health check
+        echo "🔍 External health check..."
         HEALTH_CHECK_SUCCESS=false
         
-        for i in {1..6}; do
-          # Use shorter timeout (5 seconds instead of default 30+)
+        for i in {1..4}; do
           if timeout 5 curl -f "http://$VM_IP/health" >/dev/null 2>&1; then
             echo "✅ External health check passed!"
             echo "🎯 Dashboard URL: http://$VM_IP"
@@ -1003,37 +726,19 @@ jobs:
             HEALTH_CHECK_SUCCESS=true
             break
           fi
-          echo "⏳ Waiting for external access... ($i/6)"
+          echo "⏳ Waiting for external access... ($i/4)"
           sleep 10
         done
         
         # Only do troubleshooting if health check failed
         if [ "$HEALTH_CHECK_SUCCESS" = "false" ]; then
-          echo "❌ External health check failed after 6 attempts"
-          echo "🔍 Quick troubleshooting..."
-          
-          # Quick container status check with timeout
-          echo "   - Checking container status..."
-          timeout 30 gcloud compute ssh ${{ env.VM_NAME }} \
+          echo "❌ External health check failed - service may still be initializing"
+          echo "📋 Recent logs:"
+          timeout 20 gcloud compute ssh ${{ env.VM_NAME }} \
             --zone=${{ env.VM_ZONE }} \
             --project=${{ secrets.GCP_PROJECT_ID }} \
-            --ssh-flag="-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3" \
-            --command="docker ps --filter name=trading-system --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'" || echo "   - SSH connection timed out"
-          
-          # Quick log check with timeout  
-          echo "   - Checking recent logs..."
-          timeout 30 gcloud compute ssh ${{ env.VM_NAME }} \
-            --zone=${{ env.VM_ZONE }} \
-            --project=${{ secrets.GCP_PROJECT_ID }} \
-            --ssh-flag="-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3" \
-            --command="docker logs --tail 10 trading-system 2>/dev/null || echo 'Container logs unavailable'" || echo "   - Log retrieval timed out"
-          
-          echo ""
-          echo "🔍 Manual verification steps:"
-          echo "   1. Check container: gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.VM_ZONE }} --command='docker ps'"
-          echo "   2. Check logs: gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.VM_ZONE }} --command='docker logs trading-system'"
-          echo "   3. Test locally: gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.VM_ZONE }} --command='curl http://localhost/health'"
-          echo "   4. Check firewall: gcloud compute firewall-rules list --filter='name:allow-trading*'"
+            --ssh-flag="-o ConnectTimeout=10" \
+            --command="docker logs --tail 5 trading-system 2>/dev/null || echo 'Logs unavailable'" || echo "   - Could not retrieve logs"
         fi
 
     - name: Notify deployment status
@@ -1088,20 +793,16 @@ jobs:
       run: |
         echo "🧹 Cleaning up old Docker images in Artifact Registry..."
         
-        # Get list of images with proper sorting
+        # Get old images (keep latest 5)
         IMAGES_TO_DELETE=$(gcloud artifacts docker images list \
           ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }} \
           --sort-by="~CREATE_TIME" \
-          --format="value(IMAGE)" | tail -n +6)  # Keep latest 5 instead of 10
+          --format="value(IMAGE)" | tail -n +6)
         
         if [ -n "$IMAGES_TO_DELETE" ]; then
-          echo "Images to delete:"
-          echo "$IMAGES_TO_DELETE"
-          echo ""
-          
+          echo "Deleting old images..."
           echo "$IMAGES_TO_DELETE" | while read image; do
             if [ -n "$image" ]; then
-              echo "Deleting: $image"
               gcloud artifacts docker images delete "$image" --quiet || echo "Failed to delete $image"
             fi
           done
@@ -1110,10 +811,3 @@ jobs:
         fi
         
         echo "✅ Artifact Registry cleanup completed"
-        
-        # Show remaining images
-        echo "📊 Remaining images in registry:"
-        gcloud artifacts docker images list \
-          ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/${{ env.IMAGE_NAME }} \
-          --sort-by="~CREATE_TIME" \
-          --limit=10
