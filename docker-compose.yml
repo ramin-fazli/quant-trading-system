@@ -1,17 +1,15 @@
-# Unified Docker Compose for Trading System
-# Works for both local development and production
+# Docker Compose for Trading System - Mirrors GCP VM Deployment
+# Exactly matches the production deployment configuration
 
 services:
   trading-system:
     build: .
     container_name: trading-system
     restart: unless-stopped
-    # Keep container running for script execution
-    entrypoint: ["tail", "-f", "/dev/null"]
     ports:
-      - "${DASHBOARD_PORT:-8050}:8050"  # Dashboard
-      - "${API_PORT:-8000}:8000"        # API
-      - "${SCRIPT_MANAGER_PORT:-9000}:9000"  # Script Manager API
+      - "80:8050"    # Dashboard (matches GCP deployment port mapping)
+      - "443:8050"   # HTTPS Dashboard (matches GCP deployment)
+      - "8080:8080"  # API (matches GCP deployment)
     environment:
       - TRADING_MODE=${TRADING_MODE:-live}
       - DATA_PROVIDER=${DATA_PROVIDER:-ctrader}
@@ -19,133 +17,86 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - ENVIRONMENT=${ENVIRONMENT:-production}
       - PYTHONUNBUFFERED=1
-      - WAIT_FOR_INFLUXDB=1
-      # Dashboard configuration
+      # Dashboard configuration (matches GCP deployment)
       - DASHBOARD_HOST=0.0.0.0
-      - DASHBOARD_PORT=${DASHBOARD_PORT:-8050}
-      # Override InfluxDB URLs for container networking (takes precedence over .env)
+      - DASHBOARD_PORT=8050
+      # InfluxDB connection (matches GCP deployment linking)
       - INFLUXDB_URL=http://influxdb:8086
       - TRADING_STATE_INFLUXDB_URL=http://influxdb:8086
-      - TRADING_STATE_INFLUXDB_TOKEN=${INFLUXDB_TOKEN}
-      - TRADING_STATE_INFLUXDB_ORG=${INFLUXDB_ORG:-quant-system}
-      - TRADING_STATE_INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-quant-data}
     env_file:
-      - .env${ENV_SUFFIX}
+      - .env
     volumes:
       - ./logs:/app/logs
       - ./backtest_reports:/app/backtest_reports
-      - ./data:/app/data
-      - ./state_fallback:/app/state_fallback
       - ./cache:/app/cache
-      - ./config:/app/config  # Mount config directory - allows runtime modification of pairs.json and other config files
-      - ./scripts:/app/scripts  # Mount all scripts for easy access
+      - ./pairs_config:/app/pairs_config  # Matches GCP deployment volume structure
     depends_on:
       influxdb:
         condition: service_healthy
+    networks:
+      - trading-network
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8050/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 60s
+    # Resource limits matching GCP deployment
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: '2.0'
     logging:
       driver: json-file
       options:
-        max-size: "${LOG_MAX_SIZE:-10m}"
-        max-file: "${LOG_MAX_FILES:-3}"
+        max-size: "100m"  # Matches GCP deployment logging config
+        max-file: "5"     # Matches GCP deployment logging config
 
   influxdb:
-    image: influxdb:2.7-alpine
+    image: influxdb:2.7-alpine  # Matches exact GCP deployment image
     container_name: influxdb
     restart: unless-stopped
+    networks:
+      - trading-network
     ports:
-      - "${INFLUXDB_PORT:-8086}:8086"
+      - "8086:8086"
     environment:
+      # Exact environment variables matching GCP deployment
       - DOCKER_INFLUXDB_INIT_MODE=setup
-      - DOCKER_INFLUXDB_INIT_USERNAME=${INFLUXDB_ADMIN_USERNAME:-admin}
-      - DOCKER_INFLUXDB_INIT_PASSWORD=${INFLUXDB_ADMIN_PASSWORD:-defaultpassword}
-      - DOCKER_INFLUXDB_INIT_ORG=${INFLUXDB_ORG:-trading_org}
-      - DOCKER_INFLUXDB_INIT_BUCKET=${INFLUXDB_BUCKET:-trading_data}
-      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUXDB_TOKEN:-defaulttoken}
+      - DOCKER_INFLUXDB_INIT_USERNAME=${INFLUXDB_USERNAME}
+      - DOCKER_INFLUXDB_INIT_PASSWORD=${INFLUXDB_PASSWORD}
+      - DOCKER_INFLUXDB_INIT_ORG=${INFLUXDB_ORG}
+      - DOCKER_INFLUXDB_INIT_BUCKET=${INFLUXDB_BUCKET}
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=${INFLUXDB_TOKEN}
     volumes:
-      - influxdb-data:/var/lib/influxdb2
-      - influxdb-config:/etc/influxdb2
+      - influxdb-data:/var/lib/influxdb2    # Matches GCP deployment volume paths
+      - influxdb-config:/etc/influxdb2      # Matches GCP deployment volume paths
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8086/health"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 60s
+    # Resource limits matching GCP deployment
+    deploy:
+      resources:
+        limits:
+          memory: 512m  # Matches GCP deployment memory limit
+          cpus: '1.0'   # Matches GCP deployment CPU limit
     logging:
       driver: json-file
       options:
-        max-size: "${LOG_MAX_SIZE:-10m}"
-        max-file: "${LOG_MAX_FILES:-3}"
-
-  # Optional Redis for advanced caching (not required for basic operation)
-  redis:
-    image: redis:7-alpine
-    container_name: redis
-    restart: unless-stopped
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
-    volumes:
-      - redis-data:/data
-    command: >
-      redis-server 
-      --appendonly yes 
-      --maxmemory ${REDIS_MAX_MEMORY:-256mb}
-      --maxmemory-policy allkeys-lru
-      --tcp-keepalive 60
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    logging:
-      driver: json-file
-      options:
-        max-size: "${LOG_MAX_SIZE:-10m}"
-        max-file: "${LOG_MAX_FILES:-3}"
-    profiles:
-      - redis  # Only start if explicitly enabled
-
-  # Optional PostgreSQL for alternative state management
-  postgres:
-    image: postgres:15-alpine
-    container_name: postgres
-    restart: unless-stopped
-    ports:
-      - "${TRADING_STATE_POSTGRES_PORT:-5432}:5432"
-    environment:
-      - POSTGRES_DB=${TRADING_STATE_POSTGRES_DB:-trading_states}
-      - POSTGRES_USER=${TRADING_STATE_POSTGRES_USER:-postgres}
-      - POSTGRES_PASSWORD=${TRADING_STATE_POSTGRES_PASSWORD:-postgres}
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${TRADING_STATE_POSTGRES_USER:-postgres}"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    logging:
-      driver: json-file
-      options:
-        max-size: "${LOG_MAX_SIZE:-10m}"
-        max-file: "${LOG_MAX_FILES:-3}"
-    profiles:
-      - postgres  # Only start if explicitly enabled
+        max-size: "50m"  # Matches GCP deployment logging config
+        max-file: "3"    # Matches GCP deployment logging config
 
 volumes:
   influxdb-data:
     driver: local
   influxdb-config:
     driver: local
-  redis-data:
-    driver: local
-  postgres-data:
-    driver: local
 
+# Use named network for proper container communication
 networks:
-  default:
+  trading-network:
     driver: bridge

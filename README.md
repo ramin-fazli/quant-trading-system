@@ -81,6 +81,19 @@ A modular quantitative trading system that provides complete flexibility in sele
    docker-compose up --build -d
    ```
 
+### Option 3: GCP VM Deployment
+
+The system includes automated deployment to Google Cloud Platform with CI/CD pipeline:
+
+1. **Automatic Deployment**: Push to the branch triggers deployment
+2. **Manual Deployment**: Use GitHub Actions workflow dispatch  
+3. **Production Ready**: Includes InfluxDB, proper networking, and health monitoring
+
+**Access URLs** (after deployment):
+- Dashboard: `http://YOUR-VM-IP`
+- API: `http://YOUR-VM-IP:8080` 
+- Health Check: `http://YOUR-VM-IP/health`
+
 ## 📋 Prerequisites
 
 - **Python 3.8+**
@@ -184,6 +197,138 @@ http://localhost:5000
 - **Backtest Results** (`/backtest`): Detailed backtest analysis
 - **Reports** (`/reports`): Download Excel reports
 
+## 🔬 Running Backtests
+
+### Local Development Backtests
+
+```bash
+# Basic usage - CTrader data and execution
+python scripts/pair_trading/main.py
+
+# Specify providers explicitly
+python scripts/pair_trading/main.py --data-provider ctrader --broker ctrader --mode backtest
+
+# Mix providers - CTrader data with MT5 execution
+python scripts/pair_trading/main.py --data-provider ctrader --broker mt5 --mode backtest
+
+# Force refresh all data (ignore cache)
+python scripts/pair_trading/main.py --force-refresh
+```
+
+### Docker Compose Backtests
+
+```bash
+# Run backtest in Docker environment
+docker-compose run --rm trading-system python -m scripts.pair_trading.main --mode backtest --data-provider ctrader
+
+# With custom parameters
+docker-compose run --rm trading-system python -m scripts.pair_trading.main \
+  --mode backtest \
+  --data-provider ctrader \
+  --pairs "NVDA.US-AMD.US,V.US-MA.US"
+```
+
+### GCP VM Backtests
+
+For production backtests on your deployed GCP VM with proper InfluxDB connectivity:
+
+#### 1. Connect to Your GCP VM
+```bash
+# Replace with your actual VM details
+gcloud compute ssh instance-20250729-190934 --zone=us-east4-c --project=your-project-id
+
+# Or use direct SSH if configured
+ssh -i your-key.pem user@your-vm-ip
+```
+
+#### 2. Run Backtests with Helper Script
+```bash
+# Navigate to trading system directory
+cd /opt/trading-system
+
+# Basic backtest (uses default parameters)
+./run-backtest-vm.sh
+
+# Backtest with custom parameters
+./run-backtest-vm.sh -- --mode backtest --data-provider ctrader --pairs "NVDA.US-AMD.US,V.US-MA.US"
+
+# Backtest specific date range
+./run-backtest-vm.sh -- --mode backtest --start-date "2024-01-01" --end-date "2024-06-30"
+```
+
+#### 3. Manual Docker Command (Advanced)
+If you prefer to run the Docker command manually:
+
+```bash
+# Get the current trading system image
+IMAGE_NAME=$(docker inspect trading-system --format='{{.Config.Image}}')
+
+# Run backtest with proper networking
+docker run --rm \
+  --name "trading-system-backtest-$(date +%s)" \
+  --network trading-network \
+  --env-file /opt/trading-system/.env \
+  -e TRADING_MODE=backtest \
+  -v /opt/trading-system/logs:/app/logs \
+  -v /opt/trading-system/backtest_reports:/app/backtest_reports \
+  -v /opt/trading-system/cache:/app/cache \
+  -v /opt/trading-system/pairs_config:/app/pairs_config \
+  --memory=2g \
+  --cpus=2 \
+  --entrypoint="" \
+  "$IMAGE_NAME" \
+  python -m scripts.pair_trading.main --mode backtest --data-provider ctrader
+```
+
+#### 4. View Results
+```bash
+# Check backtest reports
+ls -la /opt/trading-system/backtest_reports/
+
+# View recent logs
+tail -f /opt/trading-system/logs/enhanced_pairs_trading.log
+
+# Check InfluxDB data storage
+docker exec influxdb influx query 'from(bucket:"your-bucket") |> range(start:-1h) |> limit(n:10)'
+```
+
+#### Key Benefits of GCP VM Backtests:
+- ✅ **InfluxDB Integration**: Data persisted in production database
+- ✅ **Proper Networking**: Container communication via `trading-network`
+- ✅ **Resource Management**: 2GB RAM, 2 CPU allocation
+- ✅ **Volume Persistence**: Reports and logs saved to host
+- ✅ **Production Environment**: Same setup as live trading
+
+## 🔄 Supported Provider Combinations
+
+The system provides complete flexibility in selecting data providers and execution brokers independently:
+
+| Data Provider | Execution Broker | Use Case | Environment |
+|---------------|------------------|----------|-------------|
+| `ctrader` | `ctrader` | Pure cTrader environment | All |
+| `mt5` | `mt5` | Pure MT5 environment | All |
+| `ctrader` | `mt5` | cTrader data with MT5 execution | All |
+| `mt5` | `ctrader` | MT5 data with cTrader execution | All |
+
+### Command Examples
+
+```bash
+# Pure cTrader environment
+python scripts/pair_trading/main.py --data-provider ctrader --broker ctrader --mode backtest
+
+# Pure MT5 environment  
+python scripts/pair_trading/main.py --data-provider mt5 --broker mt5 --mode backtest
+
+# Mixed: cTrader data with MT5 execution
+python scripts/pair_trading/main.py --data-provider ctrader --broker mt5 --mode backtest
+
+# Live trading with CTrader
+python scripts/pair_trading/main.py --data-provider ctrader --broker ctrader --mode live
+
+# Force refresh all data (ignore cache)
+python scripts/pair_trading/main.py --force-refresh
+```
+
 ## 🏗️ Architecture
 
 ### System Overview
@@ -206,8 +351,8 @@ Enhanced Quantitative Trading System
 │   ├── Flask Server with WebSocket Streaming
 │   └── Interactive Charts & Real-time Updates
 └── Deployment
-    ├── Docker Containers
-    └── CI/CD Pipeline (GitHub Actions → AWS)
+    ├── Docker Containers with Modern Networking
+    └── CI/CD Pipeline (GitHub Actions → GCP VM & AWS)
 ```
 
 ### Core Components

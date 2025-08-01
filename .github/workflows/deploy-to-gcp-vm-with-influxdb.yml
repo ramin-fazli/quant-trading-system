@@ -470,6 +470,10 @@ jobs:
             USE_SUDO="sudo"
         fi
         
+        # Create a Docker network for container communication
+        echo "🌐 Creating Docker network for container communication..."
+        $USE_SUDO docker network create trading-network 2>/dev/null || echo "Network already exists"
+        
         # Ensure .env file exists in the correct location
         if [ ! -f "/opt/trading-system/.env" ]; then
             echo "❌ Environment file not found at /opt/trading-system/.env"
@@ -516,6 +520,7 @@ jobs:
         $USE_SUDO docker run -d \
           --name "influxdb" \
           --restart unless-stopped \
+          --network trading-network \
           -p 8086:8086 \
           -v /opt/trading-system/influxdb-data:/var/lib/influxdb2 \
           -v /opt/trading-system/influxdb-config:/etc/influxdb2 \
@@ -557,10 +562,10 @@ jobs:
         $USE_SUDO docker run -d \
           --name "$SERVICE_NAME" \
           --restart unless-stopped \
+          --network trading-network \
           -p 80:8050 \
           -p 443:8050 \
           -p 8080:8080 \
-          --link influxdb:influxdb \
           --env-file /opt/trading-system/.env \
           -v /opt/trading-system/logs:/app/logs \
           -v /opt/trading-system/backtest_reports:/app/backtest_reports \
@@ -665,12 +670,18 @@ jobs:
           --project=${{ secrets.GCP_PROJECT_ID }} \
           --scp-flag="-o ConnectTimeout=10"
         
+        # Copy backtest helper script to VM
+        gcloud compute scp scripts/run-backtest-vm.sh ${{ env.VM_NAME }}:~/run-backtest-vm.sh \
+          --zone=${{ env.VM_ZONE }} \
+          --project=${{ secrets.GCP_PROJECT_ID }} \
+          --scp-flag="-o ConnectTimeout=10"
+        
         # Execute deployment on VM with timeout
         timeout 600 gcloud compute ssh ${{ env.VM_NAME }} \
           --zone=${{ env.VM_ZONE }} \
           --project=${{ secrets.GCP_PROJECT_ID }} \
           --ssh-flag="-o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=3" \
-          --command="chmod +x ~/deploy.sh && ~/deploy.sh && sudo mv ~/trading-system.env /opt/trading-system/.env && sudo mv ~/pairs.json /opt/trading-system/pairs_config/pairs.json && sudo chown -R \$USER:\$USER /opt/trading-system && chmod +x ~/start-container.sh && cd /opt/trading-system && ~/start-container.sh"
+          --command="chmod +x ~/deploy.sh && ~/deploy.sh && sudo mv ~/trading-system.env /opt/trading-system/.env && sudo mv ~/pairs.json /opt/trading-system/pairs_config/pairs.json && sudo chown -R \$USER:\$USER /opt/trading-system && chmod +x ~/start-container.sh && chmod +x ~/run-backtest-vm.sh && sudo mv ~/run-backtest-vm.sh /opt/trading-system/ && cd /opt/trading-system && ~/start-container.sh"
 
     - name: VM Docker cleanup
       run: |
